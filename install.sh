@@ -18,6 +18,10 @@ MANAGER_URL="http://127.0.0.1:8080"
 CLUSTER_TOKEN="dist-log-cluster-secret-token"
 NODE_NAME=""
 AUTO_START=true
+HA_MODE="standalone"
+PEER_URL=""
+VIP=""
+VIP_INTERFACE=""
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -33,6 +37,21 @@ while [[ $# -gt 0 ]]; do
             ;;
         --data-dir=*)
             DATA_DIR="${1#*=}"
+            ;;
+        --ha-mode=*)
+            HA_MODE="${1#*=}"
+            ;;
+        --peer-url=*)
+            PEER_URL="${1#*=}"
+            ;;
+        --vip=*)
+            VIP="${1#*=}"
+            ;;
+        --vip-interface=*)
+            VIP_INTERFACE="${1#*=}"
+            ;;
+        --gateway-ip=*)
+            GATEWAY_IP="${1#*=}"
             ;;
         --manager-url=*)
             MANAGER_URL="${1#*=}"
@@ -59,18 +78,23 @@ while [[ $# -gt 0 ]]; do
             echo "分布式存储日志分析系统 一键安装程序"
             echo "使用方法: $0 [选项]"
             echo ""
-            echo "选项:"
+            echo "安装时核心选项:"
             echo "  --role=manager|worker      安装角色: manager(管理组件, 默认) 或 worker(业务组件)"
             echo "  --port=<端口>              监听端口 (manager 默认 8080, worker 默认 8081)"
             echo "  --install-dir=<目录>       程序安装目标路径 (默认: /opt/dist-log-analyzer)"
             echo "  --data-dir=<目录>          数据存储与隔离根目录 (默认: <安装路径>/data)"
+            echo "  --manager-url=<URL>        连接的管理节点地址 (仅 worker 角色需要，支持主备多地址)"
+            echo "  --cluster-token=<Token>    集群通信安全凭据"
+            echo "  --node-name=<名称>         节点显示名称 (默认: 本机主机名)"
+            echo "  --no-start                 安装完成后不立即启动服务"
+            echo ""
+            echo "业务存储盘选项 (仅 worker 角色支持):"
             echo "  --disk=<设备路径>          指定存放日志的物理硬盘 (例如: /dev/sdb)"
             echo "  --fstype=ext4|xfs          硬盘文件系统格式 (默认: ext4)"
             echo "  --format                   自动格式化该指定硬盘并配置开机自动挂载"
-            echo "  --manager-url=<URL>        业务节点连接的管理节点地址 (worker 角色必填)"
-            echo "  --cluster-token=<Token>    集群通信握手安全凭据"
-            echo "  --node-name=<名称>         节点显示名称 (默认: 本机主机名)"
-            echo "  --no-start                 安装完成后不立即启动服务"
+            echo ""
+            echo "💡 提示: 高可用 HA 架构、对端节点同步、网关防脑裂自检 (--gateway-ip)、虚拟 IP (VIP) 等高级参数，"
+            echo "         均已全部移至 Web 管理控制台进行图形化配置并支持在线热生效，无需在安装时复杂指定！"
             exit 0
             ;;
         *)
@@ -167,7 +191,12 @@ if [ "$IS_ROOT" = true ] && command -v systemctl >/dev/null 2>&1 && [ -d "/etc/s
     SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 
     if [ "$ROLE" == "manager" ]; then
-        EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer manager --port=$PORT --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN"
+        MGR_HA_ARGS="--ha-mode=$HA_MODE"
+        if [ -n "$PEER_URL" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --peer-url=$PEER_URL"; fi
+        if [ -n "$VIP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip=$VIP"; fi
+        if [ -n "$VIP_INTERFACE" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip-interface=$VIP_INTERFACE"; fi
+        if [ -n "$GATEWAY_IP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --gateway-ip=$GATEWAY_IP"; fi
+        EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer manager --port=$PORT --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN $MGR_HA_ARGS"
     else
         EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer worker --port=$PORT --manager-url=$MANAGER_URL --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN"
     fi
@@ -202,12 +231,28 @@ if [ "$AUTO_START" = true ]; then
         systemctl restart "dist-log-$ROLE.service"
         sleep 1
         systemctl status "dist-log-$ROLE.service" --no-pager | head -n 8
+    else
         # 独立脚本方式常驻后台启动
-        nohup "$INSTALL_DIR/bin/dist-log-analyzer" "$ROLE" \
-            --port="$PORT" \
-            --data-dir="$DATA_DIR" \
-            --advertise-ip="$LOCAL_IP" \
-            --cluster-token="$CLUSTER_TOKEN" </dev/null >> "$INSTALL_DIR/logs/$ROLE.log" 2>&1 &
+        if [ "$ROLE" == "manager" ]; then
+            MGR_HA_ARGS="--ha-mode=$HA_MODE"
+            if [ -n "$PEER_URL" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --peer-url=$PEER_URL"; fi
+            if [ -n "$VIP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip=$VIP"; fi
+            if [ -n "$VIP_INTERFACE" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip-interface=$VIP_INTERFACE"; fi
+            if [ -n "$GATEWAY_IP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --gateway-ip=$GATEWAY_IP"; fi
+            nohup "$INSTALL_DIR/bin/dist-log-analyzer" manager \
+                --port="$PORT" \
+                --data-dir="$DATA_DIR" \
+                --advertise-ip="$LOCAL_IP" \
+                --cluster-token="$CLUSTER_TOKEN" \
+                $MGR_HA_ARGS </dev/null >> "$INSTALL_DIR/logs/$ROLE.log" 2>&1 &
+        else
+            nohup "$INSTALL_DIR/bin/dist-log-analyzer" worker \
+                --port="$PORT" \
+                --manager-url="$MANAGER_URL" \
+                --data-dir="$DATA_DIR" \
+                --advertise-ip="$LOCAL_IP" \
+                --cluster-token="$CLUSTER_TOKEN" </dev/null >> "$INSTALL_DIR/logs/$ROLE.log" 2>&1 &
+        fi
         DAEMON_PID=$!
         disown $DAEMON_PID 2>/dev/null || true
         echo $DAEMON_PID > "$INSTALL_DIR/run/service.pid"
@@ -224,7 +269,9 @@ if [ "$ROLE" == "manager" ]; then
     echo "  ▶ 初始管理员账号: admin"
     echo "  ▶ 初始管理员密码: admin123"
     echo "  ▶ 数据存储隔离目录: $DATA_DIR"
-    echo "  ▶ 业务组件后续安装: 登录 Web 控制台 -> [集群节点] -> 一键远程安装"
+    echo "  ▶ ⚙️ 高可用与网络配置: 登录 Web 控制台 -> [集群节点] -> [⚙️ 高可用与网络配置]"
+    echo "     (支持在线随时设置主备 HA 模式、网关防脑裂 IP (--gateway-ip)、双重仲裁与 VIP，即时生效)"
+    echo "  ▶ 业务组件后续安装: 登录 Web 控制台 -> [集群节点] -> 一键远程安装 (SSH)"
 else
     echo "  ▶ 业务计算节点已接入: $LOCAL_IP:$PORT"
     echo "  ▶ 所属管理节点: $MANAGER_URL"

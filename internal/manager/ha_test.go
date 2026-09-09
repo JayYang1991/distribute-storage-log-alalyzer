@@ -279,3 +279,76 @@ func TestWorkerQuorumCheckProtection(t *testing.T) {
 	t.Logf("Worker 多数派仲裁防脑裂拦截成功！拦截说明: %s (在线 Worker: %d/%d)",
 		status.BlockedReason, status.WorkerQuorumOnline, status.WorkerQuorumTotal)
 }
+
+func TestDynamicHAConfigAndGatewayUpdate(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "ha_dynamic_cfg_*")
+	if err != nil {
+		t.Fatalf("创建临时目录失败: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := config.DefaultConfig()
+	cfg.DataDir = tmpDir
+	cfg.HAMode = "standalone"
+
+	st, err := store.NewStore(cfg)
+	if err != nil {
+		t.Fatalf("创建 Store 失败: %v", err)
+	}
+	defer st.Close()
+
+	ha := NewHAManager(cfg, st)
+	if ha.mode != "standalone" {
+		t.Fatalf("初始模式应为 standalone")
+	}
+
+	// 模拟管理界面动态提交高可用与网关新配置
+	newCfg := config.HAConfig{
+		HAMode:               "primary",
+		PeerURL:              "http://192.168.1.88:8080",
+		GatewayIP:            "127.0.0.1", // 本机可通
+		EnableGatewayCheck:   true,
+		EnableWorkerQuorum:   true,
+		VIP:                  "192.168.1.222/24",
+		VIPInterface:         "lo",
+		HeartbeatIntervalSec: 3,
+		FailoverTimeoutSec:   9,
+		SyncIntervalSec:      7,
+	}
+
+	// 1. 持久化到 Store
+	if err := st.SaveHAConfig(&newCfg); err != nil {
+		t.Fatalf("SaveHAConfig 失败: %v", err)
+	}
+
+	saved, err := st.GetHAConfig()
+	if err != nil || saved == nil {
+		t.Fatalf("GetHAConfig 失败: %v", err)
+	}
+	if saved.GatewayIP != "127.0.0.1" || saved.HAMode != "primary" || saved.PeerURL != "http://192.168.1.88:8080" {
+		t.Fatalf("持久化读取的数据不匹配: %+v", saved)
+	}
+
+	// 2. 动态热更新到 HAManager
+	if err := ha.UpdateConfig(newCfg); err != nil {
+		t.Fatalf("UpdateConfig 失败: %v", err)
+	}
+
+	status := ha.GetStatus()
+	if status.Mode != "primary" {
+		t.Fatalf("动态更新后模式应为 primary, 实际为 %s", status.Mode)
+	}
+	if status.PeerURL != "http://192.168.1.88:8080" {
+		t.Fatalf("动态更新后对端地址不匹配: %s", status.PeerURL)
+	}
+	if status.GatewayIP != "127.0.0.1" {
+		t.Fatalf("动态更新后网关 IP 应为 127.0.0.1, 实际为 %s", status.GatewayIP)
+	}
+	if status.VIP != "192.168.1.222/24" {
+		t.Fatalf("动态更新后 VIP 不匹配: %s", status.VIP)
+	}
+
+	t.Logf("高可用与网关配置动态热更新测试通过: 模式=%s, 网关=%s, 对端=%s, VIP=%s",
+		status.Mode, status.GatewayIP, status.PeerURL, status.VIP)
+}
+

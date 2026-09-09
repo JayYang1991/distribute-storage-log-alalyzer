@@ -22,6 +22,8 @@ type HAManager struct {
 	cfg        *config.Config
 	store      *store.Store
 	syncEngine *HASyncEngine
+	ctx        context.Context
+	cancel     context.CancelFunc
 
 	mu            sync.RWMutex
 	mode          string // standalone | primary | backup
@@ -125,8 +127,128 @@ func (h *HAManager) IsActive() bool {
 	return h.role == "active"
 }
 
+// GetConfig 获取当前 HA 配置
+func (h *HAManager) GetConfig() config.HAConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return config.HAConfig{
+		HAMode:               h.mode,
+		PeerURL:              h.peerURL,
+		GatewayIP:            h.gatewayIP,
+		EnableGatewayCheck:   h.cfg.EnableGatewayCheck,
+		EnableWorkerQuorum:   h.cfg.EnableWorkerQuorum,
+		VIP:                  h.cfg.VIP,
+		VIPInterface:         h.cfg.VIPInterface,
+		HeartbeatIntervalSec: h.cfg.HeartbeatIntervalSec,
+		FailoverTimeoutSec:   h.cfg.FailoverTimeoutSec,
+		SyncIntervalSec:      h.cfg.SyncIntervalSec,
+	}
+}
+
+// UpdateConfig 动态更新高可用与网络自检配置并立即热生效
+func (h *HAManager) UpdateConfig(newCfg config.HAConfig) error {
+	h.mu.Lock()
+
+	oldVIP := h.cfg.VIP
+	oldMode := h.mode
+	oldPeer := h.peerURL
+
+	// 1. 更新网关与防脑裂参数
+	h.gatewayIP = strings.TrimSpace(newCfg.GatewayIP)
+	if h.gatewayIP == "" && newCfg.EnableGatewayCheck {
+		h.gatewayIP = DetectDefaultGateway()
+	}
+	h.cfg.GatewayIP = h.gatewayIP
+	h.cfg.EnableGatewayCheck = newCfg.EnableGatewayCheck
+	h.cfg.EnableWorkerQuorum = newCfg.EnableWorkerQuorum
+
+	// 2. 更新超时与间隔
+	if newCfg.HeartbeatIntervalSec > 0 {
+		h.cfg.HeartbeatIntervalSec = newCfg.HeartbeatIntervalSec
+	}
+	if newCfg.FailoverTimeoutSec > 0 {
+		h.cfg.FailoverTimeoutSec = newCfg.FailoverTimeoutSec
+	}
+	if newCfg.SyncIntervalSec > 0 {
+		h.cfg.SyncIntervalSec = newCfg.SyncIntervalSec
+	}
+
+	// 3. 更新对端地址
+	newPeer := strings.TrimRight(strings.TrimSpace(newCfg.PeerURL), "/")
+	if newPeer != oldPeer {
+		h.peerURL = newPeer
+		h.cfg.PeerURL = newPeer
+		h.peerOnline = false
+		h.consecutiveFailures = 0
+	}
+
+	// 4. 更新 VIP
+	h.cfg.VIP = strings.TrimSpace(newCfg.VIP)
+	h.cfg.VIPInterface = strings.TrimSpace(newCfg.VIPInterface)
+	if oldVIP != "" && oldVIP != h.cfg.VIP && h.vipActive {
+		h.releaseVIPLocked()
+	}
+
+	// 5. 更新模式
+	newMode := strings.ToLower(strings.TrimSpace(newCfg.HAMode))
+	if newMode == "" {
+		newMode = "standalone"
+	}
+	h.mode = newMode
+	h.cfg.HAMode = newMode
+
+	if newMode == "standalone" {
+		h.role = "active"
+		if h.vipActive {
+			h.releaseVIPLocked()
+		}
+	} else if oldMode == "standalone" {
+		if newMode == "backup" {
+			h.role = "standby"
+		} else {
+			h.role = "active"
+		}
+	}
+
+	if h.role == "active" && h.cfg.VIP != "" && !h.vipActive {
+		h.bindVIPLocked()
+	}
+
+	ctx := h.ctx
+	h.mu.Unlock()
+
+	// 异步探测一次网关连通性
+	if h.cfg.EnableGatewayCheck && h.gatewayIP != "" {
+		go func() {
+			online := CheckGatewayPing(h.gatewayIP, 2*time.Second)
+			h.mu.Lock()
+			h.gatewayOnline = online
+			h.mu.Unlock()
+		}()
+	}
+
+	// 异步探测一次对端
+	if h.peerURL != "" {
+		go h.probePeer(3)
+	}
+
+	// 如果从 standalone 动态转为 HA 主备模式，且之前未启动循环
+	if oldMode == "standalone" && newMode != "standalone" && ctx != nil {
+		go h.syncEngine.Start(ctx)
+		go h.heartbeatLoop(ctx)
+	}
+
+	log.Printf("[HA Manager] 网页动态更新高可用与网关配置成功: 模式=%s, 角色=%s, 网关=%s, 对端=%s, VIP=%s",
+		h.mode, h.role, h.gatewayIP, h.peerURL, h.cfg.VIP)
+	return nil
+}
+
 // Start 启动 HA 心跳探测与数据同步引擎
 func (h *HAManager) Start(ctx context.Context) {
+	h.mu.Lock()
+	h.ctx = ctx
+	h.mu.Unlock()
+
 	if h.mode == "standalone" {
 		log.Printf("[HA Manager] 当前处于单节点独立模式 (Standalone)")
 		return

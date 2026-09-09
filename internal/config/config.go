@@ -38,6 +38,56 @@ type Config struct {
 	} `json:"initial_admin"`
 }
 
+// HAConfig 管理页面上可视化配置的高可用与网络参数
+type HAConfig struct {
+	HAMode               string `json:"ha_mode"`
+	PeerURL              string `json:"peer_url"`
+	GatewayIP            string `json:"gateway_ip"`
+	EnableGatewayCheck   bool   `json:"enable_gateway_check"`
+	EnableWorkerQuorum   bool   `json:"enable_worker_quorum"`
+	VIP                  string `json:"vip"`
+	VIPInterface         string `json:"vip_interface"`
+	HeartbeatIntervalSec int    `json:"heartbeat_interval_sec"`
+	FailoverTimeoutSec   int    `json:"failover_timeout_sec"`
+	SyncIntervalSec      int    `json:"sync_interval_sec"`
+}
+
+func (c *Config) GetHAConfig() HAConfig {
+	return HAConfig{
+		HAMode:               c.HAMode,
+		PeerURL:              c.PeerURL,
+		GatewayIP:            c.GatewayIP,
+		EnableGatewayCheck:   c.EnableGatewayCheck,
+		EnableWorkerQuorum:   c.EnableWorkerQuorum,
+		VIP:                  c.VIP,
+		VIPInterface:         c.VIPInterface,
+		HeartbeatIntervalSec: c.HeartbeatIntervalSec,
+		FailoverTimeoutSec:   c.FailoverTimeoutSec,
+		SyncIntervalSec:      c.SyncIntervalSec,
+	}
+}
+
+func (c *Config) ApplyHAConfig(hac HAConfig) {
+	if hac.HAMode != "" {
+		c.HAMode = hac.HAMode
+	}
+	c.PeerURL = hac.PeerURL
+	c.GatewayIP = hac.GatewayIP
+	c.EnableGatewayCheck = hac.EnableGatewayCheck
+	c.EnableWorkerQuorum = hac.EnableWorkerQuorum
+	c.VIP = hac.VIP
+	c.VIPInterface = hac.VIPInterface
+	if hac.HeartbeatIntervalSec > 0 {
+		c.HeartbeatIntervalSec = hac.HeartbeatIntervalSec
+	}
+	if hac.FailoverTimeoutSec > 0 {
+		c.FailoverTimeoutSec = hac.FailoverTimeoutSec
+	}
+	if hac.SyncIntervalSec > 0 {
+		c.SyncIntervalSec = hac.SyncIntervalSec
+	}
+}
+
 // DefaultConfig 默认配置
 func DefaultConfig() *Config {
 	hostname, _ := os.Hostname()

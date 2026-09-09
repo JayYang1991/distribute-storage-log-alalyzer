@@ -24,6 +24,7 @@ var (
 	bucketArchives = []byte("archives")
 	bucketRules    = []byte("rules")
 	bucketReports  = []byte("reports")
+	bucketSettings = []byte("settings")
 )
 
 type Store struct {
@@ -50,7 +51,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化各 bucket
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports} {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -491,3 +492,34 @@ func (s *Store) DeleteReport(archiveID string) error {
 		return b.Delete([]byte(archiveID))
 	})
 }
+
+// ================= 系统设置与高可用网络配置 =================
+
+var keyHAConfig = []byte("ha_config")
+
+// SaveHAConfig 持久化保存高可用与网络配置
+func (s *Store) SaveHAConfig(cfg *config.HAConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyHAConfig, data)
+	})
+}
+
+// GetHAConfig 读取持久化的高可用与网络配置
+func (s *Store) GetHAConfig() (*config.HAConfig, error) {
+	var cfg *config.HAConfig
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyHAConfig)
+		if data == nil {
+			return errors.New("ha_config not set")
+		}
+		return json.Unmarshal(data, &cfg)
+	})
+	return cfg, err
+}
+

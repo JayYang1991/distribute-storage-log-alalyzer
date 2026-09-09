@@ -161,6 +161,7 @@
               </span>
               <div id="ha-action-btns" style="display: flex; gap: 8px;">
                 <button class="btn btn-secondary btn-sm" onclick="app.fetchHAStatus()">🔄 刷新 HA 状态</button>
+                <button class="btn btn-primary btn-sm" id="btn-ha-config" onclick="app.openHAConfigModal()">⚙️ 高可用与网络配置</button>
                 <button class="btn btn-warning btn-sm" id="btn-ha-switchover" onclick="app.doHASwitchover()" style="display: none;">⚡ 一键主备平滑倒换</button>
               </div>
             </div>
@@ -636,6 +637,93 @@
           <div class="modal-footer" style="padding: 14px 0 0 0;">
             <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-rule')">取消</button>
             <button type="submit" class="btn btn-primary">💾 保存规则</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框: 高可用 (HA) 与网络防脑裂配置 -->
+  <div class="modal-overlay" id="modal-ha-config">
+    <div class="modal-content" style="max-width: 620px;">
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ 管理组件高可用 (HA) 与网络自检配置</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-ha-config')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-ha-config" onsubmit="event.preventDefault(); app.saveHAConfig();">
+          <div style="background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.25); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 16px; font-size: 13px; color: var(--text-secondary);">
+            💡 <strong>免安装传参说明</strong>：所有高可用、对端同步与防脑裂网关参数均可随时在此页面动态调整，保存后<strong>无需重启服务立即热生效</strong>。
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">高可用部署运行模式 *</label>
+            <select class="form-control" id="ha-cfg-mode" onchange="app.onHAModeChange()">
+              <option value="standalone">单节点独立模式 (Standalone - 默认)</option>
+              <option value="primary">主备高可用架构 - 主管理节点 (HA Primary)</option>
+              <option value="backup">主备高可用架构 - 备管理节点 (HA Backup)</option>
+            </select>
+          </div>
+
+          <div class="form-group" id="ha-group-peer">
+            <label class="form-label">对端管理节点完整地址 (Peer URL)</label>
+            <input type="text" class="form-control" id="ha-cfg-peer-url" placeholder="例如：http://192.168.1.11:8080 (单机模式可留空)">
+            <small class="form-text" style="color: var(--text-muted);">用于主备管理节点间发送探测心跳及增量/全量快照元数据实时热同步。</small>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">默认网关 IP (Gateway IP)</label>
+              <input type="text" class="form-control" id="ha-cfg-gateway-ip" placeholder="留空则自动探测系统默认网关">
+              <small class="form-text" style="color: var(--text-muted);">用于防网络孤岛自检，支持手动指定 IP。</small>
+            </div>
+            <div class="form-group">
+              <label class="form-label">虚拟高可用浮动 IP (VIP / 可选)</label>
+              <input type="text" class="form-control" id="ha-cfg-vip" placeholder="例如：192.168.1.200/24">
+              <small class="form-text" style="color: var(--text-muted);">Active 节点自动接管绑定，无 VIP 请留空。</small>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">VIP 绑定网络接口 (网卡名称)</label>
+            <input type="text" class="form-control" id="ha-cfg-vip-interface" placeholder="留空则自动探测当前默认网卡 (如 eth0, ens33)">
+          </div>
+
+          <div style="background: rgba(15,23,42,0.5); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px; margin-bottom: 16px;">
+            <div style="font-weight: 600; font-size: 13px; margin-bottom: 8px; color: var(--text-primary);">🛡️ 双重防脑裂保护机制开关</div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+                <input type="checkbox" id="ha-cfg-enable-gateway" checked>
+                <span><strong>启用网关连通性自检</strong> (若丢失心跳但网关不可达，判定本机处于网络孤岛，严格阻断晋升以防双主)</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+                <input type="checkbox" id="ha-cfg-enable-quorum" checked>
+                <span><strong>启用 Worker 多数派仲裁</strong> (备机晋升需获得 >50% 在线 Worker 法定人数，主机孤立在小分区自动退位)</span>
+              </label>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+            <div class="form-group">
+              <label class="form-label">心跳探测间隔</label>
+              <input type="number" class="form-control" id="ha-cfg-heartbeat" min="1" max="60" value="2">
+              <small class="form-text" style="color: var(--text-muted);">单位: 秒 (默认 2s)</small>
+            </div>
+            <div class="form-group">
+              <label class="form-label">判定宕机超时</label>
+              <input type="number" class="form-control" id="ha-cfg-failover" min="3" max="300" value="6">
+              <small class="form-text" style="color: var(--text-muted);">单位: 秒 (默认 6s)</small>
+            </div>
+            <div class="form-group">
+              <label class="form-label">数据快照同步周期</label>
+              <input type="number" class="form-control" id="ha-cfg-sync" min="1" max="300" value="5">
+              <small class="form-text" style="color: var(--text-muted);">单位: 秒 (默认 5s)</small>
+            </div>
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-ha-config')">取消</button>
+            <button type="submit" class="btn btn-primary" id="btn-save-ha-cfg">💾 保存配置并立即生效</button>
           </div>
         </form>
       </div>

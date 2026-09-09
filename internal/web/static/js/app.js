@@ -337,6 +337,80 @@ const app = {
     }
   },
 
+  async openHAConfigModal() {
+    try {
+      const res = await this.api("/api/ha/config");
+      let cfg = {};
+      if (res.ok) {
+        cfg = await res.json();
+      }
+
+      document.getElementById("ha-cfg-mode").value = cfg.ha_mode || "standalone";
+      document.getElementById("ha-cfg-peer-url").value = cfg.peer_url || "";
+      document.getElementById("ha-cfg-gateway-ip").value = cfg.gateway_ip || "";
+      document.getElementById("ha-cfg-vip").value = cfg.vip || "";
+      document.getElementById("ha-cfg-vip-interface").value = cfg.vip_interface || "";
+      document.getElementById("ha-cfg-enable-gateway").checked = (cfg.enable_gateway_check !== false);
+      document.getElementById("ha-cfg-enable-quorum").checked = (cfg.enable_worker_quorum !== false);
+      document.getElementById("ha-cfg-heartbeat").value = cfg.heartbeat_interval_sec || 2;
+      document.getElementById("ha-cfg-failover").value = cfg.failover_timeout_sec || 6;
+      document.getElementById("ha-cfg-sync").value = cfg.sync_interval_sec || 5;
+
+      this.onHAModeChange();
+      this.openModal("modal-ha-config");
+    } catch (e) {
+      alert("获取高可用与网络配置失败: " + e.message);
+    }
+  },
+
+  onHAModeChange() {
+    const mode = document.getElementById("ha-cfg-mode").value;
+    const peerInput = document.getElementById("ha-cfg-peer-url");
+    if (mode === "standalone") {
+      peerInput.placeholder = "单节点独立模式无需填写对端地址 (可留空)";
+    } else if (mode === "primary") {
+      peerInput.placeholder = "例如：http://192.168.1.11:8080 (对端备节点地址)";
+    } else {
+      peerInput.placeholder = "例如：http://192.168.1.10:8080 (对端主节点地址)";
+    }
+  },
+
+  async saveHAConfig() {
+    const btn = document.getElementById("btn-save-ha-cfg");
+    btn.disabled = true;
+    btn.innerText = "正在保存并热生效...";
+
+    const payload = {
+      ha_mode: document.getElementById("ha-cfg-mode").value,
+      peer_url: document.getElementById("ha-cfg-peer-url").value.trim(),
+      gateway_ip: document.getElementById("ha-cfg-gateway-ip").value.trim(),
+      vip: document.getElementById("ha-cfg-vip").value.trim(),
+      vip_interface: document.getElementById("ha-cfg-vip-interface").value.trim(),
+      enable_gateway_check: document.getElementById("ha-cfg-enable-gateway").checked,
+      enable_worker_quorum: document.getElementById("ha-cfg-enable-quorum").checked,
+      heartbeat_interval_sec: parseInt(document.getElementById("ha-cfg-heartbeat").value, 10) || 2,
+      failover_timeout_sec: parseInt(document.getElementById("ha-cfg-failover").value, 10) || 6,
+      sync_interval_sec: parseInt(document.getElementById("ha-cfg-sync").value, 10) || 5,
+    };
+
+    try {
+      const res = await this.api("/api/ha/config", "POST", payload);
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText);
+      }
+      const data = await res.json();
+      alert("✅ " + (data.message || "高可用与网络配置已保存并立即生效！"));
+      this.closeModal("modal-ha-config");
+      await this.fetchHAStatus();
+    } catch (e) {
+      alert("❌ 保存高可用配置失败: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "💾 保存配置并立即生效";
+    }
+  },
+
   async api(url, method = "GET", body = null) {
     const headers = {};
     if (this.token) {

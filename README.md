@@ -74,17 +74,17 @@ git push origin v1.0.0
 ```
 推送后即可在 GitHub 仓库的 **Releases** 页面查看自动生成的发布包与安装说明。
 
-### 3. 目标服务器一键安装管理组件
-将生成的 `dist-log-analyzer-linux-amd64.tar.gz` 拷贝至任意通用 RedHat 衍生 Linux（或 CentOS / Rocky / Ubuntu 等）机器：
+### 3. 目标服务器一键安装管理组件 (极简部署)
+将生成的 `dist-log-analyzer-linux-amd64.tar.gz` 拷贝至任意通用 RedHat 衍生 Linux（或 CentOS / Rocky / AlmaLinux / Ubuntu 等）机器：
 ```bash
 tar -zxvf dist-log-analyzer-linux-amd64.tar.gz
 cd dist-log-analyzer-linux-amd64
 
-# 一键安装并启动管理组件 (默认端口 8080)
+# 一键极简安装并启动管理组件 (默认端口 8080，无复杂命令行参数交互)
 sudo ./install.sh
 
-# 或自定义端口与数据存储路径:
-sudo ./install.sh --role=manager --port=8080 --data-dir=/opt/dist-log/data
+# 或仅按需指定基础系统参数 (如端口与数据存放根目录):
+sudo ./install.sh --port=8080 --data-dir=/opt/dist-log/data
 ```
 
 安装完成后即可在浏览器打开 Web 控制台：
@@ -92,7 +92,11 @@ sudo ./install.sh --role=manager --port=8080 --data-dir=/opt/dist-log/data
 - **默认管理员账号**: `admin`
 - **默认管理员密码**: `admin123`
 
-### 3. 在 Web 界面安装业务计算节点
+> 💡 **免安装复杂传参设计**：
+> 高可用架构模式切换 (单机 Standalone / HA Primary / HA Backup)、对端管理节点同步地址、默认网关 IP (`--gateway-ip`)、双重防脑裂仲裁开关、虚拟高可用 IP (VIP) 以及心跳超时等所有高级参数，**均已全面集成在 Web 控制台进行可视化配置**！
+> 登录 Web 控制台后，点击【集群节点与安装】->【⚙️ 高可用与网络配置】即可随时调整，点击保存立即**热生效**，无需在终端安装时指定繁杂参数或重启服务。
+
+### 4. 在 Web 界面安装业务计算节点
 1. 登录 Web 控制台，点击左侧导航【集群节点与安装】；
 2. 点击【➕ 一键安装业务组件 (SSH)】，填写目标业务服务器 IP、端口及 SSH 账号密码；
 3. 点击【开始一键安装并接入】，系统通过内置 SSH 自动完成传输与服务启动，业务节点自动向管理节点注册上线！

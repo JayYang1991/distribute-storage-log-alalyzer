@@ -69,6 +69,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// 高可用 HA 路由
 	mux.HandleFunc("/api/ha/status", s.handleHAStatus)
+	mux.HandleFunc("/api/ha/config", s.handleHAConfig)
 	mux.HandleFunc("/api/ha/heartbeat", s.handleHAHeartbeat)
 	mux.HandleFunc("/api/ha/snapshot", s.handleHASnapshot)
 	mux.HandleFunc("/api/ha/switchover", s.handleHASwitchover)
@@ -1171,6 +1172,47 @@ func (s *Server) handleHAStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.ha.GetStatus()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) handleHAConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cfg := s.ha.GetConfig()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfg)
+	case http.MethodPost:
+		user, err := s.authenticate(r)
+		if err != nil || user == nil || user.Role != model.RoleAdmin {
+			http.Error(w, "需要管理员权限", http.StatusForbidden)
+			return
+		}
+		var req config.HAConfig
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// 持久化到 store
+		if err := s.store.SaveHAConfig(&req); err != nil {
+			http.Error(w, "持久化保存高可用配置失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// 动态热更新到运行中的 HAManager
+		if err := s.ha.UpdateConfig(req); err != nil {
+			http.Error(w, "动态更新高可用配置失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "高可用与网络自检配置已保存并立即热生效",
+			"config":  s.ha.GetConfig(),
+			"status":  s.ha.GetStatus(),
+		})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleHAHeartbeat(w http.ResponseWriter, r *http.Request) {

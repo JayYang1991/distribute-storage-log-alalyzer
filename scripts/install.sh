@@ -78,27 +78,23 @@ while [[ $# -gt 0 ]]; do
             echo "分布式存储日志分析系统 一键安装程序"
             echo "使用方法: $0 [选项]"
             echo ""
-            echo "通用选项:"
+            echo "安装时核心选项:"
             echo "  --role=manager|worker      安装角色: manager(管理组件, 默认) 或 worker(业务组件)"
             echo "  --port=<端口>              监听端口 (manager 默认 8080, worker 默认 8081)"
             echo "  --install-dir=<目录>       程序安装目标路径 (默认: /opt/dist-log-analyzer)"
             echo "  --data-dir=<目录>          数据存储与隔离根目录 (默认: <安装路径>/data)"
-            echo "  --cluster-token=<Token>    集群通信与数据同步安全凭据"
+            echo "  --manager-url=<URL>        连接的管理节点地址 (仅 worker 角色需要，支持主备多地址)"
+            echo "  --cluster-token=<Token>    集群通信安全凭据"
             echo "  --node-name=<名称>         节点显示名称 (默认: 本机主机名)"
             echo "  --no-start                 安装完成后不立即启动服务"
             echo ""
-            echo "管理组件高可用(HA)选项 (仅当 --role=manager 时生效):"
-            echo "  --ha-mode=standalone|primary|backup"
-            echo "                             安装模式: standalone(单节点默认), primary(HA主节点), backup(HA备节点)"
-            echo "  --peer-url=<URL>           对端对等管理节点完整地址 (例如: http://192.168.1.11:8080)"
-            echo "  --vip=<虚拟IP/掩码>        可选虚拟高可用浮动IP (例如: 192.168.1.200/24)"
-            echo "  --vip-interface=<网卡>     虚拟 IP 绑定网卡 (默认自动探测)"
-            echo ""
-            echo "业务组件选项 (仅当 --role=worker 时生效):"
-            echo "  --manager-url=<URL>        连接的管理节点地址 (支持逗号分隔的主备多地址实现故障自动漂移)"
+            echo "业务存储盘选项 (仅 worker 角色支持):"
             echo "  --disk=<设备路径>          指定存放日志的物理硬盘 (例如: /dev/sdb)"
             echo "  --fstype=ext4|xfs          硬盘文件系统格式 (默认: ext4)"
             echo "  --format                   自动格式化该指定硬盘并配置开机自动挂载"
+            echo ""
+            echo "💡 提示: 高可用 HA 架构、对端节点同步、网关防脑裂自检 (--gateway-ip)、虚拟 IP (VIP) 等高级参数，"
+            echo "         均已全部移至 Web 管理控制台进行图形化配置并支持在线热生效，无需在安装时复杂指定！"
             exit 0
             ;;
         *)
@@ -112,37 +108,6 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
-
-# 如果是交互式终端且角色为 manager，且用户未显式通过参数指定 --ha-mode，提供交互式模式选择
-if [ -t 0 ] && [ "$ROLE" == "manager" ] && [ "$HA_MODE" == "standalone" ] && [ -z "$PEER_URL" ]; then
-    echo "=================================================================="
-    echo "       请选择管理组件的部署安装模式:                                "
-    echo "=================================================================="
-    echo "  1) 单节点独立部署 (Standalone - 默认)"
-    echo "  2) 主备高可用部署 - 主管理节点 (HA Primary)"
-    echo "  3) 主备高可用部署 - 备管理节点 (HA Backup)"
-    echo "=================================================================="
-    read -r -p "请输入选项 [1-3, 默认 1]: " HA_CHOICE
-    case "$HA_CHOICE" in
-        2)
-            HA_MODE="primary"
-            read -r -p "请输入对端备管理节点地址 (例如 http://192.168.1.11:8080，可留空稍后配置): " PEER_URL_INPUT
-            if [ -n "$PEER_URL_INPUT" ]; then PEER_URL="$PEER_URL_INPUT"; fi
-            read -r -p "请输入虚拟高可用 IP/VIP (例如 192.168.1.200/24，无 VIP 请直接回车): " VIP_INPUT
-            if [ -n "$VIP_INPUT" ]; then VIP="$VIP_INPUT"; fi
-            ;;
-        3)
-            HA_MODE="backup"
-            read -r -p "请输入对端主管理节点地址 (例如 http://192.168.1.10:8080): " PEER_URL_INPUT
-            if [ -n "$PEER_URL_INPUT" ]; then PEER_URL="$PEER_URL_INPUT"; fi
-            read -r -p "请输入虚拟高可用 IP/VIP (例如 192.168.1.200/24，无 VIP 请直接回车): " VIP_INPUT
-            if [ -n "$VIP_INPUT" ]; then VIP="$VIP_INPUT"; fi
-            ;;
-        *)
-            HA_MODE="standalone"
-            ;;
-    esac
-fi
 
 if [ -z "$DATA_DIR" ]; then
     DATA_DIR="$INSTALL_DIR/data"
@@ -301,23 +266,12 @@ echo "          🎉 安装完成！系统已成功部署并运行              
 echo "=================================================================="
 if [ "$ROLE" == "manager" ]; then
     echo "  ▶ 控制台 Web 访问地址: http://$LOCAL_IP:$PORT"
-    if [ "$HA_MODE" == "standalone" ]; then
-        echo "  ▶ 部署架构模式: 单节点独立模式 (Standalone)"
-    else
-        echo "  ▶ 部署架构模式: 主备高可用架构 (HA: $HA_MODE)"
-        if [ -n "$PEER_URL" ]; then
-            echo "  ▶ 对端节点地址: $PEER_URL"
-            echo "  ▶ 数据快照同步: 自动每 5 秒进行全量元数据热重载同步"
-            echo "  ▶ 故障感知机制: 6 秒内自动故障转移 (Failover 自动晋升)"
-        fi
-        if [ -n "$VIP" ]; then
-            echo "  ▶ 虚拟高可用 IP: $VIP (Active 节点自动接管绑定)"
-        fi
-    fi
     echo "  ▶ 初始管理员账号: admin"
     echo "  ▶ 初始管理员密码: admin123"
     echo "  ▶ 数据存储隔离目录: $DATA_DIR"
-    echo "  ▶ 业务组件后续安装: 登录 Web 控制台 -> [集群节点] -> 一键远程安装"
+    echo "  ▶ ⚙️ 高可用与网络配置: 登录 Web 控制台 -> [集群节点] -> [⚙️ 高可用与网络配置]"
+    echo "     (支持在线随时设置主备 HA 模式、网关防脑裂 IP (--gateway-ip)、双重仲裁与 VIP，即时生效)"
+    echo "  ▶ 业务组件后续安装: 登录 Web 控制台 -> [集群节点] -> 一键远程安装 (SSH)"
 else
     echo "  ▶ 业务计算节点已接入: $LOCAL_IP:$PORT"
     echo "  ▶ 所属管理节点: $MANAGER_URL"

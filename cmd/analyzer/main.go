@@ -105,6 +105,11 @@ func runManager(args []string) {
 	}
 	defer st.Close()
 
+	// 若数据库中已有通过 Web 管理页面配置的高可用与网络配置，自动加载并应用 (支持网页配置持久化)
+	if savedHACfg, err := st.GetHAConfig(); err == nil && savedHACfg != nil {
+		cfg.ApplyHAConfig(*savedHACfg)
+	}
+
 	// 保存自身作为管理节点展示
 	mgrNode := &model.Node{
 		ID:       fmt.Sprintf("manager_%s", cfg.HAMode),
