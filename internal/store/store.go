@@ -323,6 +323,27 @@ func (s *Store) GetNode(id string) (*model.Node, error) {
 	return n, err
 }
 
+// CalculateNodeStorageUsage 统计指定业务节点上保存的日志归档总字节数
+func (s *Store) CalculateNodeStorageUsage(nodeID string) (int64, error) {
+	var totalBytes int64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var a model.LogArchive
+			if err := json.Unmarshal(v, &a); err == nil {
+				if a.StorageNodeID == nodeID {
+					totalBytes += a.Size
+				}
+			}
+			return nil
+		})
+	})
+	return totalBytes, err
+}
+
 func (s *Store) ListNodes() ([]*model.Node, error) {
 	var list []*model.Node
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -335,7 +356,16 @@ func (s *Store) ListNodes() ([]*model.Node, error) {
 			return nil
 		})
 	})
-	return list, err
+	if err != nil {
+		return nil, err
+	}
+	// 动态填充各节点的存储日志大小
+	for _, n := range list {
+		if usage, err := s.CalculateNodeStorageUsage(n.ID); err == nil {
+			n.StorageUsedBytes = usage
+		}
+	}
+	return list, nil
 }
 
 func (s *Store) DeleteNode(id string) error {

@@ -720,8 +720,20 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 
 	// 检查目标存储节点
 	var targetWorker *model.Node
-	if targetNodeID != "" && targetNodeID != "manager_primary" && targetNodeID != "local" {
+	if targetNodeID == "auto" || targetNodeID == "" {
+		// 自动智能调度：优先使用已使用容量最低的业务节点存放
+		targetWorker = s.scheduler.PickLowestUsageWorker(header.Size)
+		if targetWorker != nil {
+			log.Printf("[Manager] 智能容量调度生效：选定已用容量最低的业务节点 %s (已用: %d MB, 剩余: %d MB) 存放日志包 %s",
+				targetWorker.Name, targetWorker.Resource.DiskUsedMB, targetWorker.Resource.DiskFreeMB, header.Filename)
+		}
+	} else if targetNodeID != "manager_primary" && targetNodeID != "local" {
 		targetWorker, _ = s.store.GetNode(targetNodeID)
+		// 如果用户指定的节点不在线，自动重新回退到容量最低的在线节点
+		if targetWorker == nil || targetWorker.Role != "worker" || targetWorker.Status != "online" {
+			log.Printf("[Manager] 用户指定的节点不可用，自动重定向至已用容量最低的在线业务节点")
+			targetWorker = s.scheduler.PickLowestUsageWorker(header.Size)
+		}
 	}
 
 	// 如果选定的业务节点在线，直接存储并分发至该业务节点已挂载的存储硬盘

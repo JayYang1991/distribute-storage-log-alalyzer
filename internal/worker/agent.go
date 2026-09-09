@@ -512,10 +512,21 @@ func (a *Agent) collectSystemResource() model.SystemResource {
 		Arch: runtime.GOARCH,
 	}
 
-	// 磁盘空间
+	// 磁盘空间 (采集总容量、已用容量、可用容量与使用率)
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(a.cfg.DataDir, &stat); err == nil {
-		res.DiskFreeMB = int64(stat.Bavail * uint64(stat.Bsize) / (1024 * 1024))
+		totalMB := int64(stat.Blocks * uint64(stat.Bsize) / (1024 * 1024))
+		freeMB := int64(stat.Bavail * uint64(stat.Bsize) / (1024 * 1024))
+		usedMB := totalMB - freeMB
+		if usedMB < 0 {
+			usedMB = 0
+		}
+		res.DiskTotalMB = totalMB
+		res.DiskUsedMB = usedMB
+		res.DiskFreeMB = freeMB
+		if totalMB > 0 {
+			res.DiskUsedPercent = float64(usedMB) / float64(totalMB) * 100
+		}
 	}
 
 	// 内存读取 /proc/meminfo

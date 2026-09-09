@@ -23,12 +23,15 @@ type User struct {
 
 // SystemResource 节点系统资源上报
 type SystemResource struct {
-	CPUPercent float64 `json:"cpu_percent"`
-	MemTotalMB int64   `json:"mem_total_mb"`
-	MemUsedMB  int64   `json:"mem_used_mb"`
-	DiskFreeMB int64   `json:"disk_free_mb"`
-	OS         string  `json:"os"`
-	Arch       string  `json:"arch"`
+	CPUPercent      float64 `json:"cpu_percent"`
+	MemTotalMB      int64   `json:"mem_total_mb"`
+	MemUsedMB       int64   `json:"mem_used_mb"`
+	DiskTotalMB     int64   `json:"disk_total_mb"`     // 磁盘总空间 (MB)
+	DiskUsedMB      int64   `json:"disk_used_mb"`      // 磁盘已用空间 (MB)
+	DiskFreeMB      int64   `json:"disk_free_mb"`      // 磁盘剩余可用空间 (MB)
+	DiskUsedPercent float64 `json:"disk_used_percent"` // 磁盘已使用率 (0-100%)
+	OS              string  `json:"os"`
+	Arch            string  `json:"arch"`
 }
 
 // DiskInfo 远程物理磁盘信息
@@ -50,20 +53,21 @@ type DiskInfo struct {
 
 // Node 节点实体
 type Node struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	IP            string         `json:"ip"`
-	Port          int            `json:"port"`
-	Role          string         `json:"role"` // manager | worker
-	Status        string         `json:"status"` // online | offline | installing | failed
-	Resource      SystemResource `json:"resource"`
-	DiskDevice    string         `json:"disk_device,omitempty"` // 格式化挂载的磁盘设备，如 /dev/sdb
-	MountPoint    string         `json:"mount_point,omitempty"` // 挂载路径，如 /data/dist-log-storage
-	FSType        string         `json:"fs_type,omitempty"`     // 文件系统类型 ext4/xfs
-	ActiveTasks   int            `json:"active_tasks"`
-	InstallLog    string         `json:"install_log,omitempty"`
-	LastHeartbeat time.Time      `json:"last_heartbeat"`
-	JoinedAt      time.Time      `json:"joined_at"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	IP               string         `json:"ip"`
+	Port             int            `json:"port"`
+	Role             string         `json:"role"` // manager | worker
+	Status           string         `json:"status"` // online | offline | installing | failed
+	Resource         SystemResource `json:"resource"`
+	StorageUsedBytes int64          `json:"storage_used_bytes"` // 该节点上已保存的日志包总大小(字节)
+	DiskDevice       string         `json:"disk_device,omitempty"` // 格式化挂载的磁盘设备，如 /dev/sdb
+	MountPoint       string         `json:"mount_point,omitempty"` // 挂载路径，如 /data/dist-log-storage
+	FSType           string         `json:"fs_type,omitempty"`     // 文件系统类型 ext4/xfs
+	ActiveTasks      int            `json:"active_tasks"`
+	InstallLog       string         `json:"install_log,omitempty"`
+	LastHeartbeat    time.Time      `json:"last_heartbeat"`
+	JoinedAt         time.Time      `json:"joined_at"`
 }
 
 // LogArchive 用户上传的压缩包日志记录

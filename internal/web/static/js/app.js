@@ -453,16 +453,45 @@ const app = {
     const sel = document.getElementById("upload-target-node");
     if (!sel) return;
     const currentVal = sel.value;
-    sel.innerHTML = '<option value="manager_primary">管理节点本地存储</option>';
-    this.nodes.forEach(n => {
-      if (n.role === "worker" && n.status === "online") {
-        const diskInfo = n.disk_device ? ` [磁盘: ${n.disk_device}]` : '';
-        const freeGB = n.resource && n.resource.disk_free_mb ? ` (可用: ${(n.resource.disk_free_mb/1024).toFixed(1)}GB)` : '';
-        sel.innerHTML += `<option value="${n.id}">${this.escape(n.name)} - ${n.ip}:${n.port}${diskInfo}${freeGB}</option>`;
-      }
+
+    // 筛选所有在线计算节点
+    const workers = this.nodes.filter(n => n.role === "worker" && n.status === "online");
+
+    // 核心算法：按已使用容量升序排序 (容量最低的优先排在前列)
+    workers.sort((a, b) => {
+      const usedA = (a.resource && a.resource.disk_used_mb) ? a.resource.disk_used_mb : (a.storage_used_bytes ? Math.round(a.storage_used_bytes / (1024 * 1024)) : 0);
+      const usedB = (b.resource && b.resource.disk_used_mb) ? b.resource.disk_used_mb : (b.storage_used_bytes ? Math.round(b.storage_used_bytes / (1024 * 1024)) : 0);
+      if (usedA !== usedB) return usedA - usedB;
+      const freeA = a.resource?.disk_free_mb || 0;
+      const freeB = b.resource?.disk_free_mb || 0;
+      return freeB - freeA; // 剩余可用空间大的优先
     });
-    if (currentVal) {
+
+    let opts = "";
+    if (workers.length > 0) {
+      const lowest = workers[0];
+      const lowestUsed = lowest.resource?.disk_used_mb ? `${(lowest.resource.disk_used_mb / 1024).toFixed(2)} GB` : '0 MB';
+      opts += `<option value="auto">🎯 智能调度 (优先存放至已用容量最低节点: ${this.escape(lowest.name)}，已用 ${lowestUsed})</option>`;
+
+      workers.forEach((n, idx) => {
+        const usedMB = (n.resource && n.resource.disk_used_mb) ? n.resource.disk_used_mb : (n.storage_used_bytes ? Math.round(n.storage_used_bytes / (1024 * 1024)) : 0);
+        const usedStr = usedMB >= 1024 ? `${(usedMB / 1024).toFixed(2)} GB` : `${usedMB} MB`;
+        const freeGB = n.resource?.disk_free_mb ? `${(n.resource.disk_free_mb / 1024).toFixed(1)} GB` : '未知';
+        const pctStr = n.resource?.disk_used_percent ? ` (${n.resource.disk_used_percent.toFixed(1)}%)` : '';
+        const recBadge = (idx === 0) ? ' ⭐ [推荐: 已用容量最低]' : '';
+        const diskInfo = n.disk_device ? ` [磁盘: ${n.disk_device}]` : '';
+
+        opts += `<option value="${n.id}">${this.escape(n.name)} - ${n.ip}:${n.port}${diskInfo} (已用: ${usedStr}${pctStr}, 剩余可用: ${freeGB})${recBadge}</option>`;
+      });
+    }
+
+    opts += '<option value="manager_primary">管理节点本地存储 (Local Manager)</option>';
+    sel.innerHTML = opts;
+
+    if (currentVal && Array.from(sel.options).some(o => o.value === currentVal)) {
       sel.value = currentVal;
+    } else if (workers.length > 0) {
+      sel.value = "auto";
     }
   },
 
@@ -481,7 +510,17 @@ const app = {
         : '<span class="badge badge-danger">离线</span>';
 
       const memStr = n.resource ? `${n.resource.mem_used_mb || 0} / ${n.resource.mem_total_mb || 0} MB` : "-";
-      const diskStr = n.resource ? `${(n.resource.disk_free_mb / 1024).toFixed(1)} GB` : "-";
+      
+      // 丰富容量展示：已用容量与剩余空间
+      const usedMB = (n.resource && n.resource.disk_used_mb) ? n.resource.disk_used_mb : (n.storage_used_bytes ? Math.round(n.storage_used_bytes / (1024 * 1024)) : 0);
+      const usedStr = usedMB >= 1024 ? `${(usedMB / 1024).toFixed(2)} GB` : `${usedMB} MB`;
+      const freeStr = n.resource?.disk_free_mb ? `${(n.resource.disk_free_mb / 1024).toFixed(1)} GB` : "-";
+      const pctStr = n.resource?.disk_used_percent ? `${n.resource.disk_used_percent.toFixed(1)}%` : "";
+      
+      const diskHtml = (n.resource && n.resource.disk_total_mb > 0)
+        ? `<div><strong>${freeStr} 可用</strong></div><div style="font-size: 11px; color: var(--text-muted);">已用 ${usedStr} (${pctStr})</div>`
+        : `<div>${freeStr} 可用</div><div style="font-size: 11px; color: var(--text-muted);">日志占用: ${usedStr}</div>`;
+
       const lastHb = n.last_heartbeat ? new Date(n.last_heartbeat).toLocaleTimeString() : "-";
       const diskBadge = n.disk_device ? `<span style="font-size: 11px; color: var(--primary); display: block;">💾 ${this.escape(n.disk_device)} (${n.fs_type || 'ext4'})</span>` : '';
 
@@ -492,7 +531,7 @@ const app = {
         <td>${statusBadge}</td>
         <td>${n.active_tasks || 0}</td>
         <td>${memStr}</td>
-        <td>${diskStr}</td>
+        <td>${diskHtml}</td>
         <td>${lastHb}</td>
         <td>
           ${n.role !== "manager" && this.currentUser?.role === "admin" ? `
