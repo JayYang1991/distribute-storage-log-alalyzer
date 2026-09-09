@@ -54,8 +54,10 @@ chmod +x "$STAGE_DIR/bin/dist-log-analyzer"
 # 复制脚本
 cp -f "$PROJECT_ROOT/scripts/install.sh" "$STAGE_DIR/install.sh"
 cp -f "$PROJECT_ROOT/scripts/install.sh" "$STAGE_DIR/scripts/install.sh"
+cp -f "$PROJECT_ROOT/scripts/uninstall.sh" "$STAGE_DIR/uninstall.sh"
+cp -f "$PROJECT_ROOT/scripts/uninstall.sh" "$STAGE_DIR/scripts/uninstall.sh"
 cp -f "$PROJECT_ROOT/scripts/service.sh" "$STAGE_DIR/scripts/service.sh"
-chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/scripts/"*.sh
+chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/scripts/"*.sh
 
 # 生成默认配置文件模版
 cat > "$STAGE_DIR/conf/config.example.json" <<EOF
@@ -64,45 +66,33 @@ cat > "$STAGE_DIR/conf/config.example.json" <<EOF
   "port": 8080,
   "listen_host": "0.0.0.0",
   "data_dir": "./data",
-  "cluster_token": "dist-log-cluster-secret-token",
-  "jwt_secret": "dist-log-jwt-secret-key-2026",
-  "initial_admin": {
-    "username": "admin",
-    "password": "admin123"
-  }
+  "log_dir": "./logs",
+  "log_level": "info",
+  "cluster_token": "dist-log-cluster-secret-token"
 }
 EOF
 
-# 生成安装包内的自述文档
+# 生成包内快速指引
 cat > "$STAGE_DIR/README.md" <<EOF
 # 分布式存储日志分析系统 (Distributed Storage Log Analyzer)
 
-本系统采用纯静态单一二进制构建，零外部依赖，天然适配通用 RedHat / CentOS 7/8/9、Rocky Linux、AlmaLinux 等主流 Linux 环境。
-
-## 快速一键安装管理组件 (Manager)
+## 快速安装
 \`\`\`bash
-# 默认安装并启动管理组件 (HTTP: 8080)
-sudo ./install.sh
+# 1. 安装管理节点 Manager (默认端口 8080)
+sudo ./install.sh --role=manager
 
-# 或者自定义端口与数据目录安装:
-sudo ./install.sh --role=manager --port=8080 --data-dir=/opt/dist-log/data
+# 2. 安装业务节点 Worker (默认端口 8081)
+sudo ./install.sh --role=worker --manager-url=http://<管理节点IP>:8080
 \`\`\`
-
-安装完成后，打开浏览器访问控制台：
-- 访问地址: http://<服务器IP>:8080
-- 默认管理员账号: admin
-- 默认管理员密码: admin123
-
-## 在 Web 控制台一键安装业务组件 (Worker)
-1. 登录管理员控制台；
-2. 点击侧边栏【集群节点与安装】；
-3. 点击【一键安装业务组件 (SSH)】，填写目标业务主机 IP 及 SSH 凭据，系统将自动进行 SFTP 推包与一键远程部署；
-4. 或者复制界面提供的离线安装命令在目标主机执行。
 
 ## 服务管理命令
 - 查看状态: \`./scripts/service.sh status\` (或 \`systemctl status dist-log-manager\`)
 - 停止服务: \`./scripts/service.sh stop\`   (或 \`systemctl stop dist-log-manager\`)
 - 重启服务: \`./scripts/service.sh restart\`(或 \`systemctl restart dist-log-manager\`)
+
+## 一键卸载
+- 安全卸载 (保留历史数据): \`sudo ./uninstall.sh\`
+- 彻底卸载 (清除全部数据): \`sudo ./uninstall.sh --purge -y\`
 EOF
 
 echo "[3/4] 打包生成归档压缩包 ($PACKAGE_NAME.tar.gz)..."
@@ -125,5 +115,6 @@ echo ""
 echo "  ▶ 交付使用方法 (在目标机器上直接执行):"
 echo "     tar -zxvf $PACKAGE_NAME.tar.gz"
 echo "     cd $PACKAGE_NAME"
-echo "     sudo ./install.sh"
+echo "     sudo ./install.sh       # 一键安装"
+echo "     sudo ./uninstall.sh     # 一键卸载"
 echo "=================================================================="

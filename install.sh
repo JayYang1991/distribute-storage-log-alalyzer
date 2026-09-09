@@ -174,6 +174,16 @@ elif [ -f "$SCRIPT_DIR/service.sh" ]; then
     chmod +x "$INSTALL_DIR/service.sh" "$INSTALL_DIR/scripts/service.sh"
 fi
 
+if [ -f "$SCRIPT_DIR/scripts/uninstall.sh" ]; then
+    cp -f "$SCRIPT_DIR/scripts/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
+    cp -f "$SCRIPT_DIR/scripts/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
+    chmod +x "$INSTALL_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
+elif [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    cp -f "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
+    cp -f "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
+    chmod +x "$INSTALL_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
+fi
+
 # 4. 获取本机 IP
 LOCAL_IP="127.0.0.1"
 if command -v hostname >/dev/null 2>&1; then
@@ -288,4 +298,8 @@ else
     echo "     $INSTALL_DIR/service.sh restart"
     echo "     $INSTALL_DIR/service.sh stop"
 fi
+echo ""
+echo "  ▶ 一键卸载命令:"
+echo "     sudo $INSTALL_DIR/uninstall.sh           # 安全卸载 (保留历史数据)"
+echo "     sudo $INSTALL_DIR/uninstall.sh --purge   # 彻底清除 (含数据与日志)"
 echo "=================================================================="

@@ -108,17 +108,18 @@ sudo ./install.sh --port=8080 --data-dir=/opt/dist-log/data
 3. 点击【开始一键安装并接入】，系统通过内置 SSH 自动完成传输与服务启动，业务节点自动向管理节点注册上线！
 4. 亦可点击【离线接入命令】，在目标机器终端粘贴运行一键脚本接入。
 
-### 4. 服务启停管理
-```bash
-# Systemd 方式
-systemctl status dist-log-manager
-systemctl restart dist-log-manager
-systemctl stop dist-log-manager
+### 5. 一键卸载与环境清理
+系统提供全自动安全卸载脚本，可自动停止与注销 Systemd 守护服务、清理运行进程并清除程序文件：
 
-# 或使用脚本方式 (无 systemd 环境)
-./scripts/service.sh status
-./scripts/service.sh restart
-./scripts/service.sh stop
+```bash
+# 1. 安全卸载 (注销服务并清理程序二进制，默认安全保留历史分析数据与数据库):
+sudo ./uninstall.sh
+
+# 2. 彻底卸载 (连同数据目录 data/、用户上传的归档日志包及 SQLite 数据库一并清空):
+sudo ./uninstall.sh --purge -y
+
+# 3. 指定自定义安装目录卸载:
+sudo ./uninstall.sh --install-dir=/opt/dist-log-analyzer-manager
 ```
 
 ---
@@ -141,9 +142,11 @@ systemctl stop dist-log-manager
 │   └── worker/                 # 业务计算节点核心 (解压缩, 全文检索, 资源上报)
 ├── scripts/
 │   ├── install.sh              # 统一安装脚本 (适配 manager 与 worker)
+│   ├── uninstall.sh            # 一键安全/彻底卸载与环境清理脚本
 │   └── service.sh              # 服务管理与进程守护控制脚本
 ├── package.sh                  # 一键打包生成免依赖发布压缩包脚本
 ├── install.sh                  # 根目录快捷安装入口
+├── uninstall.sh                # 根目录快捷卸载入口
 ├── go.mod                      # 纯 Go 模块定义
 └── README.md                   # 系统说明文档
 ```
