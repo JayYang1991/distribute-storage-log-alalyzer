@@ -1,0 +1,493 @@
+package store
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"dist-log-analyzer/internal/config"
+	"dist-log-analyzer/internal/model"
+
+	bolt "go.etcd.io/bbolt"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var (
+	bucketUsers    = []byte("users")
+	bucketNodes    = []byte("nodes")
+	bucketArchives = []byte("archives")
+	bucketRules    = []byte("rules")
+	bucketReports  = []byte("reports")
+)
+
+type Store struct {
+	db      *bolt.DB
+	dataDir string
+	mu      sync.RWMutex
+}
+
+func NewStore(cfg *config.Config) (*Store, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data dir: %w", err)
+	}
+
+	dbPath := filepath.Join(cfg.DataDir, "analyzer.db")
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open bbolt db: %w", err)
+	}
+
+	s := &Store{
+		db:      db,
+		dataDir: cfg.DataDir,
+	}
+
+	// 初始化各 bucket
+	err = db.Update(func(tx *bolt.Tx) error {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// 初始化管理员账号
+	if err := s.initAdmin(cfg.InitialAdmin.Username, cfg.InitialAdmin.Password); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
+// ExportSnapshot 导出 bbolt 当前数据快照流 (并发安全)
+func (s *Store) ExportSnapshot(w io.Writer) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.db == nil {
+		return 0, errors.New("database is not open")
+	}
+
+	var written int64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		n, err := tx.WriteTo(w)
+		written = n
+		return err
+	})
+	return written, err
+}
+
+// ReloadFromSnapshot 从快照流原子重载数据库 (备节点数据同步专用)
+func (s *Store) ReloadFromSnapshot(r io.Reader) (int64, error) {
+	tmpPath := filepath.Join(s.dataDir, "analyzer.db.sync_tmp")
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return 0, fmt.Errorf("创建同步临时文件失败: %w", err)
+	}
+
+	written, err := io.Copy(f, r)
+	_ = f.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("写入同步数据流失败: %w", err)
+	}
+
+	// 验证临时数据库文件是否完好
+	testDB, err := bolt.Open(tmpPath, 0600, &bolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("验证同步数据快照损坏: %w", err)
+	}
+	_ = testDB.Close()
+
+	// 加全局排他写锁，执行原子切换
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dbPath := filepath.Join(s.dataDir, "analyzer.db")
+	if s.db != nil {
+		_ = s.db.Close()
+	}
+
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		// rename 失败尝试重新打开原 db
+		s.db, _ = bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 2 * time.Second})
+		return 0, fmt.Errorf("原子替换数据库文件失败: %w", err)
+	}
+
+	newDB, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		return 0, fmt.Errorf("重新加载数据库失败: %w", err)
+	}
+	s.db = newDB
+
+	return written, nil
+}
+
+func (s *Store) initAdmin(username, password string) error {
+	existing, err := s.GetUserByUsername(username)
+	if err == nil && existing != nil {
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	admin := &model.User{
+		ID:               "usr_admin_001",
+		Username:         username,
+		PasswordHash:     string(hash),
+		Role:             model.RoleAdmin,
+		SpaceQuotaBytes:  0, // 不受限制
+		UsedStorageBytes: 0,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+	if err := s.SaveUser(admin); err != nil {
+		return err
+	}
+	// 创建物理目录
+	return s.EnsureUserDirectories(username)
+}
+
+// ================= 用户物理存储空间隔离 =================
+
+func (s *Store) GetUserBaseDir(username string) string {
+	return filepath.Join(s.dataDir, "users", username)
+}
+
+func (s *Store) GetUserArchiveDir(username string) string {
+	return filepath.Join(s.GetUserBaseDir(username), "archives")
+}
+
+func (s *Store) GetUserExtractDir(username, archiveID string) string {
+	return filepath.Join(s.GetUserBaseDir(username), "extracted", archiveID)
+}
+
+func (s *Store) EnsureUserDirectories(username string) error {
+	if err := os.MkdirAll(s.GetUserArchiveDir(username), 0755); err != nil {
+		return err
+	}
+	return os.MkdirAll(filepath.Join(s.GetUserBaseDir(username), "extracted"), 0755)
+}
+
+// CalculateUserStorageUsage 实时遍历用户物理目录统计使用空间
+func (s *Store) CalculateUserStorageUsage(username string) (int64, error) {
+	baseDir := s.GetUserBaseDir(username)
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		return 0, nil
+	}
+	var totalSize int64
+	err := filepath.WalkDir(baseDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			info, err := d.Info()
+			if err == nil {
+				totalSize += info.Size()
+			}
+		}
+		return nil
+	})
+	return totalSize, err
+}
+
+// CheckUserQuota 校验用户存储配额
+func (s *Store) CheckUserQuota(username string, incomingSize int64) error {
+	user, err := s.GetUserByUsername(username)
+	if err != nil {
+		return err
+	}
+	if user.SpaceQuotaBytes <= 0 {
+		return nil // 无限制
+	}
+	usage, err := s.CalculateUserStorageUsage(username)
+	if err != nil {
+		return err
+	}
+	if usage+incomingSize > user.SpaceQuotaBytes {
+		return fmt.Errorf("存储空间配额不足: 当前使用 %.2f MB, 尝试增加 %.2f MB, 配额上限 %.2f MB",
+			float64(usage)/(1024*1024), float64(incomingSize)/(1024*1024), float64(user.SpaceQuotaBytes)/(1024*1024))
+	}
+	return nil
+}
+
+// ================= 用户数据存取 =================
+
+func (s *Store) SaveUser(u *model.User) error {
+	u.UpdatedAt = time.Now()
+	data, err := json.Marshal(u)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		return b.Put([]byte(u.Username), data)
+	})
+}
+
+func (s *Store) GetUserByUsername(username string) (*model.User, error) {
+	var u *model.User
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		data := b.Get([]byte(username))
+		if data == nil {
+			return errors.New("user not found")
+		}
+		return json.Unmarshal(data, &u)
+	})
+	return u, err
+}
+
+func (s *Store) ListUsers() ([]*model.User, error) {
+	var list []*model.User
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		return b.ForEach(func(k, v []byte) error {
+			var u model.User
+			if err := json.Unmarshal(v, &u); err == nil {
+				list = append(list, &u)
+			}
+			return nil
+		})
+	})
+	// 动态更新已用空间
+	for _, u := range list {
+		if usage, err := s.CalculateUserStorageUsage(u.Username); err == nil {
+			u.UsedStorageBytes = usage
+		}
+	}
+	return list, err
+}
+
+func (s *Store) DeleteUser(username string) error {
+	if username == "admin" {
+		return errors.New("cannot delete default admin")
+	}
+	// 清理物理目录
+	_ = os.RemoveAll(s.GetUserBaseDir(username))
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketUsers)
+		return b.Delete([]byte(username))
+	})
+}
+
+// ================= 节点管理 =================
+
+func (s *Store) SaveNode(n *model.Node) error {
+	data, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		return b.Put([]byte(n.ID), data)
+	})
+}
+
+func (s *Store) GetNode(id string) (*model.Node, error) {
+	var n *model.Node
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("node not found")
+		}
+		return json.Unmarshal(data, &n)
+	})
+	return n, err
+}
+
+func (s *Store) ListNodes() ([]*model.Node, error) {
+	var list []*model.Node
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		return b.ForEach(func(k, v []byte) error {
+			var n model.Node
+			if err := json.Unmarshal(v, &n); err == nil {
+				list = append(list, &n)
+			}
+			return nil
+		})
+	})
+	return list, err
+}
+
+func (s *Store) DeleteNode(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		return b.Delete([]byte(id))
+	})
+}
+
+// ================= 日志压缩包存取 =================
+
+func (s *Store) SaveArchive(a *model.LogArchive) error {
+	data, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		return b.Put([]byte(a.ID), data)
+	})
+}
+
+func (s *Store) GetArchive(id string) (*model.LogArchive, error) {
+	var a *model.LogArchive
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("archive not found")
+		}
+		return json.Unmarshal(data, &a)
+	})
+	return a, err
+}
+
+func (s *Store) ListArchives(username string, isAdmin bool) ([]*model.LogArchive, error) {
+	var list []*model.LogArchive
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		return b.ForEach(func(k, v []byte) error {
+			var a model.LogArchive
+			if err := json.Unmarshal(v, &a); err == nil {
+				if isAdmin || a.Username == username {
+					list = append(list, &a)
+				}
+			}
+			return nil
+		})
+	})
+	return list, err
+}
+
+func (s *Store) DeleteArchive(id, username string, isAdmin bool) error {
+	a, err := s.GetArchive(id)
+	if err != nil {
+		return err
+	}
+	if !isAdmin && a.Username != username {
+		return errors.New("permission denied")
+	}
+	// 删除物理文件及解包目录
+	if a.ExtractPath != "" {
+		_ = os.RemoveAll(a.ExtractPath)
+	}
+	archiveFile := filepath.Join(s.GetUserArchiveDir(a.Username), a.Filename)
+	_ = os.Remove(archiveFile)
+
+	// 删除关联的诊断报告
+	_ = s.DeleteReport(id)
+
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		return b.Delete([]byte(id))
+	})
+}
+
+// ================= 规则管理 =================
+
+func (s *Store) SaveRule(r *model.Rule) error {
+	r.UpdatedAt = time.Now()
+	data, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRules)
+		return b.Put([]byte(r.ID), data)
+	})
+}
+
+func (s *Store) GetRule(id string) (*model.Rule, error) {
+	var r *model.Rule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRules)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("rule not found")
+		}
+		return json.Unmarshal(data, &r)
+	})
+	return r, err
+}
+
+func (s *Store) ListRules() ([]*model.Rule, error) {
+	var list []*model.Rule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRules)
+		return b.ForEach(func(k, v []byte) error {
+			var r model.Rule
+			if err := json.Unmarshal(v, &r); err == nil {
+				list = append(list, &r)
+			}
+			return nil
+		})
+	})
+	return list, err
+}
+
+func (s *Store) DeleteRule(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRules)
+		return b.Delete([]byte(id))
+	})
+}
+
+// ================= 诊断报告 =================
+
+func (s *Store) SaveReport(rep *model.DiagnosisReport) error {
+	data, err := json.Marshal(rep)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketReports)
+		return b.Put([]byte(rep.ArchiveID), data)
+	})
+}
+
+func (s *Store) GetReport(archiveID string) (*model.DiagnosisReport, error) {
+	var rep *model.DiagnosisReport
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketReports)
+		data := b.Get([]byte(archiveID))
+		if data == nil {
+			return errors.New("report not found")
+		}
+		return json.Unmarshal(data, &rep)
+	})
+	return rep, err
+}
+
+func (s *Store) DeleteReport(archiveID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketReports)
+		return b.Delete([]byte(archiveID))
+	})
+}

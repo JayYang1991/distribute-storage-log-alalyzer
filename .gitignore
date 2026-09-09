@@ -1,0 +1,15 @@
+# Binaries and packages
+bin/
+dist/
+*.tar.gz
+*.sha256
+
+# Logs and test artifacts
+*.log
+*.out
+*.test
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store

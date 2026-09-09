@@ -1,0 +1,79 @@
+name: Auto Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run Unit Tests
+        run: |
+          go test -v ./...
+
+      - name: Build and Package
+        run: |
+          chmod +x ./package.sh
+          ./package.sh
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "分布式存储日志分析系统 ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/dist-log-analyzer-linux-amd64.tar.gz
+            dist/dist-log-analyzer-linux-amd64.tar.gz.sha256
+          body: |
+            ## 📦 分布式存储日志分析系统 (Distributed Storage Log Analyzer) 发布包
+
+            ### 🚀 核心架构与特性
+            - **纯静态单一二进制**：采用 `CGO_ENABLED=0` 静态编译，零外部动态链接库依赖；
+            - **多节点分布式部署**：支持单节点独立模式 (Standalone) 与主备高可用模式 (Active-Standby HA)；
+            - **双向数据实时快照同步**：基于 bbolt 在线热重载快照，保证主备数据时刻 100% 同步；
+            - **防脑裂双重屏障**：默认网关连通性自检 + Worker 业务节点反向多数派法定人数仲裁，彻底杜绝双主；
+            - **硬盘智能探测与格式化防呆**：智能探测并排查已有文件系统/系统盘，支持选择挂载硬盘并格式化为 `ext4`/`xfs`；
+            - **多用户独立物理空间隔离**：授权用户沙箱隔离，常用压缩包格式 (.tar.gz, .zip 等) 在线文件树浏览与全文/正则检索；
+            - **内置存储故障特征库**：内置 Ceph / HDFS / MinIO / Linux IO 专家级故障预设规则，上传自动诊断出具评分报告；
+            - **通用环境兼容**：原生开箱即用于所有通用 RedHat / CentOS 7/8/9、Rocky Linux、AlmaLinux 等主流发行版。
+
+            ### 📥 一键安装指南 (目标服务器直接执行)
+            ```bash
+            # 1. 下载并解压发布包
+            tar -zxvf dist-log-analyzer-linux-amd64.tar.gz
+            cd dist-log-analyzer-linux-amd64
+
+            # 2. 单节点模式一键安装 (默认)
+            sudo ./install.sh --role=manager
+
+            # 3. 或主备高可用模式安装
+            # 主节点: sudo ./install.sh --role=manager --ha-mode=primary --peer-url=http://<备机IP>:8080
+            # 备节点: sudo ./install.sh --role=manager --ha-mode=backup --peer-url=http://<主机IP>:8080
+            ```
+
+            ### 🔐 校验和验证
+            ```bash
+            sha256sum -c dist-log-analyzer-linux-amd64.tar.gz.sha256
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

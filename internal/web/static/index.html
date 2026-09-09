@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>分布式存储日志分析系统 (Distributed Storage Log Analyzer)</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 侧边导航栏 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div>
+          <div class="brand-title">DistLog Analyzer</div>
+          <div class="brand-subtitle">分布式存储日志与诊断系统</div>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <div class="nav-item active" data-tab="dashboard">
+          <span class="icon">📊</span>
+          <span>概览仪表盘</span>
+        </div>
+        <div class="nav-item" data-tab="nodes">
+          <span class="icon">🖥️</span>
+          <span>集群节点与安装</span>
+        </div>
+        <div class="nav-item" data-tab="users" id="nav-users">
+          <span class="icon">👥</span>
+          <span>用户与存储空间</span>
+        </div>
+        <div class="nav-item" data-tab="archives">
+          <span class="icon">📦</span>
+          <span>日志归档与文件</span>
+        </div>
+        <div class="nav-item" data-tab="search">
+          <span class="icon">🔍</span>
+          <span>日志全局检索</span>
+        </div>
+        <div class="nav-item" data-tab="rules">
+          <span class="icon">🛡️</span>
+          <span>故障规则与诊断</span>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-badge">
+          <div class="avatar" id="user-avatar">A</div>
+          <div class="user-info">
+            <span class="user-name" id="user-name">admin</span>
+            <span class="user-role" id="user-role">Administrator</span>
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="btn-logout" title="退出登录">🚪</button>
+      </div>
+    </aside>
+
+    <!-- 主展示区 -->
+    <main class="main-content">
+      <header class="top-bar">
+        <div class="page-header">
+          <h2 id="page-title">概览仪表盘</h2>
+          <p id="page-desc">实时监控分布式存储计算节点状态与日志分析全局指标</p>
+        </div>
+        <div class="top-actions">
+          <div id="ha-top-indicator" style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 12px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);">
+            <span class="status-dot online"></span>
+            <span id="ha-top-text">HA: 检测中</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh">🔄 刷新数据</button>
+          <button class="btn btn-primary btn-sm" id="btn-quick-upload">⬆️ 上传日志包</button>
+        </div>
+      </header>
+
+      <div class="content-body">
+        <!-- 1. 概览仪表盘 Tab -->
+        <section class="tab-pane active" id="pane-dashboard">
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-icon blue">🖥️</div>
+              <div>
+                <div class="stat-label">集群总节点数</div>
+                <div class="stat-val" id="stat-nodes">1</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon green">📦</div>
+              <div>
+                <div class="stat-label">已处理日志归档包</div>
+                <div class="stat-val" id="stat-archives">0</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon purple">💾</div>
+              <div>
+                <div class="stat-label">存储占用空间</div>
+                <div class="stat-val" id="stat-storage">0.0 MB</div>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-icon red">⚠️</div>
+              <div>
+                <div class="stat-label">检出故障事件总数</div>
+                <div class="stat-val" id="stat-events">0</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">🚀 快捷操作与分布式节点接入</span>
+            </div>
+            <div class="card-body" style="display: flex; gap: 16px; flex-wrap: wrap;">
+              <button class="btn btn-primary" onclick="app.switchTab('nodes'); app.openDeployModal();">
+                ➕ 一键远程安装业务组件 (SSH)
+              </button>
+              <button class="btn btn-secondary" onclick="app.openAgentScriptModal();">
+                📋 查看业务组件离线一键接入脚本
+              </button>
+              <button class="btn btn-secondary" onclick="app.switchTab('rules');">
+                🛠️ 查看存储故障预设特征库
+              </button>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">🕒 最近上传的存储日志</span>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-recent-archives">
+                  <thead>
+                    <tr>
+                      <th>文件名</th>
+                      <th>所属用户</th>
+                      <th>大小</th>
+                      <th>文件数</th>
+                      <th>状态</th>
+                      <th>上传时间</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. 集群节点与安装 Tab -->
+        <section class="tab-pane" id="pane-nodes" style="display: none;">
+          <!-- 管理组件高可用 (HA) 状态监控卡片 -->
+          <div class="card" id="card-ha-status" style="margin-bottom: 20px; border: 1px solid rgba(59, 130, 246, 0.3);">
+            <div class="card-header" style="background: rgba(30, 41, 59, 0.4); display: flex; justify-content: space-between; align-items: center;">
+              <span class="card-title" style="display: flex; align-items: center; gap: 8px;">
+                <span>🛡️ 管理组件高可用 (HA) 主备状态</span>
+                <span id="ha-role-badge" class="badge badge-info">检测中</span>
+              </span>
+              <div id="ha-action-btns" style="display: flex; gap: 8px;">
+                <button class="btn btn-secondary btn-sm" onclick="app.fetchHAStatus()">🔄 刷新 HA 状态</button>
+                <button class="btn btn-warning btn-sm" id="btn-ha-switchover" onclick="app.doHASwitchover()" style="display: none;">⚡ 一键主备平滑倒换</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px;" id="ha-info-grid">
+                <!-- 动态填充 HA 指标 -->
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">🖥️ 分布式业务组件节点列表</span>
+              <div style="display: flex; gap: 10px;">
+                <button class="btn btn-secondary btn-sm" onclick="app.openAgentScriptModal();">📋 离线接入命令</button>
+                <button class="btn btn-primary btn-sm" onclick="app.openDeployModal();">➕ 一键安装业务组件 (SSH)</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-nodes">
+                  <thead>
+                    <tr>
+                      <th>节点名称</th>
+                      <th>角色</th>
+                      <th>IP 地址与端口</th>
+                      <th>节点状态</th>
+                      <th>活跃任务</th>
+                      <th>内存占用</th>
+                      <th>剩余磁盘</th>
+                      <th>最后心跳</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. 用户与存储空间 Tab -->
+        <section class="tab-pane" id="pane-users" style="display: none;">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">👥 多用户列表与独立存储空间隔离管理</span>
+              <button class="btn btn-primary btn-sm" onclick="app.openCreateUserModal();">➕ 创建新用户</button>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-users">
+                  <thead>
+                    <tr>
+                      <th>用户名</th>
+                      <th>角色</th>
+                      <th>状态</th>
+                      <th>已用存储空间</th>
+                      <th>空间配额上限</th>
+                      <th>使用百分比</th>
+                      <th>创建时间</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4. 日志归档与文件 Tab -->
+        <section class="tab-pane" id="pane-archives" style="display: none;">
+          <!-- 拖拽上传 -->
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">⬆️ 上传存储日志压缩包 (.tar.gz, .tgz, .zip, .tar, .gz, .bz2)</span>
+            </div>
+            <div class="card-body">
+              <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 14px; background: rgba(15, 23, 42, 0.4); padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+                <label class="form-label" style="margin: 0; white-space: nowrap; font-weight: 600; color: var(--primary);">🎯 存放业务计算节点:</label>
+                <select class="form-control" id="upload-target-node" style="flex: 1; max-width: 450px;">
+                  <option value="local">管理节点本地存储</option>
+                </select>
+                <span style="font-size: 11px; color: var(--text-dim);">* 上传的日志包将物理存储在该节点已格式化的硬盘上</span>
+              </div>
+              <div class="dropzone" id="archive-dropzone">
+                <div class="dropzone-icon">📁</div>
+                <h3>点击或拖拽常用压缩包格式日志到此处上传</h3>
+                <p style="color: var(--text-muted); margin-top: 6px; font-size: 12px;">
+                  支持 Ceph / HDFS / MinIO / GlusterFS / Linux 核心 I/O 运行日志。上传后自动在该选定业务节点解包与智能诊断！
+                </p>
+                <input type="file" id="file-input" style="display: none;">
+              </div>
+              <div id="upload-progress-box" style="margin-top: 15px; display: none;">
+                <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                  <span id="upload-filename">正在上传...</span>
+                  <span id="upload-percent">0%</span>
+                </div>
+                <div style="height: 6px; background: #334155; border-radius: 3px; overflow: hidden;">
+                  <div id="upload-progress-bar" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.2s;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 归档列表 -->
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">📦 日志包管理列表</span>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-all-archives">
+                  <thead>
+                    <tr>
+                      <th>归档包名称</th>
+                      <th>格式</th>
+                      <th>大小</th>
+                      <th>文件数</th>
+                      <th>总行数</th>
+                      <th>存放节点与磁盘</th>
+                      <th>分析状态</th>
+                      <th>上传时间</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 5. 日志检索 Tab -->
+        <section class="tab-pane" id="pane-search" style="display: none;">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">🔍 分布式日志智能检索中心</span>
+            </div>
+            <div class="card-body">
+              <form id="form-search" onsubmit="event.preventDefault(); app.doSearch();">
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 14px;">
+                  <div class="form-group">
+                    <label class="form-label">目标日志归档包 *</label>
+                    <select class="form-control" id="search-archive-select" required></select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">关键词或搜索模式</label>
+                    <input type="text" class="form-control" id="search-keyword" placeholder="例如：osd down, slow request, ChecksumException">
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">日志级别过滤</label>
+                    <select class="form-control" id="search-level">
+                      <option value="ALL">全部级别 (ALL)</option>
+                      <option value="ERROR">错误与崩溃 (ERROR / FATAL)</option>
+                      <option value="WARN">警告与降级 (WARN)</option>
+                      <option value="INFO">常规信息 (INFO)</option>
+                      <option value="DEBUG">调试跟踪 (DEBUG)</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">指定文件路径过滤</label>
+                    <input type="text" class="form-control" id="search-filepath" placeholder="例如：ceph.log 或 datanode">
+                  </div>
+                </div>
+
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                  <div style="display: flex; gap: 20px; font-size: 12px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                      <input type="checkbox" id="search-is-regex"> 启用正则表达式匹配
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                      <input type="checkbox" id="search-case-sensitive"> 区分大小写
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px;">
+                      上下文展开:
+                      <select id="search-context-lines" class="form-control" style="width: 70px; padding: 2px 6px;">
+                        <option value="0">无</option>
+                        <option value="2" selected>前后2行</option>
+                        <option value="5">前后5行</option>
+                      </select>
+                    </label>
+                  </div>
+                  <button type="submit" class="btn btn-primary" id="btn-exec-search">🔎 执行检索</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- 检索结果区 -->
+          <div class="card" id="search-results-card" style="display: none;">
+            <div class="card-header">
+              <span class="card-title" id="search-result-title">检索结果</span>
+              <span id="search-cost-badge" class="badge badge-info">耗时 0 ms</span>
+            </div>
+            <div class="card-body">
+              <div id="search-hits-container"></div>
+              <div id="search-pagination" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. 故障规则与诊断 Tab -->
+        <section class="tab-pane" id="pane-rules" style="display: none;">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">🛡️ 存储系统预设故障匹配特征库</span>
+              <div style="display: flex; gap: 10px;" id="admin-rule-actions">
+                <button class="btn btn-secondary btn-sm" onclick="app.resetDefaultRules();">🔄 恢复官方预设规则</button>
+                <button class="btn btn-primary btn-sm" onclick="app.openCreateRuleModal();">➕ 添加自定义规则</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-rules">
+                  <thead>
+                    <tr>
+                      <th>规则名称</th>
+                      <th>存储类型</th>
+                      <th>严重级别</th>
+                      <th>匹配特征 (Pattern)</th>
+                      <th>类型</th>
+                      <th>专家排查处置建议</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- 模态框 1: 一键安装业务组件 (SSH) -->
+  <div class="modal-overlay" id="modal-deploy">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title">🖥️ 一键远程安装业务组件 (SSH 自动化推包)</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-deploy')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px;">
+          管理节点将通过纯 Go 内置 SSH/SFTP 将业务组件直接传输至目标主机，免配外部软件源，真正零依赖开箱即用！
+        </p>
+        <form id="form-deploy" onsubmit="event.preventDefault(); app.submitDeploy();">
+          <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">目标主机 IP *</label>
+              <input type="text" class="form-control" id="deploy-host" placeholder="例如：192.168.1.120" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">SSH 端口</label>
+              <input type="number" class="form-control" id="deploy-port" value="22" required>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">SSH 登录用户名 *</label>
+              <input type="text" class="form-control" id="deploy-user" value="root" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">SSH 密码</label>
+              <input type="password" class="form-control" id="deploy-pass" placeholder="目标主机 root 密码">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">节点显示名称 (可选)</label>
+            <input type="text" class="form-control" id="deploy-name" placeholder="worker-node-02">
+          </div>
+
+          <!-- 存放日志的硬盘选择与格式化 -->
+          <div style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <label class="form-label" style="margin: 0; font-weight: 600; color: var(--primary);">💾 选择存放日志的物理硬盘并格式化</label>
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-detect-disks" onclick="app.detectDisks()">🔍 探测目标磁盘</button>
+            </div>
+            <div class="form-group" style="margin-bottom: 8px;">
+              <select class="form-control" id="deploy-disk-select" onchange="app.onDiskSelectChange()">
+                <option value="">-- 请点击“探测目标磁盘”或手动填写设备路径 --</option>
+              </select>
+            </div>
+            <div id="deploy-disk-hint" style="display: none; font-size: 12px; line-height: 1.4; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--radius-sm);"></div>
+            <div class="form-group" style="margin-bottom: 10px;">
+              <input type="text" class="form-control" id="deploy-disk-input" placeholder="设备路径，例如：/dev/sdb 或 /dev/vdb">
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <div class="form-group" style="margin: 0;">
+                <label class="form-label">文件系统格式</label>
+                <select class="form-control" id="deploy-fstype">
+                  <option value="ext4" selected>ext4 (Linux 通用标准)</option>
+                  <option value="xfs">xfs (RedHat/CentOS 推荐格式)</option>
+                </select>
+              </div>
+              <div class="form-group" style="margin: 0;">
+                <label class="form-label">硬盘挂载目录</label>
+                <input type="text" class="form-control" id="deploy-mountpoint" value="/data/dist-log-storage">
+              </div>
+            </div>
+            <div style="margin-top: 10px;">
+              <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; color: var(--warning);">
+                <input type="checkbox" id="deploy-format-disk" checked> ⚡ 部署时自动格式化该硬盘并写入开机自动挂载 (/etc/fstab)
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group" id="deploy-terminal-box" style="display: none;">
+            <label class="form-label">实时安装阶段日志</label>
+            <div class="terminal-output" id="deploy-terminal">正在建立 SSH 连接并推送安装包...</div>
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-deploy')">取消</button>
+            <button type="submit" class="btn btn-primary" id="btn-deploy-submit">🚀 开始一键安装并接入</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 2: 离线安装命令展示 -->
+  <div class="modal-overlay" id="modal-agent-script">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title">📋 业务组件离线快捷接入命令</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-agent-script')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          如果在无法直接使用 SSH 密码的环境，您可以在任意 RedHat / CentOS 目标主机终端粘贴并运行以下一键脚本命令：
+        </p>
+        <div class="terminal-output" id="agent-script-cmd" style="height: 120px; user-select: all; color: #a5f3fc;"></div>
+        <div style="margin-top: 14px; text-align: right;">
+          <button class="btn btn-primary btn-sm" onclick="app.copyAgentCmd()">📋 复制一键接入命令</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 3: 创建/编辑用户 -->
+  <div class="modal-overlay" id="modal-user">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title" id="modal-user-title">👥 创建系统用户与分配存储空间</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-user')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-user" onsubmit="event.preventDefault(); app.submitUser();">
+          <div class="form-group">
+            <label class="form-label">用户名 *</label>
+            <input type="text" class="form-control" id="user-username" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">登录密码 *</label>
+            <input type="password" class="form-control" id="user-password" placeholder="设置登录密码">
+          </div>
+          <div class="form-group">
+            <label class="form-label">用户角色</label>
+            <select class="form-control" id="user-role-select">
+              <option value="user">普通用户 (仅访问自己存储空间)</option>
+              <option value="admin">管理员 (拥有所有权限)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">存储空间配额限制</label>
+            <select class="form-control" id="user-quota-select">
+              <option value="0">无限制</option>
+              <option value="1073741824">1 GB</option>
+              <option value="5368709120">5 GB</option>
+              <option value="10737418240">10 GB</option>
+              <option value="53687091200">50 GB</option>
+              <option value="107374182400">100 GB</option>
+            </select>
+          </div>
+          <div class="modal-footer" style="padding: 14px 0 0 0;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-user')">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存用户</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 4: 在线文件树与日志查看器 -->
+  <div class="modal-overlay" id="modal-file-browser">
+    <div class="modal-content" style="max-width: 960px; height: 80vh;">
+      <div class="modal-header">
+        <h3 class="modal-title" id="file-browser-title">📁 日志文件解包目录树</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-file-browser')">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 0;">
+        <div class="file-browser">
+          <div class="file-tree" id="file-tree-container"></div>
+          <div class="file-viewer">
+            <div class="file-viewer-header">
+              <span id="viewer-filepath" style="color: var(--primary);">请选择左侧文件查看</span>
+              <span id="viewer-meta" style="color: var(--text-dim);"></span>
+            </div>
+            <div class="file-viewer-content" id="viewer-content"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 5: 故障诊断报告 -->
+  <div class="modal-overlay" id="modal-diagnosis">
+    <div class="modal-content" style="max-width: 860px; height: 85vh;">
+      <div class="modal-header">
+        <h3 class="modal-title" id="diag-modal-title">🛡️ 存储故障智能诊断报告</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-diagnosis')">&times;</button>
+      </div>
+      <div class="modal-body" id="diag-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- 模态框 6: 添加自定义规则 -->
+  <div class="modal-overlay" id="modal-rule">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 class="modal-title">🛡️ 新增/编辑存储故障匹配规则</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-rule')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-rule" onsubmit="event.preventDefault(); app.submitRule();">
+          <div class="form-group">
+            <label class="form-label">规则名称 *</label>
+            <input type="text" class="form-control" id="rule-name" placeholder="例如：Ceph OSD 下线告警" required>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">存储组件类型</label>
+              <select class="form-control" id="rule-storage">
+                <option value="Ceph">Ceph 分布式存储</option>
+                <option value="HDFS">Hadoop HDFS</option>
+                <option value="MinIO">MinIO 对象存储</option>
+                <option value="GlusterFS">GlusterFS</option>
+                <option value="Generic">通用 Linux 磁盘与文件系统</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">故障严重级别</label>
+              <select class="form-control" id="rule-severity">
+                <option value="FATAL">致命 (FATAL) - 业务严重中断</option>
+                <option value="CRITICAL">严重 (CRITICAL) - 冗余丢失/降级</option>
+                <option value="WARNING">警告 (WARNING) - 性能受损</option>
+                <option value="INFO">提示 (INFO) - 常规通知</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">匹配特征表达式 (Pattern) *</label>
+            <input type="text" class="form-control" id="rule-pattern" placeholder="例如：(?i)(osd down|heartbeat.*lost)" required>
+          </div>
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" id="rule-is-regex" checked> 按正则表达式匹配 (取消勾选则为精确字符串匹配)
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="form-label">故障描述</label>
+            <input type="text" class="form-control" id="rule-desc" placeholder="简述该故障发生的机理与影响">
+          </div>
+          <div class="form-group">
+            <label class="form-label">专家排查处置与自愈建议 *</label>
+            <textarea class="form-control" id="rule-suggestion" rows="3" placeholder="提供运维人员明确的定位命令与修复处置流程" required></textarea>
+          </div>
+          <div class="modal-footer" style="padding: 14px 0 0 0;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-rule')">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存规则</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 7: 登录弹窗 (未登录时展示) -->
+  <div class="modal-overlay" id="modal-login">
+    <div class="modal-content" style="max-width: 400px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🔐 登录系统</h3>
+      </div>
+      <div class="modal-body">
+        <form id="form-login" onsubmit="event.preventDefault(); app.doLogin();">
+          <div class="form-group">
+            <label class="form-label">用户名</label>
+            <input type="text" class="form-control" id="login-username" value="admin" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">密码</label>
+            <input type="password" class="form-control" id="login-password" value="admin123" required>
+          </div>
+          <div id="login-error" style="color: var(--danger); font-size: 12px; margin-bottom: 10px; display: none;"></div>
+          <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center;">立即登录</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
