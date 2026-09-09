@@ -60,6 +60,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// 启动 HA 状态机与数据同步
 	s.ha.Start(ctx)
 
+	// 启动业务计算节点心跳存活与自动故障告警监控协程
+	go s.startNodeHealthAndAlarmMonitor(ctx)
+
 	mux := http.NewServeMux()
 
 	// 静态文件与前端
@@ -75,6 +78,13 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/ha/switchover", s.handleHASwitchover)
 	mux.HandleFunc("/api/ha/promote", s.handleHAPromote)
 	mux.HandleFunc("/api/ha/demote", s.handleHADemote)
+
+	// 告警管理路由
+	mux.HandleFunc("/api/alarms", s.handleAlarms)
+	mux.HandleFunc("/api/alarms/report", s.handleAlarmReport)
+	mux.HandleFunc("/api/alarms/summary", s.handleAlarmSummary)
+	mux.HandleFunc("/api/alarms/clear-resolved", s.handleClearResolvedAlarms)
+	mux.HandleFunc("/api/alarms/", s.handleAlarmItem)
 
 	// 认证与用户管理
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
@@ -547,6 +557,9 @@ func (s *Server) handleClusterHeartbeat(w http.ResponseWriter, r *http.Request) 
 	node.LastHeartbeat = time.Now()
 	node.Status = "online"
 	_ = s.store.SaveNode(&node)
+
+	// 自动消警：节点重新上报心跳，自动解除此前的离线失联告警
+	_, _ = s.store.ResolveAlarm(node.ID, model.AlarmTypeNodeOffline)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -1318,5 +1331,213 @@ func (s *Server) handleHADemote(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
+}
+
+// ================= 告警系统 API 与节点心跳存活后台巡检 =================
+
+// startNodeHealthAndAlarmMonitor 后台定时巡检 Worker 节点心跳，感知失联并自动触发/消警
+func (s *Server) startNodeHealthAndAlarmMonitor(ctx context.Context) {
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 仅 Active 管理节点执行集群节点心跳超期告警检测
+			if !s.ha.IsActive() {
+				continue
+			}
+			nodes, err := s.store.ListNodes()
+			if err != nil {
+				continue
+			}
+			now := time.Now()
+			for _, node := range nodes {
+				if node.Role == "worker" {
+					if node.Status == "online" && now.Sub(node.LastHeartbeat) > 12*time.Second {
+						node.Status = "offline"
+						_ = s.store.SaveNode(node)
+
+						// 触发/聚合严重告警
+						_, _ = s.store.CreateOrAggregateAlarm(&model.Alarm{
+							NodeID:    node.ID,
+							NodeName:  node.Name,
+							NodeIP:    node.IP,
+							Component: "worker",
+							AlarmType: model.AlarmTypeNodeOffline,
+							Severity:  model.SeverityCritical,
+							Title:     fmt.Sprintf("业务计算节点 [%s] 离线失联", node.Name),
+							Message:   fmt.Sprintf("计算节点 %s (%s:%d) 超过 12 秒未发送心跳，可能已遭遇网络中断、服务器宕机或服务崩溃", node.Name, node.IP, node.Port),
+						})
+						log.Printf("[告警监控] 检测到计算节点 [%s] 离线失联，已自动生成 CRITICAL 严重告警！", node.Name)
+					}
+				}
+			}
+		}
+	}
+}
+
+// handleAlarmReport 接收业务组件主动上报的异常告警
+func (s *Server) handleAlarmReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := r.Header.Get("X-Cluster-Token")
+	if token != s.cfg.ClusterToken {
+		http.Error(w, "集群通信凭证无效", http.StatusUnauthorized)
+		return
+	}
+
+	var req model.AlarmReportReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	nodeName := req.NodeID
+	nodeIP := r.RemoteAddr
+	if n, err := s.store.GetNode(req.NodeID); err == nil && n != nil {
+		nodeName = n.Name
+		nodeIP = n.IP
+	}
+
+	alarm := &model.Alarm{
+		NodeID:    req.NodeID,
+		NodeName:  nodeName,
+		NodeIP:    nodeIP,
+		Component: "worker",
+		AlarmType: req.AlarmType,
+		Severity:  req.Severity,
+		Title:     req.Title,
+		Message:   req.Message,
+	}
+
+	created, err := s.store.CreateOrAggregateAlarm(alarm)
+	if err != nil {
+		http.Error(w, "保存告警失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[告警中心] 收到业务组件 [%s] 异常告警: %s (级别: %s, 频次: %d)",
+		nodeName, req.Title, req.Severity, created.Count)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"alarm":  created,
+	})
+}
+
+// handleAlarms 获取告警列表
+func (s *Server) handleAlarms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user, err := s.authenticate(r)
+	if err != nil || user == nil {
+		http.Error(w, "请先登录", http.StatusUnauthorized)
+		return
+	}
+
+	statusFilter := r.URL.Query().Get("status")
+	list, err := s.store.ListAlarms(statusFilter)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if list == nil {
+		list = []*model.Alarm{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+// handleAlarmSummary 获取告警全局指标统计 (未恢复数及各级别统计)
+func (s *Server) handleAlarmSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sum := s.store.GetAlarmSummary()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(sum)
+}
+
+// handleClearResolvedAlarms 一键清空已恢复告警
+func (s *Server) handleClearResolvedAlarms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	user, err := s.authenticate(r)
+	if err != nil || user == nil || user.Role != model.RoleAdmin {
+		http.Error(w, "需要管理员权限", http.StatusForbidden)
+		return
+	}
+	count, err := s.store.ClearResolvedAlarms()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": fmt.Sprintf("已成功清理 %d 条已恢复的历史告警", count),
+		"count":   count,
+	})
+}
+
+// handleAlarmItem 单条告警的操作 (确认、标记解决、删除)
+func (s *Server) handleAlarmItem(w http.ResponseWriter, r *http.Request) {
+	user, err := s.authenticate(r)
+	if err != nil || user == nil || user.Role != model.RoleAdmin {
+		http.Error(w, "需要管理员权限", http.StatusForbidden)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/alarms/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "缺少告警 ID", http.StatusBadRequest)
+		return
+	}
+	alarmID := parts[0]
+
+	if len(parts) == 2 {
+		action := parts[1]
+		if action == "ack" && r.Method == http.MethodPost {
+			if err := s.store.AcknowledgeAlarm(alarmID); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "告警已标记为已确认"})
+			return
+		} else if action == "resolve" && r.Method == http.MethodPost {
+			if err := s.store.ManualResolveAlarm(alarmID); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "告警已标记为已解除"})
+			return
+		}
+	}
+
+	if r.Method == http.MethodDelete {
+		if err := s.store.DeleteAlarm(alarmID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "告警已删除"})
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 

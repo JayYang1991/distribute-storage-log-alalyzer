@@ -25,6 +25,7 @@ var (
 	bucketRules    = []byte("rules")
 	bucketReports  = []byte("reports")
 	bucketSettings = []byte("settings")
+	bucketAlarms   = []byte("alarms")
 )
 
 type Store struct {
@@ -51,7 +52,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化各 bucket
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings} {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -521,5 +522,240 @@ func (s *Store) GetHAConfig() (*config.HAConfig, error) {
 		return json.Unmarshal(data, &cfg)
 	})
 	return cfg, err
+}
+
+// ================= 告警数据存取与生命周期管理 =================
+
+// SaveAlarm 保存告警实体
+func (s *Store) SaveAlarm(a *model.Alarm) error {
+	data, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.Put([]byte(a.ID), data)
+	})
+}
+
+// GetAlarm 根据 ID 获取告警
+func (s *Store) GetAlarm(id string) (*model.Alarm, error) {
+	var a *model.Alarm
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("alarm not found")
+		}
+		return json.Unmarshal(data, &a)
+	})
+	return a, err
+}
+
+// FindActiveAlarm 查找指定节点上尚未解除的同类型活跃告警 (用于聚合去重)
+func (s *Store) FindActiveAlarm(nodeID, alarmType string) (*model.Alarm, error) {
+	var target *model.Alarm
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.ForEach(func(k, v []byte) error {
+			var a model.Alarm
+			if err := json.Unmarshal(v, &a); err == nil {
+				if a.NodeID == nodeID && a.AlarmType == alarmType && a.Status != model.AlarmStatusResolved {
+					target = &a
+					return nil
+				}
+			}
+			return nil
+		})
+	})
+	if target == nil {
+		return nil, errors.New("active alarm not found")
+	}
+	return target, err
+}
+
+// CreateOrAggregateAlarm 创建新告警，或对已存在的活跃告警执行频次累加与更新 (防止告警风暴)
+func (s *Store) CreateOrAggregateAlarm(in *model.Alarm) (*model.Alarm, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, _ := s.FindActiveAlarm(in.NodeID, in.AlarmType)
+	if existing != nil {
+		// 已存在活跃告警，累加频次并更新最新时间与说明
+		existing.Count++
+		existing.LastOccurAt = time.Now()
+		existing.Message = in.Message
+		if in.Severity != "" {
+			existing.Severity = in.Severity
+		}
+		if in.Title != "" {
+			existing.Title = in.Title
+		}
+		if err := s.SaveAlarm(existing); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+
+	// 首次发生，生成新 ID
+	if in.ID == "" {
+		in.ID = fmt.Sprintf("alm_%d_%s", time.Now().UnixNano()/1e6, in.AlarmType)
+	}
+	if in.Status == "" {
+		in.Status = model.AlarmStatusActive
+	}
+	if in.Count <= 0 {
+		in.Count = 1
+	}
+	now := time.Now()
+	if in.FirstOccurAt.IsZero() {
+		in.FirstOccurAt = now
+	}
+	in.LastOccurAt = now
+
+	if err := s.SaveAlarm(in); err != nil {
+		return nil, err
+	}
+	return in, nil
+}
+
+// ResolveAlarm 自动消警：将指定节点和类型的未恢复告警标记为 resolved
+func (s *Store) ResolveAlarm(nodeID, alarmType string) (*model.Alarm, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, err := s.FindActiveAlarm(nodeID, alarmType)
+	if err != nil || existing == nil {
+		return nil, nil // 无活跃告警，无需消警
+	}
+
+	now := time.Now()
+	existing.Status = model.AlarmStatusResolved
+	existing.ResolvedAt = &now
+	if err := s.SaveAlarm(existing); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
+// ListAlarms 查询告警列表 (按最后发生时间倒序)，支持 statusFilter (active / resolved / all)
+func (s *Store) ListAlarms(statusFilter string) ([]*model.Alarm, error) {
+	var list []*model.Alarm
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.ForEach(func(k, v []byte) error {
+			var a model.Alarm
+			if err := json.Unmarshal(v, &a); err == nil {
+				if statusFilter == "" || statusFilter == "all" || a.Status == statusFilter || (statusFilter == "active" && a.Status != model.AlarmStatusResolved) {
+					list = append(list, &a)
+				}
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 内存按 LastOccurAt 降序排序
+	for i := 0; i < len(list)-1; i++ {
+		for j := i + 1; j < len(list); j++ {
+			if list[i].LastOccurAt.Before(list[j].LastOccurAt) {
+				list[i], list[j] = list[j], list[i]
+			}
+		}
+	}
+	return list, nil
+}
+
+// AcknowledgeAlarm 管理员确认告警
+func (s *Store) AcknowledgeAlarm(id string) error {
+	a, err := s.GetAlarm(id)
+	if err != nil {
+		return err
+	}
+	if a.Status == model.AlarmStatusResolved {
+		return errors.New("已恢复的告警无需确认")
+	}
+	a.Status = model.AlarmStatusAcknowledged
+	return s.SaveAlarm(a)
+}
+
+// ManualResolveAlarm 管理员手动消警
+func (s *Store) ManualResolveAlarm(id string) error {
+	a, err := s.GetAlarm(id)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	a.Status = model.AlarmStatusResolved
+	a.ResolvedAt = &now
+	return s.SaveAlarm(a)
+}
+
+// DeleteAlarm 删除一条告警
+func (s *Store) DeleteAlarm(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.Delete([]byte(id))
+	})
+}
+
+// ClearResolvedAlarms 清理全部已恢复的历史告警
+func (s *Store) ClearResolvedAlarms() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var toDelete [][]byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.ForEach(func(k, v []byte) error {
+			var a model.Alarm
+			if err := json.Unmarshal(v, &a); err == nil {
+				if a.Status == model.AlarmStatusResolved {
+					toDelete = append(toDelete, k)
+				}
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		for _, k := range toDelete {
+			_ = b.Delete(k)
+		}
+		return nil
+	})
+	return len(toDelete), err
+}
+
+// GetAlarmSummary 统计活跃告警数据
+func (s *Store) GetAlarmSummary() model.AlarmSummary {
+	var sum model.AlarmSummary
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketAlarms)
+		return b.ForEach(func(k, v []byte) error {
+			var a model.Alarm
+			if err := json.Unmarshal(v, &a); err == nil {
+				if a.Status != model.AlarmStatusResolved {
+					sum.TotalActive++
+					switch a.Severity {
+					case model.SeverityCritical:
+						sum.CriticalCount++
+					case model.SeverityWarning:
+						sum.WarningCount++
+					default:
+						sum.InfoCount++
+					}
+				}
+			}
+			return nil
+		})
+	})
+	return sum
 }
 

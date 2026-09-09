@@ -25,18 +25,21 @@ import (
 
 // Agent Worker 计算节点守护服务
 type Agent struct {
-	cfg        *config.Config
-	server     *http.Server
-	nodeID     string
-	activeTask int
-	mu         sync.Mutex
+	cfg           *config.Config
+	server        *http.Server
+	nodeID        string
+	activeTask    int
+	mu            sync.Mutex
+	alarmCooldown map[string]time.Time
+	alarmMu       sync.Mutex
 }
 
 func NewAgent(cfg *config.Config) *Agent {
 	nodeID := fmt.Sprintf("worker_%s_%d", cfg.NodeName, cfg.Port)
 	return &Agent{
-		cfg:    cfg,
-		nodeID: nodeID,
+		cfg:           cfg,
+		nodeID:        nodeID,
+		alarmCooldown: make(map[string]time.Time),
 	}
 }
 
@@ -145,6 +148,7 @@ func (a *Agent) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	defer destFile.Close()
 
 	if _, err := io.Copy(destFile, file); err != nil {
+		a.ReportAlarm(model.AlarmTypeDiskReadOnly, model.SeverityCritical, "日志写入磁盘发生 I/O 异常", fmt.Sprintf("节点 %s 写入文件 %s 失败: %v", a.cfg.NodeName, destPath, err))
 		http.Error(w, fmt.Sprintf("写入文件失败: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -154,6 +158,7 @@ func (a *Agent) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	// 2. 本地解包与文件树提取
 	files, totalLines, err := ExtractArchive(destPath, extractDir)
 	if err != nil {
+		a.ReportAlarm(model.AlarmTypeTaskFailed, model.SeverityWarning, "日志归档解压缩失败", fmt.Sprintf("节点 %s 解压缩文件 %s 发生异常: %v", a.cfg.NodeName, header.Filename, err))
 		http.Error(w, fmt.Sprintf("解包失败: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -364,6 +369,9 @@ func (a *Agent) sendHeartbeat() {
 	tasks := a.activeTask
 	a.mu.Unlock()
 
+	// 业务组件健康自检与主动上报告警 (磁盘满、只读挂载、内存超高)
+	a.checkSelfHealth(res)
+
 	node := &model.Node{
 		ID:            a.nodeID,
 		Name:          a.cfg.NodeName,
@@ -407,6 +415,94 @@ func (a *Agent) sendHeartbeat() {
 		}
 	}
 	log.Printf("[Worker] 向管理节点 (%s) 发送心跳均未能成功响应", a.cfg.ManagerURL)
+}
+
+// ReportAlarm 业务组件向管理节点主动上报告警事件 (支持多 Manager 故障自动转移与防风暴消抖)
+func (a *Agent) ReportAlarm(alarmType, severity, title, message string) {
+	a.alarmMu.Lock()
+	lastTime, exists := a.alarmCooldown[alarmType]
+	if exists && time.Since(lastTime) < 30*time.Second {
+		a.alarmMu.Unlock()
+		return // 30秒内同类告警限频消抖
+	}
+	a.alarmCooldown[alarmType] = time.Now()
+	a.alarmMu.Unlock()
+
+	reqPayload := model.AlarmReportReq{
+		NodeID:    a.nodeID,
+		AlarmType: alarmType,
+		Severity:  severity,
+		Title:     title,
+		Message:   message,
+	}
+	data, _ := json.Marshal(reqPayload)
+
+	mgrURLs := strings.Split(a.cfg.ManagerURL, ",")
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for _, rawURL := range mgrURLs {
+		cleanURL := strings.TrimSpace(rawURL)
+		if cleanURL == "" {
+			continue
+		}
+		targetURL := fmt.Sprintf("%s/api/alarms/report", strings.TrimRight(cleanURL, "/"))
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cluster-Token", a.cfg.ClusterToken)
+
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				log.Printf("[Worker Alarm] 成功上报告警 [%s] 到管理节点 (%s): %s", alarmType, cleanURL, title)
+				return
+			}
+		}
+	}
+	log.Printf("[Worker Alarm] 上报告警 [%s] 到管理节点失败: %s", alarmType, title)
+}
+
+// checkSelfHealth 检查业务组件健康状态，发现异常及时上报告警
+func (a *Agent) checkSelfHealth(res model.SystemResource) {
+	// 1. 磁盘空间严重不足检测
+	if res.DiskFreeMB > 0 && res.DiskFreeMB < 1024 {
+		a.ReportAlarm(
+			model.AlarmTypeDiskFull,
+			model.SeverityCritical,
+			fmt.Sprintf("业务存储磁盘空间严重不足 (剩余 %d MB)", res.DiskFreeMB),
+			fmt.Sprintf("计算节点 %s 存储目录 %s 可用空间仅剩 %d MB (< 1GB)，可能导致日志写入及解压失败，请尽快扩容或清理", a.cfg.NodeName, a.cfg.DataDir, res.DiskFreeMB),
+		)
+	}
+
+	// 2. 存储挂载目录只读与 I/O 异常检测
+	testFile := filepath.Join(a.cfg.DataDir, ".write_health_test.tmp")
+	if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
+		a.ReportAlarm(
+			model.AlarmTypeDiskReadOnly,
+			model.SeverityCritical,
+			"业务存储文件系统发生只读或 I/O 写入故障",
+			fmt.Sprintf("计算节点 %s 存储目录 %s 无法写入文件: %v，可能硬盘损坏或被内核置为只读模式", a.cfg.NodeName, a.cfg.DataDir, err),
+		)
+	} else {
+		_ = os.Remove(testFile)
+	}
+
+	// 3. 内存超高使用率检测
+	if res.MemTotalMB > 0 {
+		usageRatio := float64(res.MemUsedMB) / float64(res.MemTotalMB)
+		if usageRatio > 0.92 {
+			a.ReportAlarm(
+				model.AlarmTypeHighMemory,
+				model.SeverityWarning,
+				fmt.Sprintf("业务节点内存占用过高 (%.1f%%)", usageRatio*100),
+				fmt.Sprintf("计算节点 %s 当前内存已使用 %d MB / %d MB (%.1f%%)，面临 OOM 风险", a.cfg.NodeName, res.MemUsedMB, res.MemTotalMB, usageRatio*100),
+			)
+		}
+	}
 }
 
 // collectSystemResource 纯 Go 读取 Linux /proc 系统硬件及状态指标

@@ -43,6 +43,11 @@
           <span class="icon">🛡️</span>
           <span>故障规则与诊断</span>
         </div>
+        <div class="nav-item" data-tab="alarms" id="nav-alarms">
+          <span class="icon">🚨</span>
+          <span>实时告警中心</span>
+          <span class="badge badge-danger" id="nav-alarm-badge" style="display: none; margin-left: auto; font-size: 11px; padding: 2px 6px;">0</span>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
@@ -65,6 +70,10 @@
           <p id="page-desc">实时监控分布式存储计算节点状态与日志分析全局指标</p>
         </div>
         <div class="top-actions">
+          <div id="alarm-top-indicator" onclick="app.switchTab('alarms')" style="cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 10px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);" title="点击查看活跃告警中心">
+            <span>🚨</span>
+            <span id="alarm-top-text">告警: 正常</span>
+          </div>
           <div id="ha-top-indicator" style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 12px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);">
             <span class="status-dot online"></span>
             <span id="ha-top-text">HA: 检测中</span>
@@ -97,6 +106,13 @@
               <div>
                 <div class="stat-label">存储占用空间</div>
                 <div class="stat-val" id="stat-storage">0.0 MB</div>
+              </div>
+            </div>
+            <div class="stat-card" style="cursor: pointer;" onclick="app.switchTab('alarms')" title="点击查看未解除业务告警">
+              <div class="stat-icon red">🚨</div>
+              <div>
+                <div class="stat-label">未解除业务告警</div>
+                <div class="stat-val" id="stat-active-alarms">0</div>
               </div>
             </div>
             <div class="stat-card">
@@ -387,6 +403,69 @@
                       <th>专家排查处置建议</th>
                       <th>状态</th>
                       <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 7. 实时告警中心 Tab -->
+        <section class="tab-pane" id="pane-alarms" style="display: none;">
+          <div class="stats-grid" style="margin-bottom: 20px;">
+            <div class="stat-card" style="border-left: 4px solid #ef4444;">
+              <div class="stat-icon red">🚨</div>
+              <div>
+                <div class="stat-label">未解除活跃告警</div>
+                <div class="stat-val" id="alarm-stat-active">0</div>
+              </div>
+            </div>
+            <div class="stat-card" style="border-left: 4px solid #f87171;">
+              <div class="stat-icon red">💥</div>
+              <div>
+                <div class="stat-label">严重故障 (CRITICAL)</div>
+                <div class="stat-val" id="alarm-stat-critical">0</div>
+              </div>
+            </div>
+            <div class="stat-card" style="border-left: 4px solid #f59e0b;">
+              <div class="stat-icon yellow">⚠️</div>
+              <div>
+                <div class="stat-label">警告事件 (WARNING)</div>
+                <div class="stat-val" id="alarm-stat-warning">0</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <span class="card-title">🚨 业务组件与系统异常告警监控列表</span>
+                <div class="btn-group" style="display: flex; gap: 6px;">
+                  <button class="btn btn-secondary btn-sm active" id="btn-alarm-filter-active" onclick="app.setAlarmFilter('active')">仅活跃告警</button>
+                  <button class="btn btn-secondary btn-sm" id="btn-alarm-filter-all" onclick="app.setAlarmFilter('all')">全部记录</button>
+                  <button class="btn btn-secondary btn-sm" id="btn-alarm-filter-resolved" onclick="app.setAlarmFilter('resolved')">已解除历史</button>
+                </div>
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn btn-secondary btn-sm" onclick="app.fetchAlarms()">🔄 刷新列表</button>
+                <button class="btn btn-secondary btn-sm" onclick="app.clearResolvedAlarms()" title="清空所有已恢复的告警记录">🧹 清理已恢复历史</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-responsive">
+                <table id="table-alarms">
+                  <thead>
+                    <tr>
+                      <th style="width: 90px;">严重级别</th>
+                      <th style="width: 140px;">告警类型</th>
+                      <th style="width: 180px;">发生节点</th>
+                      <th>告警简述与详细原因</th>
+                      <th style="width: 70px;">频次</th>
+                      <th style="width: 150px;">首次/最近触发时间</th>
+                      <th style="width: 100px;">当前状态</th>
+                      <th style="width: 130px;">操作</th>
                     </tr>
                   </thead>
                   <tbody></tbody>

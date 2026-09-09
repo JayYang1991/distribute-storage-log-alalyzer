@@ -158,6 +158,7 @@ const app = {
       archives: ["日志归档与文件", "常用格式压缩包上传、解包文件树目录与日志在线查看"],
       search: ["日志全局检索", "毫秒级正则与全文检索引擎，支持行级定位与上下文展开"],
       rules: ["故障规则与诊断", "配置存储故障模式规则库，自动诊断与自愈排查指导"],
+      alarms: ["实时告警中心", "业务计算节点异常自检、硬件磁盘故障、节点失联与系统告警全生命周期监控"],
     };
 
     if (titles[tabName]) {
@@ -172,6 +173,8 @@ const app = {
     // 切换到对应 tab 触发加载
     if (tabName === "search") {
       this.populateSearchArchiveSelect();
+    } else if (tabName === "alarms") {
+      this.fetchAlarms();
     }
   },
 
@@ -183,8 +186,12 @@ const app = {
       this.loadArchives(),
       this.loadRules(),
       this.fetchHAStatus(),
+      this.fetchAlarmSummary(),
       this.currentUser && this.currentUser.role === "admin" ? this.loadUsers() : Promise.resolve(),
     ]);
+    if (this.activeTab === "alarms") {
+      await this.fetchAlarms();
+    }
     this.updateDashboardStats();
   },
 
@@ -193,7 +200,11 @@ const app = {
       this.loadNodes(true),
       this.loadArchives(true),
       this.fetchHAStatus(),
+      this.fetchAlarmSummary(),
     ]);
+    if (this.activeTab === "alarms") {
+      await this.fetchAlarms();
+    }
     this.updateDashboardStats();
   },
 
@@ -1259,6 +1270,195 @@ const app = {
       if (a.status === "ready") eventsTotal += 1;
     });
     document.getElementById("stat-events").innerText = eventsTotal;
+  },
+
+  // ================= 告警系统管理 =================
+
+  alarmFilter: "active",
+
+  async fetchAlarmSummary() {
+    try {
+      const res = await this.api("/api/alarms/summary");
+      if (!res.ok) return;
+      const sum = await res.json();
+
+      const topText = document.getElementById("alarm-top-text");
+      const topInd = document.getElementById("alarm-top-indicator");
+      const navBadge = document.getElementById("nav-alarm-badge");
+      const dashActive = document.getElementById("stat-active-alarms");
+
+      const actStat = document.getElementById("alarm-stat-active");
+      const critStat = document.getElementById("alarm-stat-critical");
+      const warnStat = document.getElementById("alarm-stat-warning");
+
+      if (actStat) actStat.innerText = sum.total_active || 0;
+      if (critStat) critStat.innerText = sum.critical_count || 0;
+      if (warnStat) warnStat.innerText = sum.warning_count || 0;
+
+      if (dashActive) {
+        dashActive.innerText = sum.total_active || 0;
+        dashActive.style.color = sum.total_active > 0 ? "#ef4444" : "var(--text-primary)";
+      }
+
+      if (sum.total_active > 0) {
+        if (topText) topText.innerHTML = `<strong style="color:#ef4444;">告警: ${sum.total_active} 待处理</strong>`;
+        if (topInd) {
+          topInd.style.borderColor = "rgba(239, 68, 68, 0.7)";
+          topInd.style.background = "rgba(239, 68, 68, 0.15)";
+        }
+        if (navBadge) {
+          navBadge.innerText = sum.total_active;
+          navBadge.style.display = "inline-block";
+        }
+      } else {
+        if (topText) topText.innerHTML = `告警: <span style="color:#10b981;">正常 (0)</span>`;
+        if (topInd) {
+          topInd.style.borderColor = "var(--border-color)";
+          topInd.style.background = "rgba(30,41,59,0.6)";
+        }
+        if (navBadge) {
+          navBadge.style.display = "none";
+        }
+      }
+    } catch (e) {
+      console.warn("获取告警指标失败", e);
+    }
+  },
+
+  setAlarmFilter(filter) {
+    this.alarmFilter = filter;
+    ["active", "all", "resolved"].forEach(f => {
+      const btn = document.getElementById(`btn-alarm-filter-${f}`);
+      if (btn) {
+        if (f === filter) btn.classList.add("active");
+        else btn.classList.remove("active");
+      }
+    });
+    this.fetchAlarms();
+  },
+
+  async fetchAlarms() {
+    const tbody = document.querySelector("#table-alarms tbody");
+    if (!tbody) return;
+    try {
+      const res = await this.api(`/api/alarms?status=${this.alarmFilter}`);
+      if (!res.ok) return;
+      const list = await res.json();
+
+      if (!list || list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 24px;">🎉 当前暂无匹配的系统告警记录</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = list.map(a => {
+        let sevBadge = "badge-info";
+        let sevLabel = a.severity || "INFO";
+        if (a.severity === "CRITICAL") {
+          sevBadge = "badge-danger";
+        } else if (a.severity === "WARNING") {
+          sevBadge = "badge-warning";
+        }
+
+        let statusBadge = "badge-danger";
+        let statusLabel = "活跃中 (未恢复)";
+        if (a.status === "acknowledged") {
+          statusBadge = "badge-warning";
+          statusLabel = "已确认 (处理中)";
+        } else if (a.status === "resolved") {
+          statusBadge = "badge-success";
+          statusLabel = "已恢复 / 已解除";
+        }
+
+        const countBadge = (a.count && a.count > 1) 
+          ? `<span class="badge badge-warning" title="已自动去重聚合频次">${a.count}次</span>` 
+          : `<span class="badge badge-info">1次</span>`;
+
+        const firstTime = a.first_occur_at ? new Date(a.first_occur_at).toLocaleString() : "-";
+        const lastTime = a.last_occur_at ? new Date(a.last_occur_at).toLocaleString() : "-";
+
+        let actionBtns = ``;
+        if (a.status !== "resolved") {
+          if (a.status !== "acknowledged") {
+            actionBtns += `<button class="btn btn-secondary btn-sm" onclick="app.acknowledgeAlarm('${a.id}')" title="知晓并确认该告警">确认</button> `;
+          }
+          actionBtns += `<button class="btn btn-primary btn-sm" onclick="app.manualResolveAlarm('${a.id}')" title="手动解除此告警">解除</button> `;
+        }
+        actionBtns += `<button class="btn btn-danger btn-sm" onclick="app.deleteAlarm('${a.id}')" title="删除记录">🗑️</button>`;
+
+        return `
+          <tr>
+            <td><span class="badge ${sevBadge}">${sevLabel}</span></td>
+            <td><code style="font-size: 12px;">${this.escape(a.alarm_type)}</code></td>
+            <td>
+              <strong>${this.escape(a.node_name || a.node_id)}</strong>
+              <div style="font-size: 11px; color: var(--text-muted);">${this.escape(a.node_ip || '')}</div>
+            </td>
+            <td>
+              <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 2px;">${this.escape(a.title)}</div>
+              <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.4;">${this.escape(a.message)}</div>
+            </td>
+            <td>${countBadge}</td>
+            <td style="font-size: 11px; color: var(--text-muted);">
+              <div>初次: ${firstTime}</div>
+              <div>最新: ${lastTime}</div>
+            </td>
+            <td><span class="badge ${statusBadge}">${statusLabel}</span></td>
+            <td><div style="display: flex; gap: 4px;">${actionBtns}</div></td>
+          </tr>
+        `;
+      }).join("");
+    } catch (e) {
+      console.warn("加载告警列表失败", e);
+    }
+  },
+
+  async acknowledgeAlarm(id) {
+    try {
+      const res = await this.api(`/api/alarms/${id}/ack`, "POST");
+      if (!res.ok) throw new Error(await res.text());
+      await this.fetchAlarms();
+      await this.fetchAlarmSummary();
+    } catch (e) {
+      alert("确认告警失败: " + e.message);
+    }
+  },
+
+  async manualResolveAlarm(id) {
+    if (!confirm("确定要手动将该告警标记为已解除恢复吗？")) return;
+    try {
+      const res = await this.api(`/api/alarms/${id}/resolve`, "POST");
+      if (!res.ok) throw new Error(await res.text());
+      await this.fetchAlarms();
+      await this.fetchAlarmSummary();
+    } catch (e) {
+      alert("解除告警失败: " + e.message);
+    }
+  },
+
+  async deleteAlarm(id) {
+    if (!confirm("确定删除该告警记录吗？")) return;
+    try {
+      const res = await this.api(`/api/alarms/${id}`, "DELETE");
+      if (!res.ok) throw new Error(await res.text());
+      await this.fetchAlarms();
+      await this.fetchAlarmSummary();
+    } catch (e) {
+      alert("删除告警失败: " + e.message);
+    }
+  },
+
+  async clearResolvedAlarms() {
+    if (!confirm("确定要清空所有状态为【已恢复】的历史告警记录吗？")) return;
+    try {
+      const res = await this.api(`/api/alarms/clear-resolved`, "POST");
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      alert("✅ " + data.message);
+      await this.fetchAlarms();
+      await this.fetchAlarmSummary();
+    } catch (e) {
+      alert("清理已恢复告警失败: " + e.message);
+    }
   },
 
   // ================= 辅助工具 =================

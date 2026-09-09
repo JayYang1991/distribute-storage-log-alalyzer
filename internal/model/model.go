@@ -212,3 +212,57 @@ type HAStatus struct {
 	SplitBrainBlocked  bool   `json:"split_brain_blocked"`   // 是否触发防脑裂拦截阻止晋升
 	BlockedReason      string `json:"blocked_reason"`        // 拦截原因说明
 }
+
+// ================= 告警系统模型 =================
+
+// 告警生命周期状态
+const (
+	AlarmStatusActive       = "active"       // 活跃中 (未解除/未恢复)
+	AlarmStatusAcknowledged = "acknowledged" // 已确认 (已知晓，等待处理或恢复)
+	AlarmStatusResolved     = "resolved"     // 已解除 / 已自动恢复
+)
+
+// 告警特征类型
+const (
+	AlarmTypeNodeOffline  = "NODE_OFFLINE"  // 业务计算节点离线失联 (心跳丢失)
+	AlarmTypeDiskFull     = "DISK_FULL"     // 业务存储挂载盘空间告急 / 耗尽
+	AlarmTypeDiskReadOnly = "DISK_READONLY" // 存储文件系统只读或 I/O 挂载异常
+	AlarmTypeHighMemory   = "HIGH_MEMORY"   // 内存使用率超过危险阈值 (>90%)
+	AlarmTypeTaskFailed   = "TASK_FAILED"   // 核心日志解包/分析/诊断任务严重执行失败
+	AlarmTypeNetworkError = "NETWORK_ERROR" // 业务节点网络通信异常
+)
+
+// Alarm 告警记录实体
+type Alarm struct {
+	ID           string    `json:"id"`
+	NodeID       string    `json:"node_id"`                 // 产生告警的节点 ID
+	NodeName     string    `json:"node_name"`               // 节点名称
+	NodeIP       string    `json:"node_ip"`                 // 节点 IP 地址
+	Component    string    `json:"component"`               // 组件名称 (如 worker)
+	AlarmType    string    `json:"alarm_type"`              // 告警类型 (NODE_OFFLINE, DISK_FULL 等)
+	Severity     string    `json:"severity"`                // CRITICAL | WARNING | INFO
+	Title        string    `json:"title"`                   // 告警标题
+	Message      string    `json:"message"`                 // 告警详细信息与排查线索
+	Status       string    `json:"status"`                  // active | acknowledged | resolved
+	Count        int       `json:"count"`                   // 连续发生频次 (告警聚合防风暴)
+	FirstOccurAt time.Time `json:"first_occur_at"`           // 首次触发时间
+	LastOccurAt  time.Time `json:"last_occur_at"`            // 最近触发时间
+	ResolvedAt   *time.Time `json:"resolved_at,omitempty"`  // 自动或手动恢复时间
+}
+
+// AlarmReportReq 业务组件主动上报告警的请求载荷
+type AlarmReportReq struct {
+	NodeID    string `json:"node_id"`
+	AlarmType string `json:"alarm_type"`
+	Severity  string `json:"severity"`
+	Title     string `json:"title"`
+	Message   string `json:"message"`
+}
+
+// AlarmSummary 告警全局指标统计
+type AlarmSummary struct {
+	TotalActive   int `json:"total_active"`
+	CriticalCount int `json:"critical_count"`
+	WarningCount  int `json:"warning_count"`
+	InfoCount     int `json:"info_count"`
+}
