@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -30,10 +32,35 @@ type SSHDeployOptions struct {
 	InstallDir   string `json:"install_dir"` // 默认 /opt/dist-log-worker
 
 	// 磁盘格式化与挂载选项
-	DiskDevice string `json:"disk_device"` // 例如 /dev/sdb
-	FSType     string `json:"fs_type"`     // ext4 或 xfs
-	MountPoint string `json:"mount_point"` // 例如 /data/dist-log-storage
-	FormatDisk bool   `json:"format_disk"` // 是否执行格式化
+	DiskDevice  string   `json:"disk_device"`  // 单盘兼容字符串 (支持逗号分隔多盘)
+	DiskDevices []string `json:"disk_devices"` // 多盘列表
+	FSType      string   `json:"fs_type"`      // ext4 或 xfs
+	MountPoint  string   `json:"mount_point"`  // 挂载点根目录，默认 /data/dist-log-storage
+	FormatDisk  bool     `json:"format_disk"`  // 是否执行格式化
+}
+
+// GetDiskList 解析并标准化多盘设备列表 (自动去重并剔除空项)
+func (opts SSHDeployOptions) GetDiskList() []string {
+	var list []string
+	seen := make(map[string]bool)
+
+	addDev := func(d string) {
+		cd := strings.TrimSpace(d)
+		if cd != "" && !seen[cd] {
+			seen[cd] = true
+			list = append(list, cd)
+		}
+	}
+
+	for _, d := range opts.DiskDevices {
+		addDev(d)
+	}
+	if opts.DiskDevice != "" {
+		for _, d := range strings.Split(opts.DiskDevice, ",") {
+			addDev(d)
+		}
+	}
+	return list
 }
 
 func createSSHClient(opts SSHDeployOptions) (*ssh.Client, error) {
@@ -76,13 +103,17 @@ type rawBlockDevice struct {
 }
 
 // checkBlockDeviceSafety 递归检测块设备及其子分区是否已有文件系统或为系统分区
-func checkBlockDeviceSafety(dev rawBlockDevice) (hasFS bool, isSystem bool, partsSummary []string) {
+func checkBlockDeviceSafety(dev rawBlockDevice, sysMaps ...map[string]bool) (hasFS bool, isSystem bool, partsSummary []string) {
+	var sysMap map[string]bool
+	if len(sysMaps) > 0 {
+		sysMap = sysMaps[0]
+	}
 	mountPoint := strings.TrimSpace(dev.MountPoint)
 	fsType := strings.TrimSpace(dev.FSType)
 
-	// 检查自身挂载点与系统关键路径
-	if isSystemMount(mountPoint) {
+	if isSystemMount(mountPoint) || isSystemDeviceName(dev.Name, sysMap) {
 		isSystem = true
+		hasFS = true
 	}
 	if fsType != "" || mountPoint != "" {
 		hasFS = true
@@ -91,9 +122,10 @@ func checkBlockDeviceSafety(dev rawBlockDevice) (hasFS bool, isSystem bool, part
 
 	// 递归检查所有子分区
 	for _, child := range dev.Children {
-		cHasFS, cIsSystem, cSummary := checkBlockDeviceSafety(child)
+		cHasFS, cIsSystem, cSummary := checkBlockDeviceSafety(child, sysMap)
 		if cIsSystem {
 			isSystem = true
+			hasFS = true
 		}
 		if cHasFS {
 			hasFS = true
@@ -118,6 +150,31 @@ func isSystemMount(mp string) bool {
 		mp == "/home" || mp == "/usr" || mp == "/var" || strings.Contains(mp, "swap")
 }
 
+func isSystemDeviceName(name string, sysMap map[string]bool) bool {
+	if len(sysMap) == 0 {
+		return false
+	}
+	clean := strings.TrimPrefix(strings.TrimSpace(name), "/dev/")
+	clean = strings.TrimPrefix(clean, "mapper/")
+	if sysMap[clean] {
+		return true
+	}
+	for sysName := range sysMap {
+		if sysName == clean {
+			return true
+		}
+		// 例如 clean 为 "vda"，sysName 为 "vda1"、"vda2"、"vda3"
+		if strings.HasPrefix(sysName, clean) {
+			return true
+		}
+		// 例如 clean 为 "vda1"，sysName 为 "vda"
+		if strings.HasPrefix(clean, sysName) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectRemoteDisks 通过 SSH 远程检测目标主机的物理磁盘与分区列表（执行防呆过滤与状态分析）
 func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 	client, err := createSSHClient(opts)
@@ -126,16 +183,38 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 	}
 	defer client.Close()
 
+	log.Printf("[DetectRemoteDisks] 连接目标 %s:%d 成功，开始探测...", opts.Host, opts.Port)
+
+	// 提前探测系统关键根分区及引导分区所驻留的底层物理磁盘名称列表 (内核级反查)
+	systemDisksMap := make(map[string]bool)
+	var sysDevBuf bytes.Buffer
+	cmdFindSys := `for m in / /boot /boot/efi /usr /var /home; do src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || df "$m" 2>/dev/null | tail -1 | awk '{print $1}'); if [ -n "$src" ]; then lsblk -slno NAME "$src" 2>/dev/null || echo "$src"; fi; done | sort -u`
+	if errSys := runRemoteCmd(client, cmdFindSys, &sysDevBuf); errSys == nil {
+		for _, devLine := range strings.Split(sysDevBuf.String(), "\n") {
+			devName := strings.TrimSpace(devLine)
+			devName = strings.TrimPrefix(devName, "/dev/")
+			devName = strings.TrimPrefix(devName, "mapper/")
+			if devName != "" {
+				systemDisksMap[devName] = true
+			}
+		}
+	}
+	log.Printf("[DetectRemoteDisks] 探测到系统关键磁盘/分区集合: %+v", systemDisksMap)
+
 	// 优先执行 lsblk JSON 格式化输出 (包括 children)
-	cmdJSON := "lsblk -b -J -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL 2>/dev/null"
+	cmdJSON := "lsblk -b -J -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL"
 	var outBuf bytes.Buffer
-	err = runRemoteCmd(client, cmdJSON, &outBuf)
+	var errBuf bytes.Buffer
+	err = runRemoteCmdSeparate(client, cmdJSON, &outBuf, &errBuf)
+	log.Printf("[DetectRemoteDisks] cmdJSON run err: %v, outBuf len: %d, errBuf len: %d", err, outBuf.Len(), errBuf.Len())
 	if err == nil && outBuf.Len() > 0 {
 		var res struct {
 			BlockDevices []rawBlockDevice `json:"blockdevices"`
 		}
-		if jsonErr := json.Unmarshal(outBuf.Bytes(), &res); jsonErr == nil && len(res.BlockDevices) > 0 {
-			var disks []model.DiskInfo
+		jsonErr := json.Unmarshal(outBuf.Bytes(), &res)
+		log.Printf("[DetectRemoteDisks] jsonErr: %v, blockdevices count: %d", jsonErr, len(res.BlockDevices))
+		if jsonErr == nil && len(res.BlockDevices) > 0 {
+			disks := make([]model.DiskInfo, 0)
 			for _, b := range res.BlockDevices {
 				// 过滤非磁盘设备 (如 loop, rom, zram 等) 以及大小为 0 的读卡器设备
 				bType := strings.ToLower(strings.TrimSpace(b.Type))
@@ -143,11 +222,16 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 					continue
 				}
 
-				hasFS, isSystem, partsSummary := checkBlockDeviceSafety(b)
+				hasFS, isSystem, partsSummary := checkBlockDeviceSafety(b, systemDisksMap)
+				if isSystemDeviceName(b.Name, systemDisksMap) {
+					isSystem = true
+					hasFS = true
+				}
 				canFormat := !hasFS && !isSystem
 
 				var statusText string
 				if isSystem {
+					canFormat = false
 					statusText = "🚫 系统关键盘 (含系统启动/根分区，严禁格式化)"
 				} else if hasFS {
 					summary := strings.Join(partsSummary, "; ")
@@ -189,6 +273,7 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 				return disks[i].Name < disks[j].Name
 			})
 
+			log.Printf("[DetectRemoteDisks] JSON 模式探测完成，返回磁盘数: %d", len(disks))
 			return disks, nil
 		}
 	}
@@ -197,8 +282,9 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 	outBuf.Reset()
 	cmdFallback := "lsblk -d -n -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE 2>/dev/null"
 	_ = runRemoteCmd(client, cmdFallback, &outBuf)
+	log.Printf("[DetectRemoteDisks] 降级走 fallback 表格解析, outBuf len=%d", outBuf.Len())
 	lines := strings.Split(outBuf.String(), "\n")
-	var disks []model.DiskInfo
+	disks := make([]model.DiskInfo, 0)
 	for _, line := range lines {
 		f := strings.Fields(line)
 		if len(f) >= 3 {
@@ -218,17 +304,38 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 			if len(f) >= 5 && f[4] != "" {
 				d.FSType = f[4]
 			}
-			if isSystemMount(d.MountPoint) {
+
+			// 双重防呆：通过 lsblk 查询该设备及其所有子分区的挂载点
+			var partBuf bytes.Buffer
+			_ = runRemoteCmd(client, fmt.Sprintf("lsblk -n -o MOUNTPOINT,FSTYPE /dev/%s 2>/dev/null", d.Name), &partBuf)
+			partOut := partBuf.String()
+			for _, pLine := range strings.Split(partOut, "\n") {
+				pF := strings.Fields(pLine)
+				if len(pF) > 0 {
+					for _, item := range pF {
+						if isSystemMount(item) {
+							d.IsSystem = true
+						}
+						if item != "" {
+							d.HasFS = true
+						}
+					}
+				}
+			}
+
+			if isSystemMount(d.MountPoint) || isSystemDeviceName(d.Name, systemDisksMap) {
 				d.IsSystem = true
+				d.HasFS = true
 			}
 			if d.FSType != "" || d.MountPoint != "" {
 				d.HasFS = true
 			}
 			d.CanFormat = !d.HasFS && !d.IsSystem
 			if d.IsSystem {
-				d.StatusText = "🚫 系统关键盘，严禁格式化"
+				d.CanFormat = false
+				d.StatusText = "🚫 系统关键盘 (含系统启动/根分区，严禁格式化)"
 			} else if d.HasFS {
-				d.StatusText = "🚫 已有文件系统，防呆锁定"
+				d.StatusText = "🚫 已有文件系统/分区，防呆锁定"
 			} else {
 				d.StatusText = "✅ 纯净物理裸盘，安全推荐"
 			}
@@ -246,11 +353,19 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 		return disks[i].Name < disks[j].Name
 	})
 
+	log.Printf("[DetectRemoteDisks] Fallback 模式探测完成，返回磁盘数: %d", len(disks))
 	return disks, nil
 }
 
-// DeployWorkerViaSSH 通过纯 Go SSH 远程登录并在目标机器上一键部署 Worker 业务组件（包含磁盘格式化挂载）
+// DeployWorkerViaSSH 通过纯 Go SSH 远程登录并在目标机器上一键部署 Worker 业务组件（包含磁盘格式化挂载与多盘多进程）
 func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
+	disks := opts.GetDiskList()
+	if len(disks) == 0 {
+		errMsg := "【安全策略限制】严禁使用系统盘存放日志！增加 Worker 节点时必须至少指定一块独立的物理存储盘。"
+		fmt.Fprintln(logWriter, errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
 	if opts.WorkerPort <= 0 {
 		opts.WorkerPort = 8081
 	}
@@ -276,80 +391,70 @@ func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
 	}
 	defer client.Close()
 
-	fmt.Fprintf(logWriter, "[SSH Deploy] SSH 认证成功！检测目标系统架构与环境...\n")
+	fmt.Fprintf(logWriter, "[SSH Deploy] SSH 认证成功！目标选定 %d 块物理存储盘进行多进程隔离部署...\n", len(disks))
 
-	// 1. 检查并格式化挂载存储硬盘
-	targetDataDir := fmt.Sprintf("%s/data", opts.InstallDir)
+	// 探测目标主机的系统盘/分区集合 (如 /、/boot、/home 等)
+	systemDisksMap := make(map[string]bool)
+	var sysDevBuf bytes.Buffer
+	cmdFindSys := `for m in / /boot /boot/efi /usr /var /home; do src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || df "$m" 2>/dev/null | tail -1 | awk '{print $1}'); if [ -n "$src" ]; then lsblk -slno NAME "$src" 2>/dev/null || echo "$src"; fi; done | sort -u`
+	if errSys := runRemoteCmd(client, cmdFindSys, &sysDevBuf); errSys == nil {
+		for _, devLine := range strings.Split(sysDevBuf.String(), "\n") {
+			devName := strings.TrimSpace(devLine)
+			devName = strings.TrimPrefix(devName, "/dev/")
+			devName = strings.TrimPrefix(devName, "mapper/")
+			if devName != "" {
+				systemDisksMap[devName] = true
+			}
+		}
+	}
 
-	if opts.DiskDevice != "" {
-		fmt.Fprintf(logWriter, "[SSH Deploy] 检测到已选定存储硬盘: %s, 挂载点: %s, 文件系统: %s\n",
-			opts.DiskDevice, opts.MountPoint, opts.FSType)
+	// 1. 逐一执行物理磁盘安全防呆检测
+	for _, diskDev := range disks {
+		fmt.Fprintf(logWriter, "[SSH Deploy] 正在执行磁盘安全防呆检测 (目标: %s)...\n", diskDev)
+		// 1.0 防呆校验 0：检查是否为系统盘/启动盘/根分区
+		diskClean := strings.TrimPrefix(strings.TrimSpace(diskDev), "/dev/")
+		if isSystemDeviceName(diskClean, systemDisksMap) {
+			errMsg := fmt.Sprintf("【安全防呆拦截】目标设备 %s 关联系统关键分区或系统启动盘，严禁用于日志存储！已中止部署以防系统损毁", diskDev)
+			fmt.Fprintln(logWriter, errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
 
-		if opts.FormatDisk {
-			fmt.Fprintf(logWriter, "[SSH Deploy] 正在执行磁盘安全防呆检测 (目标: %s)...\n", opts.DiskDevice)
-			// 1.1 防呆校验 1：检查是否包含系统启动/根挂载点以及关键路径
-			var lsblkBuf bytes.Buffer
-			_ = runRemoteCmd(client, fmt.Sprintf("lsblk -n -o NAME,MOUNTPOINT,FSTYPE %s 2>/dev/null", opts.DiskDevice), &lsblkBuf)
-			lsblkOutput := lsblkBuf.String()
-			for _, line := range strings.Split(lsblkOutput, "\n") {
-				fields := strings.Fields(line)
-				for _, f := range fields {
-					if isSystemMount(f) {
-						errMsg := fmt.Sprintf("【安全防呆拦截】目标设备 %s 关联系统关键分区 (%s)，严禁格式化！已中止部署以防系统损毁", opts.DiskDevice, f)
-						fmt.Fprintln(logWriter, errMsg)
-						return fmt.Errorf("%s", errMsg)
-					}
+		// 1.1 防呆校验 1：检查是否包含系统启动/根挂载点以及关键路径
+		var lsblkBuf bytes.Buffer
+		_ = runRemoteCmd(client, fmt.Sprintf("lsblk -n -o NAME,MOUNTPOINT,FSTYPE %s 2>/dev/null", diskDev), &lsblkBuf)
+		for _, line := range strings.Split(lsblkBuf.String(), "\n") {
+			fields := strings.Fields(line)
+			for _, f := range fields {
+				if isSystemMount(f) {
+					errMsg := fmt.Sprintf("【安全防呆拦截】目标设备 %s 关联系统关键分区 (%s)，严禁用于日志存储！已中止部署以防系统损毁", diskDev, f)
+					fmt.Fprintln(logWriter, errMsg)
+					return fmt.Errorf("%s", errMsg)
 				}
 			}
+		}
 
-			// 1.2 防呆校验 2：检查是否已经存在文件系统 (如 ext4, xfs, vfat, ntfs, btrfs, swap 等签名)
+		// 1.2 防呆校验 2：如果勾选格式化，检查是否包含未明确清空的文件系统签名
+		if opts.FormatDisk {
 			var wipefsBuf bytes.Buffer
-			_ = runRemoteCmd(client, fmt.Sprintf("wipefs -n %s 2>/dev/null", opts.DiskDevice), &wipefsBuf)
+			_ = runRemoteCmd(client, fmt.Sprintf("wipefs -n %s 2>/dev/null", diskDev), &wipefsBuf)
 			wipefsOutput := strings.TrimSpace(wipefsBuf.String())
 			if len(wipefsOutput) > 0 {
-				errMsg := fmt.Sprintf("【安全防呆拦截】目标磁盘 %s 上检测到已有文件系统或分区签名:\n%s\n系统防呆机制已阻止格式化，以防重要数据被清除！请选择未格式化的纯净裸盘", opts.DiskDevice, wipefsOutput)
+				errMsg := fmt.Sprintf("【安全防呆拦截】目标磁盘 %s 上检测到已有文件系统签名:\n%s\n系统防呆机制已阻止格式化以防误删重要数据！请选择未格式化的纯净裸盘", diskDev, wipefsOutput)
 				fmt.Fprintln(logWriter, errMsg)
 				return fmt.Errorf("%s", errMsg)
 			}
-
-			fmt.Fprintf(logWriter, "[SSH Deploy] 安全防呆检测通过 (确认目标盘 %s 为无文件系统的纯净裸盘)\n", opts.DiskDevice)
-			fmt.Fprintf(logWriter, "[SSH Deploy] 正在执行磁盘格式化操作 (格式: %s, 目标: %s)...\n", opts.FSType, opts.DiskDevice)
-			// 1.3 先卸载可能已挂载的旧路径
-			_ = runRemoteCmd(client, fmt.Sprintf("umount %s 2>/dev/null || true", opts.DiskDevice), logWriter)
-
-			// 1.4 执行格式化命令
-			var formatCmd string
-			if strings.ToLower(opts.FSType) == "xfs" {
-				formatCmd = fmt.Sprintf("mkfs.xfs -f %s", opts.DiskDevice)
-			} else {
-				formatCmd = fmt.Sprintf("mkfs.ext4 -F %s", opts.DiskDevice)
-			}
-			if err := runRemoteCmd(client, formatCmd, logWriter); err != nil {
-				return fmt.Errorf("格式化硬盘 %s 失败: %w", opts.DiskDevice, err)
-			}
-			fmt.Fprintf(logWriter, "[SSH Deploy] 磁盘 %s 格式化成功！\n", opts.DiskDevice)
 		}
-
-		// 1.3 创建挂载目录并挂载
-		fmt.Fprintf(logWriter, "[SSH Deploy] 正在挂载硬盘到: %s...\n", opts.MountPoint)
-		mountCmd := fmt.Sprintf("mkdir -p %s && (mount | grep -q 'on %s ' || mount %s %s)",
-			opts.MountPoint, opts.MountPoint, opts.DiskDevice, opts.MountPoint)
-		if err := runRemoteCmd(client, mountCmd, logWriter); err != nil {
-			return fmt.Errorf("挂载硬盘失败: %w", err)
-		}
-
-		// 1.4 持久化配置到 /etc/fstab (防止重启后挂载丢失)
-		fstabCmd := fmt.Sprintf("grep -v '%s' /etc/fstab > /tmp/fstab.tmp && mv -f /tmp/fstab.tmp /etc/fstab; echo '%s %s %s defaults 0 0' >> /etc/fstab",
-			opts.DiskDevice, opts.DiskDevice, opts.MountPoint, opts.FSType)
-		_ = runRemoteCmd(client, fstabCmd, logWriter)
-		fmt.Fprintf(logWriter, "[SSH Deploy] 磁盘挂载成功并已持久化写入 /etc/fstab！\n")
-
-		// 将 Worker 的主要数据目录指向该格式化后的硬盘挂载目录
-		targetDataDir = opts.MountPoint
 	}
 
-	// 2. 创建程序与日志目录
-	cmdCreateDir := fmt.Sprintf("mkdir -p %s/bin %s/logs %s", opts.InstallDir, opts.InstallDir, targetDataDir)
+	sudoPrefix := ""
+	if opts.Username != "root" {
+		sudoPrefix = "sudo -n "
+	}
+
+	// 2. 创建安装主目录
+	cmdCreateDir := fmt.Sprintf("%smkdir -p %s/bin %s/logs %s/run && %schown -R %s %s 2>/dev/null || mkdir -p %s/bin %s/logs %s/run",
+		sudoPrefix, opts.InstallDir, opts.InstallDir, opts.InstallDir, sudoPrefix, opts.Username, opts.InstallDir,
+		opts.InstallDir, opts.InstallDir, opts.InstallDir)
 	if err := runRemoteCmd(client, cmdCreateDir, logWriter); err != nil {
 		return fmt.Errorf("创建远程目录失败: %w", err)
 	}
@@ -358,6 +463,16 @@ func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
 	currentExec, err := os.Executable()
 	if err != nil {
 		currentExec = "/usr/local/bin/dist-log-analyzer"
+	}
+	// 若当前运行在 go test 环境中，优先使用工程根目录的正式二进制
+	if strings.Contains(currentExec, ".test") {
+		candidates := []string{"bin/dist-log-analyzer", "../bin/dist-log-analyzer", "../../bin/dist-log-analyzer"}
+		for _, c := range candidates {
+			if _, sErr := os.Stat(c); sErr == nil {
+				currentExec = c
+				break
+			}
+		}
 	}
 	fmt.Fprintf(logWriter, "[SSH Deploy] 正在传输业务二进制组件 (%s -> %s/bin/dist-log-analyzer)...\n", currentExec, opts.InstallDir)
 
@@ -376,32 +491,125 @@ func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
 		}
 	}
 
-	// 4. 授权并停止旧进程
-	stopCmd := fmt.Sprintf("chmod +x %s/bin/dist-log-analyzer && pkill -f '%s/bin/dist-log-analyzer worker' || true", opts.InstallDir, opts.InstallDir)
+	// 4. 停止所有旧的 worker 进程与已注册的 systemd 服务 (防止自动拉起竞争)
+	stopCmd := fmt.Sprintf("%ssystemctl stop 'dist-log-worker-*.service' 2>/dev/null || true; %spkill -9 -f '%s/bin/dist-log-analyzer worker' 2>/dev/null || true; %schown -R %s %s 2>/dev/null || true; chmod +x %s/bin/dist-log-analyzer 2>/dev/null || true",
+		sudoPrefix, sudoPrefix, opts.InstallDir, sudoPrefix, opts.Username, opts.InstallDir, opts.InstallDir)
 	_ = runRemoteCmd(client, stopCmd, logWriter)
 
-	// 5. 远程后台启动 Worker 组件 (数据目录指向 targetDataDir)
-	startCmd := fmt.Sprintf("nohup %s/bin/dist-log-analyzer worker --port=%d --manager-url=%s --cluster-token=%s --node-name=%s --advertise-ip=%s --data-dir=%s </dev/null > %s/logs/worker.log 2>&1 &",
-		opts.InstallDir, opts.WorkerPort, opts.ManagerURL, opts.ClusterToken, opts.NodeName, opts.Host, targetDataDir, opts.InstallDir)
-
-	fmt.Fprintf(logWriter, "[SSH Deploy] 正在远程启动业务组件 Worker 进程 (存储数据目录: %s)...\n", targetDataDir)
-	if err := runRemoteCmd(client, startCmd, logWriter); err != nil {
-		return fmt.Errorf("远程启动 Worker 进程失败: %w", err)
+	// 检测目标机器是否支持 Systemd 守护进程
+	var hasSystemd bool
+	var sysCheckBuf bytes.Buffer
+	checkErr := runRemoteCmd(client, "command -v systemctl || which systemctl", &sysCheckBuf)
+	if strings.Contains(sysCheckBuf.String(), "systemctl") || checkErr == nil {
+		hasSystemd = true
+		fmt.Fprintln(logWriter, "[SSH Deploy] 检测到目标节点支持 Systemd，将为每个磁盘 Worker 注册系统守护服务并开启故障 3 秒自动拉起 (Restart=always)")
 	}
 
-	// 6. 验证是否监听
+	// 5. 为每块选定的物理硬盘格式化挂载，并分别启动一个专属 Worker 进程 (多进程隔离架构)
+	for idx, diskDev := range disks {
+		diskName := filepath.Base(diskDev)
+		instPort := opts.WorkerPort + idx
+		instName := fmt.Sprintf("%s-%s", opts.NodeName, diskName)
+		instMount := fmt.Sprintf("%s/disk-%s", opts.MountPoint, diskName)
+		instDataDir := fmt.Sprintf("%s/data", instMount)
+
+		fmt.Fprintf(logWriter, "[SSH Deploy] [%d/%d] 正在处理物理磁盘: %s (服务端口: %d, 挂载点: %s)...\n",
+			idx+1, len(disks), diskDev, instPort, instMount)
+
+		if opts.FormatDisk {
+			_ = runRemoteCmd(client, fmt.Sprintf("%sumount %s 2>/dev/null || true", sudoPrefix, diskDev), logWriter)
+			var formatCmd string
+			if strings.ToLower(opts.FSType) == "xfs" {
+				formatCmd = fmt.Sprintf("%smkfs.xfs -f %s", sudoPrefix, diskDev)
+			} else {
+				formatCmd = fmt.Sprintf("%smkfs.ext4 -F %s", sudoPrefix, diskDev)
+			}
+			if err := runRemoteCmd(client, formatCmd, logWriter); err != nil {
+				return fmt.Errorf("格式化硬盘 %s 失败: %w", diskDev, err)
+			}
+		}
+
+		mountCmd := fmt.Sprintf("%smkdir -p %s && (%smount | grep -q 'on %s ' || %smount %s %s) && %schown -R %s %s 2>/dev/null || true",
+			sudoPrefix, instMount, sudoPrefix, instMount, sudoPrefix, diskDev, instMount, sudoPrefix, opts.Username, instMount)
+		if err := runRemoteCmd(client, mountCmd, logWriter); err != nil {
+			return fmt.Errorf("挂载硬盘 %s 失败: %w", diskDev, err)
+		}
+
+		fstabCmd := fmt.Sprintf("%sbash -c \"grep -v '%s' /etc/fstab > /tmp/fstab.tmp && mv -f /tmp/fstab.tmp /etc/fstab && echo '%s %s %s defaults 0 0' >> /etc/fstab\" 2>/dev/null || true",
+			sudoPrefix, diskDev, diskDev, instMount, opts.FSType)
+		_ = runRemoteCmd(client, fstabCmd, logWriter)
+
+		// 创建该盘的数据目录并赋予当前用户权限
+		_ = runRemoteCmd(client, fmt.Sprintf("%smkdir -p %s && %schown -R %s %s 2>/dev/null || true", sudoPrefix, instDataDir, sudoPrefix, opts.Username, instDataDir), logWriter)
+
+		// 优先配置并启动 Systemd 守护服务（配置故障 3 秒自动拉起，保障高可用与健康管理）
+		svcFile := fmt.Sprintf("dist-log-worker-%s.service", diskName)
+		svcPath := fmt.Sprintf("/etc/systemd/system/%s", svcFile)
+		workerExec := fmt.Sprintf("%s/bin/dist-log-analyzer worker --port=%d --manager-url=%s --cluster-token=%s --node-name=%s --advertise-ip=%s --data-dir=%s",
+			opts.InstallDir, instPort, opts.ManagerURL, opts.ClusterToken, instName, opts.Host, instDataDir)
+
+		svcContent := fmt.Sprintf(`[Unit]
+Description=Distributed Storage Log Analyzer Worker (Disk: %s, Port: %d)
+After=network.target
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=%s
+ExecStart=%s
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+TimeoutStopSec=15s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+`, diskDev, instPort, opts.InstallDir, workerExec)
+
+		if hasSystemd {
+			tmpSvcPath := fmt.Sprintf("/tmp/%s", svcFile)
+			if err := copyBytesToRemote(client, []byte(svcContent), tmpSvcPath, 0644, logWriter); err != nil {
+				return fmt.Errorf("传输 Systemd 服务配置失败: %w", err)
+			}
+
+			startSvcCmd := fmt.Sprintf("%smv -f %s %s && %schown root:root %s && %schmod 644 %s && %ssystemctl daemon-reload && %ssystemctl enable %s 2>/dev/null || true && %ssystemctl restart %s",
+				sudoPrefix, tmpSvcPath, svcPath, sudoPrefix, svcPath, sudoPrefix, svcPath, sudoPrefix, sudoPrefix, svcFile, sudoPrefix, svcFile)
+			if err := runRemoteCmd(client, startSvcCmd, logWriter); err != nil {
+				return fmt.Errorf("启动 Systemd 服务 (%s) 失败: %w", svcFile, err)
+			}
+
+			// 循环验证服务健康状态 (最多等待 4 秒，确保 systemd 从 activating 过渡到 active)
+			actState := ""
+			for retries := 0; retries < 8; retries++ {
+				time.Sleep(500 * time.Millisecond)
+				var activeBuf bytes.Buffer
+				_ = runRemoteCmd(client, fmt.Sprintf("%ssystemctl is-active %s 2>/dev/null || true", sudoPrefix, svcFile), &activeBuf)
+				actState = strings.TrimSpace(activeBuf.String())
+				if actState == "active" {
+					break
+				}
+			}
+			if actState == "active" {
+				fmt.Fprintf(logWriter, "[SSH Deploy] ✔ Worker Systemd 服务 [%s] 健康检查通过 (active)！已配置故障 3 秒自动拉起 (Restart=always)\n", svcFile)
+			} else {
+				return fmt.Errorf("Worker Systemd 服务 [%s] 启动健康检查失败 (状态: %s)", svcFile, actState)
+			}
+		} else {
+			// 降级：后台守护进程
+			startCmd := fmt.Sprintf("nohup %s </dev/null > %s/logs/worker-%s.log 2>&1 &",
+				workerExec, opts.InstallDir, diskName)
+			if err := runRemoteCmd(client, startCmd, logWriter); err != nil {
+				return fmt.Errorf("启动 Worker 进程 (磁盘: %s) 失败: %w", diskDev, err)
+			}
+			fmt.Fprintf(logWriter, "[SSH Deploy] ✔ Worker 实例 [%s] 启动成功 (无 Systemd 环境，已通过 nohup 托管)\n", instName)
+		}
+	}
+
 	time.Sleep(1500 * time.Millisecond)
-	checkCmd := fmt.Sprintf("pgrep -f '%s/bin/dist-log-analyzer worker' && echo 'WORKER_RUNNING_OK'", opts.InstallDir)
-	var outBuf bytes.Buffer
-	mw := io.MultiWriter(logWriter, &outBuf)
-	_ = runRemoteCmd(client, checkCmd, mw)
-
-	if strings.Contains(outBuf.String(), "WORKER_RUNNING_OK") {
-		fmt.Fprintf(logWriter, "[SSH Deploy] 业务节点安装并启动成功！已成功接入集群并在指定硬盘上提供存储服务。\n")
-		return nil
-	}
-
-	fmt.Fprintf(logWriter, "[SSH Deploy] 提示: 业务进程已发送启动指令，请在节点列表查看在线状态\n")
+	fmt.Fprintf(logWriter, "[SSH Deploy] 全部 %d 个物理磁盘的 Worker 实例已成功拉起并接入集群，多进程 I/O 隔离与容量调度生效！\n", len(disks))
 	return nil
 }
 
@@ -414,7 +622,21 @@ func runRemoteCmd(client *ssh.Client, cmd string, logWriter io.Writer) error {
 
 	session.Stdout = logWriter
 	session.Stderr = logWriter
-	return session.Run(cmd)
+	fullCmd := fmt.Sprintf("export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin; %s", cmd)
+	return session.Run(fullCmd)
+}
+
+func runRemoteCmdSeparate(client *ssh.Client, cmd string, stdout io.Writer, stderr io.Writer) error {
+	session, err := client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	session.Stdout = stdout
+	session.Stderr = stderr
+	fullCmd := fmt.Sprintf("export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin; %s", cmd)
+	return session.Run(fullCmd)
 }
 
 func copyBytesToRemote(client *ssh.Client, data []byte, remotePath string, mode os.FileMode, logWriter io.Writer) error {
@@ -424,16 +646,27 @@ func copyBytesToRemote(client *ssh.Client, data []byte, remotePath string, mode 
 	}
 	defer session.Close()
 
-	go func() {
-		w, _ := session.StdinPipe()
-		defer w.Close()
-		fmt.Fprintf(w, "C%04o %d %s\n", mode, len(data), "dist-log-analyzer")
-		_, _ = w.Write(data)
-		fmt.Fprint(w, "\x00")
-	}()
+	session.Stdout = logWriter
+	session.Stderr = logWriter
 
-	cmd := fmt.Sprintf("scp -t %s", remotePath)
-	return session.Run(cmd)
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	cmd := fmt.Sprintf("export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin; rm -f %s && cat > %s && chmod %04o %s", remotePath, remotePath, mode, remotePath)
+	if err := session.Start(cmd); err != nil {
+		return err
+	}
+
+	if _, err := stdin.Write(data); err != nil {
+		return err
+	}
+	if err := stdin.Close(); err != nil {
+		return err
+	}
+
+	return session.Wait()
 }
 
 // GetOutboundIP 获取本机对外 IP

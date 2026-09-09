@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -25,6 +26,7 @@ type compiledRule struct {
 	rule         *model.Rule
 	regex        *regexp.Regexp
 	patternLower string
+	orKeywords   []string
 }
 
 var scanBufPool = sync.Pool{
@@ -52,6 +54,9 @@ func NewEngine(rules []*model.Rule) *Engine {
 				// 降级为字面匹配
 				cr.regex = regexp.MustCompile(regexp.QuoteMeta(r.Pattern))
 			}
+			cr.orKeywords = extractCandidateKeywords(r.Pattern)
+		} else {
+			cr.orKeywords = []string{strings.ToLower(r.Pattern)}
 		}
 		compiled = append(compiled, cr)
 	}
@@ -205,8 +210,19 @@ func (e *Engine) DiagnoseDirectory(archiveID, userID, archiveName, rootDir strin
 	return report, nil
 }
 
-// DiagnoseFile 诊断单个文件 (利用 sync.Pool 缓冲复用与单行一次性小写优化)
+// DiagnoseFile 诊断单个文件 (利用 sync.Pool 缓冲复用、指定文件名/全路径匹配与单行一次性小写优化)
 func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([]model.DiagnosisEvent, error) {
+	// 1. 快速过滤出适用于当前相对路径/文件名的规则列表
+	var activeRules []*compiledRule
+	for _, cr := range e.compiledRules {
+		if MatchFilePath(cr.rule.FilePathPattern, relPath) {
+			activeRules = append(activeRules, cr)
+		}
+	}
+	if len(activeRules) == 0 {
+		return nil, nil // 当前文件不符合任何已启用规则的作用文件范围，跳过扫描
+	}
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -233,12 +249,29 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 		var lineLower string
 		var lineLowerInit bool
 
-		for _, cr := range e.compiledRules {
+		for _, cr := range activeRules {
+			// 性能优化：快速短路筛选。若规则提取出了候选关键字，且当前行小写文本未包含任何候选词，直接跳过此规则
+			if len(cr.orKeywords) > 0 {
+				if !lineLowerInit {
+					lineLower = strings.ToLower(line)
+					lineLowerInit = true
+				}
+				hasCandidate := false
+				for _, kw := range cr.orKeywords {
+					if strings.Contains(lineLower, kw) {
+						hasCandidate = true
+						break
+					}
+				}
+				if !hasCandidate {
+					continue
+				}
+			}
+
 			matched := false
 			if cr.regex != nil {
 				matched = cr.regex.MatchString(line)
 			} else {
-				// 优化：单行在命中非正则规则时仅做 1 次 strings.ToLower，使用预先小写的 patternLower 进行比对
 				if !lineLowerInit {
 					lineLower = strings.ToLower(line)
 					lineLowerInit = true
@@ -300,4 +333,160 @@ func extractTimestamp(line string) string {
 		}
 	}
 	return ""
+}
+
+// MatchFilePath 检查目标相对路径或文件名是否符合规则定义的路径匹配模式
+// pattern 为空时匹配所有文件
+// 支持：
+// 1. 单纯文件名匹配：如 "dmesg.log", "ceph-osd.0.log"
+// 2. 通配符文件名匹配：如 "*.log", "ceph-osd.*", "hadoop-*"
+// 3. 相对全路径精确匹配：如 "sys/dmesg.log", "ceph/ceph-osd.0.log"
+// 4. 路径级通配符：如 "ceph/*.log", "sys/*", "*/dmesg.log"
+// 5. 多模式支持：逗号或分号分隔多个候选，如 "dmesg.log, syslog, kern.log"
+func MatchFilePath(pattern string, relPath string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return true
+	}
+
+	normRel := strings.ToLower(filepath.ToSlash(relPath))
+	baseName := strings.ToLower(filepath.Base(relPath))
+
+	var subPatterns []string
+	if strings.ContainsAny(pattern, ",;") {
+		for _, p := range strings.FieldsFunc(pattern, func(r rune) bool { return r == ',' || r == ';' }) {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				subPatterns = append(subPatterns, p)
+			}
+		}
+	} else {
+		subPatterns = []string{pattern}
+	}
+
+	for _, p := range subPatterns {
+		p = strings.ToLower(filepath.ToSlash(strings.TrimSpace(p)))
+		p = strings.TrimPrefix(p, "./")
+		p = strings.TrimPrefix(p, "/")
+
+		// 1. 若不包含路径分隔符 '/'，作为纯文件名匹配
+		if !strings.Contains(p, "/") {
+			if p == baseName {
+				return true
+			}
+			if matched, _ := path.Match(p, baseName); matched {
+				return true
+			}
+		}
+
+		// 2. 包含 '/' 或作为路径匹配
+		if p == normRel {
+			return true
+		}
+		if matched, _ := path.Match(p, normRel); matched {
+			return true
+		}
+		// 支持相对路径后缀匹配，如 "sys/dmesg.log" 匹配 "foo/sys/dmesg.log"
+		if strings.HasSuffix(normRel, "/"+p) {
+			return true
+		}
+		if matched, _ := path.Match("*/"+p, normRel); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// extractCandidateKeywords 从正则表达式中提取所有顶级分支的字面量候选词（长度>=2），用于极速过滤跳过绝大多数非目标行
+func extractCandidateKeywords(pattern string) []string {
+	p := strings.TrimSpace(pattern)
+	if strings.HasPrefix(strings.ToLower(p), "(?i)") {
+		p = p[4:]
+	}
+	p = strings.TrimSpace(p)
+	if strings.HasPrefix(p, "(") && strings.HasSuffix(p, ")") {
+		depth := 0
+		matched := true
+		for i, c := range p {
+			if c == '(' {
+				depth++
+			} else if c == ')' {
+				depth--
+				if depth == 0 && i < len(p)-1 {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched && depth == 0 {
+			p = p[1 : len(p)-1]
+		}
+	}
+
+	var branches []string
+	start := 0
+	depth := 0
+	for i, c := range p {
+		if c == '(' || c == '[' {
+			depth++
+		} else if c == ')' || c == ']' {
+			if depth > 0 {
+				depth--
+			}
+		} else if c == '|' && depth == 0 {
+			branches = append(branches, p[start:i])
+			start = i + 1
+		}
+	}
+	branches = append(branches, p[start:])
+
+	var allKeywords []string
+	for _, b := range branches {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			return nil
+		}
+		token := extractLongestLiteralToken(b)
+		if len(token) < 2 {
+			return nil
+		}
+		allKeywords = append(allKeywords, strings.ToLower(token))
+	}
+
+	var unique []string
+	seen := make(map[string]bool)
+	for _, kw := range allKeywords {
+		if !seen[kw] {
+			seen[kw] = true
+			unique = append(unique, kw)
+		}
+	}
+	return unique
+}
+
+func extractLongestLiteralToken(branch string) string {
+	isMeta := func(r rune) bool {
+		switch r {
+		case '.', '*', '+', '?', '^', '$', '[', ']', '(', ')', '{', '}', '\\', '|':
+			return true
+		}
+		return false
+	}
+
+	var current strings.Builder
+	var longest string
+	for _, r := range branch {
+		if isMeta(r) {
+			if current.Len() > len(longest) {
+				longest = current.String()
+			}
+			current.Reset()
+		} else {
+			current.WriteRune(r)
+		}
+	}
+	if current.Len() > len(longest) {
+		longest = current.String()
+	}
+	return strings.TrimSpace(longest)
 }

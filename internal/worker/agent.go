@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -25,13 +26,14 @@ import (
 
 // Agent Worker 计算节点守护服务
 type Agent struct {
-	cfg           *config.Config
-	server        *http.Server
-	nodeID        string
-	activeTask    int
-	mu            sync.Mutex
-	alarmCooldown map[string]time.Time
-	alarmMu       sync.Mutex
+	cfg              *config.Config
+	server           *http.Server
+	nodeID           string
+	activeTask       int
+	mu               sync.Mutex
+	alarmCooldown    map[string]time.Time
+	alarmMu          sync.Mutex
+	isDecommissioned bool
 }
 
 func NewAgent(cfg *config.Config) *Agent {
@@ -54,7 +56,9 @@ func (a *Agent) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/worker/storage/file-content", a.handleStorageFileContent)
 	mux.HandleFunc("/api/worker/storage/download-file", a.handleStorageDownloadFile)
 	mux.HandleFunc("/api/worker/storage/download-archive", a.handleStorageDownloadArchive)
+	mux.HandleFunc("/api/worker/storage/clean-archive", a.handleStorageCleanArchive)
 	mux.HandleFunc("/api/worker/storage/files", a.handleStorageFiles)
+	mux.HandleFunc("/api/worker/decommission", a.handleDecommission)
 
 	addr := fmt.Sprintf("%s:%d", a.cfg.ListenHost, a.cfg.Port)
 	a.server = &http.Server{
@@ -160,8 +164,12 @@ func (a *Agent) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	// 2. 本地解包与文件树提取
 	files, totalLines, err := ExtractArchive(destPath, extractDir)
 	if err != nil {
-		a.ReportAlarm(model.AlarmTypeTaskFailed, model.SeverityWarning, "日志归档解压缩失败", fmt.Sprintf("节点 %s 解压缩文件 %s 发生异常: %v", a.cfg.NodeName, header.Filename, err))
-		http.Error(w, fmt.Sprintf("解包失败: %v", err), http.StatusInternalServerError)
+		errMsg := err.Error()
+		if strings.Contains(strings.ToLower(errMsg), "no space left on device") {
+			errMsg = fmt.Sprintf("存储磁盘空间不足 (no space left on device): %v", err)
+		}
+		a.ReportAlarm(model.AlarmTypeTaskFailed, model.SeverityWarning, "日志归档解压缩失败", fmt.Sprintf("节点 %s 解压缩文件 %s 发生异常: %v", a.cfg.NodeName, header.Filename, errMsg))
+		http.Error(w, fmt.Sprintf("解包失败: %v", errMsg), http.StatusInternalServerError)
 		return
 	}
 
@@ -327,6 +335,42 @@ func (a *Agent) handleStorageDownloadArchive(w http.ResponseWriter, r *http.Requ
 	http.ServeContent(w, r, filename, info.ModTime(), f)
 }
 
+// handleStorageCleanArchive 清理业务节点硬盘上的日志归档文件及解压目录 (用于节点移除时的彻底清理或迁移后的空间释放)
+func (a *Agent) handleStorageCleanArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	username := r.URL.Query().Get("username")
+	archiveID := r.URL.Query().Get("archive_id")
+	filename := r.URL.Query().Get("filename")
+	all := r.URL.Query().Get("all") == "true"
+
+	if all {
+		// 清理整个数据目录下的 users
+		usersDir := filepath.Join(a.cfg.DataDir, "users")
+		_ = os.RemoveAll(usersDir)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "message": "all user data cleared"})
+		return
+	}
+
+	if username != "" {
+		if filename != "" {
+			archivePath := filepath.Join(a.cfg.DataDir, "users", username, "archives", filename)
+			_ = os.Remove(archivePath)
+		}
+		if archiveID != "" {
+			extractDir := filepath.Join(a.cfg.DataDir, "users", username, "extracted", archiveID)
+			_ = os.RemoveAll(extractDir)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+}
+
 // handleStorageFiles 读取指定解压目录的文件树
 func (a *Agent) handleStorageFiles(w http.ResponseWriter, r *http.Request) {
 	archiveID := r.URL.Query().Get("archive_id")
@@ -448,16 +492,27 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			a.mu.Lock()
+			decom := a.isDecommissioned
+			a.mu.Unlock()
+			if decom {
+				return
+			}
 			a.sendHeartbeat()
 		}
 	}
 }
 
 func (a *Agent) sendHeartbeat() {
-	res := a.collectSystemResource()
 	a.mu.Lock()
+	if a.isDecommissioned {
+		a.mu.Unlock()
+		return
+	}
 	tasks := a.activeTask
 	a.mu.Unlock()
+
+	res := a.collectSystemResource()
 
 	// 业务组件健康自检与主动上报告警 (磁盘满、只读挂载、内存超高)
 	a.checkSelfHealth(res)
@@ -498,6 +553,11 @@ func (a *Agent) sendHeartbeat() {
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusGone {
+				log.Printf("[Worker] 收到管理节点 410 Gone (该节点已从集群移除注销)，执行自动下线停止...")
+				go a.executeDecommission()
+				return
+			}
 			if resp.StatusCode == http.StatusOK {
 				// 心跳成功送达当前活跃的管理节点
 				return
@@ -505,6 +565,65 @@ func (a *Agent) sendHeartbeat() {
 		}
 	}
 	log.Printf("[Worker] 向管理节点 (%s) 发送心跳均未能成功响应", a.cfg.ManagerURL)
+}
+
+func (a *Agent) handleDecommission(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := r.Header.Get("X-Cluster-Token")
+	if token != a.cfg.ClusterToken {
+		http.Error(w, "Token 验证失败", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"message": "Worker 已收到下线注销指令，正在执行清理并停止服务",
+	})
+
+	go a.executeDecommission()
+}
+
+func (a *Agent) executeDecommission() {
+	a.mu.Lock()
+	if a.isDecommissioned {
+		a.mu.Unlock()
+		return
+	}
+	a.isDecommissioned = true
+	a.mu.Unlock()
+
+	log.Printf("[Worker Agent] 收到集群注销指令，正在停用服务与注销守护进程...")
+
+	// 1. 如果存在由 Manager 一键部署注册的 Systemd 服务，主动停止并禁用服务文件，防止 Systemd 自动拉起
+	stopServiceCmd := fmt.Sprintf(`
+		for svc in /etc/systemd/system/dist-log-worker-*.service /etc/systemd/system/dist-log-worker.service; do
+			if [ -f "$svc" ]; then
+				sname=$(basename "$svc")
+				if grep -q "port=%d" "$svc" 2>/dev/null || grep -q "%s" "$svc" 2>/dev/null; then
+					sudo -n systemctl stop "$sname" 2>/dev/null || systemctl stop "$sname" 2>/dev/null || true
+					sudo -n systemctl disable "$sname" 2>/dev/null || systemctl disable "$sname" 2>/dev/null || true
+					sudo -n rm -f "$svc" 2>/dev/null || rm -f "$svc" 2>/dev/null || true
+					sudo -n systemctl daemon-reload 2>/dev/null || systemctl daemon-reload 2>/dev/null || true
+				fi
+			fi
+		done
+	`, a.cfg.Port, a.cfg.DataDir)
+	_ = exec.Command("sh", "-c", stopServiceCmd).Run()
+
+	// 2. 异步优雅停止 HTTP 服务并退出
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if a.server != nil {
+			_ = a.server.Shutdown(ctx)
+		}
+		os.Exit(0)
+	}()
 }
 
 // ReportAlarm 业务组件向管理节点主动上报告警事件 (支持多 Manager 故障自动转移与防风暴消抖)

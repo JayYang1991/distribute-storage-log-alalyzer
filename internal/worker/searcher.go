@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bufio"
+	"bytes"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -26,6 +27,8 @@ type searchTask struct {
 	relPath  string
 }
 
+const maxCollectedHits = 1000
+
 // SearchLogs 在目标解压目录下执行高并发、流式低内存日志检索
 func SearchLogs(extractDir string, q *model.SearchQuery) (*model.SearchResponse, error) {
 	start := time.Now()
@@ -47,18 +50,25 @@ func SearchLogs(extractDir string, q *model.SearchQuery) (*model.SearchResponse,
 	}
 
 	var reg *regexp.Regexp
+	var literalKw []byte
 	var err error
+
 	if q.Keyword != "" {
-		pattern := q.Keyword
 		if !q.IsRegex {
-			pattern = regexp.QuoteMeta(pattern)
-		}
-		if !q.CaseSensitive {
-			pattern = "(?i)" + pattern
-		}
-		reg, err = regexp.Compile(pattern)
-		if err != nil {
-			return nil, err
+			literalKw = []byte(q.Keyword)
+		} else {
+			pattern := q.Keyword
+			if !q.CaseSensitive {
+				pattern = "(?i)" + pattern
+			}
+			reg, err = regexp.Compile(pattern)
+			if err != nil {
+				return nil, err
+			}
+			// 提取正则中的字面量前缀做短路加速
+			if longest := extractLongestSearchLiteral(q.Keyword); len(longest) >= 3 {
+				literalKw = []byte(longest)
+			}
 		}
 	}
 
@@ -91,9 +101,9 @@ func SearchLogs(extractDir string, q *model.SearchQuery) (*model.SearchResponse,
 
 	var allMatchedHits []model.SearchHit
 
-	// 2. 多核并发检索各个日志文件
+	// 2. 检索各个日志文件（带上限提前终止，防止大日志导致内存占满与超时）
 	if len(tasks) == 1 {
-		allMatchedHits = searchInSingleFile(tasks[0].fullPath, tasks[0].relPath, reg, targetLevel, q.ContextLines)
+		allMatchedHits = searchInSingleFile(tasks[0].fullPath, tasks[0].relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, maxCollectedHits)
 	} else {
 		workerCount := runtime.NumCPU()
 		if workerCount > len(tasks) {
@@ -120,7 +130,15 @@ func SearchLogs(extractDir string, q *model.SearchQuery) (*model.SearchResponse,
 			go func() {
 				defer wg.Done()
 				for t := range taskChan {
-					hits := searchInSingleFile(t.fullPath, t.relPath, reg, targetLevel, q.ContextLines)
+					mu.Lock()
+					currentCount := len(allMatchedHits)
+					mu.Unlock()
+					if currentCount >= maxCollectedHits {
+						break
+					}
+
+					remaining := maxCollectedHits - currentCount
+					hits := searchInSingleFile(t.fullPath, t.relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, remaining)
 					if len(hits) > 0 {
 						mu.Lock()
 						allMatchedHits = append(allMatchedHits, hits...)
@@ -153,8 +171,8 @@ type pendingSearchHit struct {
 	remaining int
 }
 
-// searchInSingleFile 采用滑动环形缓冲区流式搜索单个文件，内存复杂度 O(contextLines)，杜绝大文件 OOM
-func searchInSingleFile(fullPath, relPath string, reg *regexp.Regexp, levelFilter string, contextLines int) []model.SearchHit {
+// searchInSingleFile 采用滑动环形缓冲区与零内存分配字节匹配，流式搜索单个文件，内存复杂度 O(contextLines)，杜绝大文件 OOM
+func searchInSingleFile(fullPath, relPath string, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex bool, levelFilter string, contextLines int, maxHits int) []model.SearchHit {
 	f, err := os.Open(fullPath)
 	if err != nil {
 		return nil
@@ -174,51 +192,97 @@ func searchInSingleFile(fullPath, relPath string, reg *regexp.Regexp, levelFilte
 
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
+		lineBytes := scanner.Bytes()
 
 		// 1. 先为等待后续上下文的 pending hit 追加当前行
-		var activePending []*pendingSearchHit
-		for _, p := range pending {
-			p.hit.ContextAfter = append(p.hit.ContextAfter, line)
-			p.remaining--
-			if p.remaining <= 0 {
-				hits = append(hits, p.hit)
-			} else {
-				activePending = append(activePending, p)
+		if len(pending) > 0 {
+			lineText := string(lineBytes)
+			var activePending []*pendingSearchHit
+			for _, p := range pending {
+				p.hit.ContextAfter = append(p.hit.ContextAfter, lineText)
+				p.remaining--
+				if p.remaining <= 0 {
+					hits = append(hits, p.hit)
+				} else {
+					activePending = append(activePending, p)
+				}
+			}
+			pending = activePending
+
+			if len(hits) >= maxHits {
+				break
 			}
 		}
-		pending = activePending
 
-		// 2. 判断当前行是否匹配级别与搜索模式
-		lineLevel := detectLogLevel(line)
+		// 2. 判断当前行是否匹配日志级别
+		lineLevel := detectLogLevelBytes(lineBytes)
 		if levelFilter != "" && levelFilter != "ALL" {
 			if !matchLogLevel(lineLevel, levelFilter) {
-				pushToRing(&ring, line, contextLines)
+				if contextLines > 0 {
+					pushToRing(&ring, string(lineBytes), contextLines)
+				}
 				continue
 			}
 		}
 
-		if reg != nil && !reg.MatchString(line) {
-			pushToRing(&ring, line, contextLines)
+		// 3. 检查关键词匹配 (Fast Path 高速字节匹配，避免 Go 正则状态机开销)
+		matched := false
+		if len(literalKw) == 0 && reg == nil {
+			matched = true
+		} else if !isRegex {
+			if caseSensitive {
+				matched = bytes.Contains(lineBytes, literalKw)
+			} else {
+				matched = bytesContainsFoldASCII(lineBytes, literalKw)
+			}
+		} else {
+			// 正则模式：若提取出字面量，先用字面量做高速 O(1) 预过滤
+			if len(literalKw) > 0 {
+				hasCandidate := false
+				if caseSensitive {
+					hasCandidate = bytes.Contains(lineBytes, literalKw)
+				} else {
+					hasCandidate = bytesContainsFoldASCII(lineBytes, literalKw)
+				}
+				if !hasCandidate {
+					if contextLines > 0 {
+						pushToRing(&ring, string(lineBytes), contextLines)
+					}
+					continue
+				}
+			}
+			if reg != nil {
+				matched = reg.Match(lineBytes)
+			}
+		}
+
+		if !matched {
+			if contextLines > 0 {
+				pushToRing(&ring, string(lineBytes), contextLines)
+			}
 			continue
 		}
 
-		// 3. 构造匹配命中实体，前序上下文从 ring 取出深拷贝
+		// 4. 命中：此时才分配 string 构造 SearchHit 实体
+		lineText := string(lineBytes)
 		contextBefore := make([]string, len(ring))
 		copy(contextBefore, ring)
 
 		newHit := model.SearchHit{
 			FilePath:      relPath,
 			LineNumber:    lineNum,
-			Content:       line,
+			Content:       lineText,
 			Level:         lineLevel,
-			Timestamp:     extractTimestamp(line),
+			Timestamp:     extractTimestamp(lineText),
 			ContextBefore: contextBefore,
 			ContextAfter:  make([]string, 0, contextLines),
 		}
 
 		if contextLines == 0 {
 			hits = append(hits, newHit)
+			if len(hits) >= maxHits {
+				break
+			}
 		} else {
 			pending = append(pending, &pendingSearchHit{
 				hit:       newHit,
@@ -226,16 +290,102 @@ func searchInSingleFile(fullPath, relPath string, reg *regexp.Regexp, levelFilte
 			})
 		}
 
-		// 4. 将当前行推入前序环形缓冲区
-		pushToRing(&ring, line, contextLines)
+		// 5. 将当前行推入前序环形缓冲区
+		if contextLines > 0 {
+			pushToRing(&ring, lineText, contextLines)
+		}
 	}
 
-	// 5. 文件结束处理未收集满 contextLines 的尾部 pending hits
+	// 处理尾部未填满的 pending hits
 	for _, p := range pending {
 		hits = append(hits, p.hit)
 	}
 
 	return hits
+}
+
+// bytesContainsFoldASCII 零内存分配的 ASCII 大小写不敏感快速子串匹配
+func bytesContainsFoldASCII(s, substr []byte) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	if len(s) < len(substr) {
+		return false
+	}
+	c0 := substr[0]
+	c0Alt := c0
+	if c0 >= 'a' && c0 <= 'z' {
+		c0Alt = c0 - 32
+	} else if c0 >= 'A' && c0 <= 'Z' {
+		c0Alt = c0 + 32
+	}
+
+	maxI := len(s) - len(substr)
+	for i := 0; i <= maxI; i++ {
+		b := s[i]
+		if b == c0 || b == c0Alt {
+			matched := true
+			for j := 1; j < len(substr); j++ {
+				sb := s[i+j]
+				tb := substr[j]
+				if sb != tb {
+					if sb >= 'A' && sb <= 'Z' {
+						sb += 32
+					}
+					if tb >= 'A' && tb <= 'Z' {
+						tb += 32
+					}
+					if sb != tb {
+						matched = false
+						break
+					}
+				}
+			}
+			if matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractLongestSearchLiteral 从正则表达式中提取最长连续字面量字符串用于预过滤
+func extractLongestSearchLiteral(pattern string) string {
+	metaChars := `.*+?^${}()|[]\`
+	parts := strings.FieldsFunc(pattern, func(r rune) bool {
+		return strings.ContainsRune(metaChars, r)
+	})
+	longest := ""
+	for _, p := range parts {
+		clean := strings.TrimSpace(p)
+		if len(clean) > len(longest) {
+			longest = clean
+		}
+	}
+	return longest
+}
+
+// detectLogLevelBytes 零内存分配快速检测日志级别，避免 string 堆分配
+func detectLogLevelBytes(b []byte) string {
+	if bytes.Contains(b, []byte("FATAL")) || bytes.Contains(b, []byte("fatal")) || bytes.Contains(b, []byte("EMERG")) {
+		return "FATAL"
+	}
+	if bytes.Contains(b, []byte("CRIT")) || bytes.Contains(b, []byte("critical")) || bytes.Contains(b, []byte("CRITICAL")) {
+		return "CRITICAL"
+	}
+	if bytes.Contains(b, []byte("ERR")) || bytes.Contains(b, []byte("error")) || bytes.Contains(b, []byte("ERROR")) || bytes.Contains(b, []byte("Error")) {
+		return "ERROR"
+	}
+	if bytes.Contains(b, []byte("WARN")) || bytes.Contains(b, []byte("warning")) || bytes.Contains(b, []byte("WARNING")) || bytes.Contains(b, []byte("Warn")) {
+		return "WARN"
+	}
+	if bytes.Contains(b, []byte("DEBUG")) || bytes.Contains(b, []byte("debug")) || bytes.Contains(b, []byte("Debug")) {
+		return "DEBUG"
+	}
+	if bytes.Contains(b, []byte("TRACE")) || bytes.Contains(b, []byte("trace")) {
+		return "TRACE"
+	}
+	return "INFO"
 }
 
 func pushToRing(ring *[]string, line string, maxCap int) {

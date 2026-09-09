@@ -420,6 +420,11 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(nodes)
 }
 
+type RemoveNodeRequest struct {
+	Action       string `json:"action"`         // "migrate" | "retain" | "delete"
+	TargetNodeID string `json:"target_node_id"` // 当 action == "migrate" 时的目标节点 ID
+}
+
 func (s *Server) handleNodeItem(w http.ResponseWriter, r *http.Request) {
 	currentUser, err := s.authenticate(r)
 	if err != nil || currentUser.Role != model.RoleAdmin {
@@ -427,13 +432,203 @@ func (s *Server) handleNodeItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
+	path := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
+	parts := strings.Split(path, "/")
+	id := parts[0]
+
+	// 支持 POST /api/nodes/{id}/remove
+	if len(parts) >= 2 && parts[1] == "remove" && r.Method == http.MethodPost {
+		var req RemoveNodeRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		s.handleRemoveNode(w, r, id, req)
+		return
+	}
+
 	if r.Method == http.MethodDelete {
-		_ = s.store.DeleteNode(id)
+		originNode, _ := s.store.GetNode(id)
+		_ = s.store.DecommissionNode(id)
+		_, _ = s.store.ResolveAlarm(id, model.AlarmTypeNodeOffline)
+		if originNode != nil && originNode.IP != "" && originNode.Port > 0 {
+			go func(ip string, port int, token string) {
+				decomURL := fmt.Sprintf("http://%s:%d/api/worker/decommission", ip, port)
+				req, err := http.NewRequest(http.MethodPost, decomURL, nil)
+				if err == nil {
+					req.Header.Set("X-Cluster-Token", token)
+					client := &http.Client{Timeout: 3 * time.Second}
+					_, _ = client.Do(req)
+				}
+			}(originNode.IP, originNode.Port, s.cfg.ClusterToken)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (s *Server) handleRemoveNode(w http.ResponseWriter, r *http.Request, nodeID string, req RemoveNodeRequest) {
+	originNode, err := s.store.GetNode(nodeID)
+	if err != nil {
+		http.Error(w, "目标节点不存在", http.StatusNotFound)
+		return
+	}
+
+	archives, _ := s.store.ListArchivesByNode(nodeID)
+	action := req.Action
+	if action == "" {
+		action = "retain" // 默认保留数据
+	}
+
+	migratedCount := 0
+
+	switch action {
+	case "migrate":
+		targetNodeID := req.TargetNodeID
+		if targetNodeID == "" || targetNodeID == nodeID {
+			http.Error(w, "迁移数据必须指定有效的接收目标节点", http.StatusBadRequest)
+			return
+		}
+
+		if targetNodeID == "manager_primary" || targetNodeID == "local" {
+			http.Error(w, "禁止将数据迁移至管理节点系统盘，日志只能保存在业务存储节点上以避免系统盘被占满", http.StatusBadRequest)
+			return
+		}
+
+		targetWorker, err := s.store.GetNode(targetNodeID)
+		if err != nil || targetWorker == nil || targetWorker.Role != "worker" || targetWorker.Status != "online" {
+			http.Error(w, "指定的目标接收业务节点不存在或已下线", http.StatusBadRequest)
+			return
+		}
+
+		rulesList, _ := s.store.ListRules()
+
+		for _, arc := range archives {
+			// 1. 获取原节点上的压缩包文件流
+			var reader io.ReadCloser
+			if originNode.Role == "manager" || originNode.IP == "" {
+				localPath := filepath.Join(s.store.GetUserArchiveDir(arc.Username), arc.Filename)
+				f, err := os.Open(localPath)
+				if err != nil {
+					continue
+				}
+				reader = f
+			} else {
+				dlURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-archive?username=%s&filename=%s",
+					originNode.IP, originNode.Port, url.QueryEscape(arc.Username), url.QueryEscape(arc.Filename))
+				resp, err := http.Get(dlURL)
+				if err != nil || resp.StatusCode != http.StatusOK {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					continue
+				}
+				reader = resp.Body
+			}
+
+			upRes, err := s.forwardUploadToWorker(targetWorker, reader, arc.Filename, arc.ID, arc.Username, arc.UserID, rulesList)
+			reader.Close()
+			if err == nil && upRes != nil {
+				arc.StorageNodeID = targetWorker.ID
+				arc.StorageNodeName = targetWorker.Name
+				arc.StorageNodeIP = targetWorker.IP
+				arc.StorageNodePort = targetWorker.Port
+				arc.ExtractPath = upRes.ExtractPath
+				if len(upRes.Files) > 0 {
+					arc.FileCount = len(upRes.Files)
+				}
+				if upRes.TotalLines > 0 {
+					arc.TotalLines = upRes.TotalLines
+				}
+				_ = s.store.SaveArchive(arc)
+				migratedCount++
+
+				// 通知原 Worker 释放该日志包磁盘空间
+				if originNode.IP != "" && originNode.Port > 0 {
+					cleanURL := fmt.Sprintf("http://%s:%d/api/worker/storage/clean-archive?username=%s&archive_id=%s&filename=%s",
+						originNode.IP, originNode.Port, url.QueryEscape(arc.Username), url.QueryEscape(arc.ID), url.QueryEscape(arc.Filename))
+					cleanReq, _ := http.NewRequest(http.MethodPost, cleanURL, nil)
+					client := &http.Client{Timeout: 5 * time.Second}
+					_, _ = client.Do(cleanReq)
+				}
+			}
+		}
+
+		_ = s.store.DecommissionNode(nodeID)
+		_, _ = s.store.ResolveAlarm(nodeID, model.AlarmTypeNodeOffline)
+		if originNode.IP != "" && originNode.Port > 0 {
+			go func(ip string, port int, token string) {
+				decomURL := fmt.Sprintf("http://%s:%d/api/worker/decommission", ip, port)
+				req, err := http.NewRequest(http.MethodPost, decomURL, nil)
+				if err == nil {
+					req.Header.Set("X-Cluster-Token", token)
+					client := &http.Client{Timeout: 3 * time.Second}
+					_, _ = client.Do(req)
+				}
+			}(originNode.IP, originNode.Port, s.cfg.ClusterToken)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":         "ok",
+			"message":        fmt.Sprintf("业务节点已成功移除，已将 %d 个日志归档包迁移至目标节点", migratedCount),
+			"migrated_count": migratedCount,
+		})
+		return
+
+	case "delete":
+		for _, arc := range archives {
+			if originNode.IP != "" && originNode.Port > 0 {
+				cleanURL := fmt.Sprintf("http://%s:%d/api/worker/storage/clean-archive?username=%s&archive_id=%s&filename=%s",
+					originNode.IP, originNode.Port, url.QueryEscape(arc.Username), url.QueryEscape(arc.ID), url.QueryEscape(arc.Filename))
+				cleanReq, _ := http.NewRequest(http.MethodPost, cleanURL, nil)
+				client := &http.Client{Timeout: 5 * time.Second}
+				_, _ = client.Do(cleanReq)
+			}
+			_ = s.store.DeleteArchive(arc.ID, arc.Username, true)
+		}
+		_ = s.store.DecommissionNode(nodeID)
+		_, _ = s.store.ResolveAlarm(nodeID, model.AlarmTypeNodeOffline)
+		if originNode.IP != "" && originNode.Port > 0 {
+			go func(ip string, port int, token string) {
+				decomURL := fmt.Sprintf("http://%s:%d/api/worker/decommission", ip, port)
+				req, err := http.NewRequest(http.MethodPost, decomURL, nil)
+				if err == nil {
+					req.Header.Set("X-Cluster-Token", token)
+					client := &http.Client{Timeout: 3 * time.Second}
+					_, _ = client.Do(req)
+				}
+			}(originNode.IP, originNode.Port, s.cfg.ClusterToken)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": fmt.Sprintf("业务节点已成功移除，其关联的 %d 个日志归档包数据已彻底清理", len(archives)),
+		})
+		return
+
+	case "retain":
+		fallthrough
+	default:
+		_ = s.store.DecommissionNode(nodeID)
+		_, _ = s.store.ResolveAlarm(nodeID, model.AlarmTypeNodeOffline)
+		if originNode.IP != "" && originNode.Port > 0 {
+			go func(ip string, port int, token string) {
+				decomURL := fmt.Sprintf("http://%s:%d/api/worker/decommission", ip, port)
+				req, err := http.NewRequest(http.MethodPost, decomURL, nil)
+				if err == nil {
+					req.Header.Set("X-Cluster-Token", token)
+					client := &http.Client{Timeout: 3 * time.Second}
+					_, _ = client.Do(req)
+				}
+			}(originNode.IP, originNode.Port, s.cfg.ClusterToken)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": fmt.Sprintf("业务节点已成功从集群注销，其物理存储的 %d 个日志归档包数据已完整保留", len(archives)),
+		})
+		return
+	}
 }
 
 // handleDetectDisks 远程探测目标主机的物理磁盘
@@ -464,6 +659,9 @@ func (s *Server) handleDetectDisks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("探测远程磁盘失败: %v", err), http.StatusBadRequest)
 		return
 	}
+	if disks == nil {
+		disks = []model.DiskInfo{}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(disks)
@@ -492,6 +690,12 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	disks := opts.GetDiskList()
+	if len(disks) == 0 {
+		http.Error(w, "安全策略限制：严禁使用系统盘存放日志！请至少选择一块独立的物理存储盘", http.StatusBadRequest)
+		return
+	}
+
 	// 自动补充 Manager 接入地址与集群凭据
 	if opts.ManagerURL == "" {
 		opts.ManagerURL = fmt.Sprintf("http://%s:%d", s.cfg.AdvertiseIP, s.cfg.Port)
@@ -500,6 +704,15 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 
 	// 创建临时节点记录
 	nodeID := fmt.Sprintf("node_%s", strings.ReplaceAll(opts.Host, ".", "_"))
+
+	// 部署前清理可能存在的历史注销/下线记录，允许节点重新加入集群
+	_ = s.store.ClearDecommissionedNode(nodeID)
+	for idx, d := range disks {
+		diskName := filepath.Base(d)
+		subNodeID := fmt.Sprintf("worker_%s-%s_%d", opts.NodeName, diskName, opts.WorkerPort+idx)
+		_ = s.store.ClearDecommissionedNode(subNodeID)
+	}
+
 	node := &model.Node{
 		ID:            nodeID,
 		Name:          opts.NodeName,
@@ -507,7 +720,7 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 		Port:          opts.WorkerPort,
 		Role:          "worker",
 		Status:        "installing",
-		DiskDevice:    opts.DiskDevice,
+		DiskDevice:    strings.Join(disks, ", "),
 		MountPoint:    opts.MountPoint,
 		FSType:        opts.FSType,
 		JoinedAt:      time.Now(),
@@ -525,12 +738,12 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 		if deployErr != nil {
 			node.Status = "failed"
 			log.Printf("[Manager] 节点 %s 远程一键部署失败: %v", opts.Host, deployErr)
+			_ = s.store.SaveNode(node)
 		} else {
-			node.Status = "online"
-			node.LastHeartbeat = time.Now()
-			log.Printf("[Manager] 节点 %s 远程一键部署成功并已接入！", opts.Host)
+			// 如果部署成功且创建了具体的磁盘子 Worker，清理临时的部署占位节点记录
+			_ = s.store.DeleteNode(node.ID)
+			log.Printf("[Manager] 节点 %s 远程一键部署成功，各磁盘独立 Worker 实例已接管服务", opts.Host)
 		}
-		_ = s.store.SaveNode(node)
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -555,6 +768,18 @@ func (s *Server) handleClusterHeartbeat(w http.ResponseWriter, r *http.Request) 
 	var node model.Node
 	if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 核心安全防线：如果该节点已被管理员移除/注销 (Decommissioned)，拒绝心跳并返回 410 Gone，命令 Worker 退出停止
+	if s.store.IsNodeDecommissioned(node.ID) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone) // 410 Gone
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "decommissioned",
+			"action":  "shutdown",
+			"message": "该节点已从集群移除注销，拒绝心跳",
+		})
 		return
 	}
 
@@ -618,6 +843,38 @@ fi
 
 // ================= 日志归档与文件管理 =================
 
+func parseTags(tagsStr string) []string {
+	tagsStr = strings.TrimSpace(tagsStr)
+	if tagsStr == "" {
+		return nil
+	}
+	var jsonTags []string
+	if err := json.Unmarshal([]byte(tagsStr), &jsonTags); err == nil {
+		var res []string
+		for _, t := range jsonTags {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				res = append(res, t)
+			}
+		}
+		return res
+	}
+
+	cleaned := strings.ReplaceAll(tagsStr, "，", ",")
+	cleaned = strings.ReplaceAll(cleaned, "；", ",")
+	cleaned = strings.ReplaceAll(cleaned, ";", ",")
+	var res []string
+	seen := make(map[string]bool)
+	for _, part := range strings.Split(cleaned, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !seen[part] {
+			seen[part] = true
+			res = append(res, part)
+		}
+	}
+	return res
+}
+
 func (s *Server) handleArchives(w http.ResponseWriter, r *http.Request) {
 	currentUser, err := s.authenticate(r)
 	if err != nil {
@@ -630,6 +887,50 @@ func (s *Server) handleArchives(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	tagFilter := strings.TrimSpace(r.URL.Query().Get("tag"))
+	keyword := strings.TrimSpace(r.URL.Query().Get("keyword"))
+
+	if tagFilter != "" || keyword != "" {
+		tagLower := strings.ToLower(tagFilter)
+		kwLower := strings.ToLower(keyword)
+		var filtered []*model.LogArchive
+		for _, a := range archives {
+			matchTag := true
+			if tagLower != "" {
+				matchTag = false
+				for _, t := range a.Tags {
+					if strings.ToLower(t) == tagLower || strings.Contains(strings.ToLower(t), tagLower) {
+						matchTag = true
+						break
+					}
+				}
+			}
+
+			matchKw := true
+			if kwLower != "" {
+				matchKw = strings.Contains(strings.ToLower(a.Filename), kwLower) ||
+					strings.Contains(strings.ToLower(a.Remark), kwLower)
+				if !matchKw {
+					for _, t := range a.Tags {
+						if strings.Contains(strings.ToLower(t), kwLower) {
+							matchKw = true
+							break
+						}
+					}
+				}
+			}
+
+			if matchTag && matchKw {
+				filtered = append(filtered, a)
+			}
+		}
+		archives = filtered
+	}
+
+	if archives == nil {
+		archives = make([]*model.LogArchive, 0)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -720,9 +1021,17 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetNodeID := r.FormValue("target_node_id")
+	tagsStr := r.FormValue("tags")
+	remark := r.FormValue("remark")
+	tags := parseTags(tagsStr)
 	archiveID := fmt.Sprintf("arc_%d", time.Now().UnixNano())
 
-	// 检查目标存储节点
+	// 检查目标存储节点：日志只能保存在业务存储上，严禁写入管理节点系统盘
+	if targetNodeID == "manager_primary" || targetNodeID == "local" {
+		http.Error(w, "禁止选择管理节点存储日志！日志包只能保存在业务存储节点上，避免管理节点系统盘被占满。", http.StatusBadRequest)
+		return
+	}
+
 	var targetWorker *model.Node
 	if targetNodeID == "auto" || targetNodeID == "" {
 		// 自动智能调度：优先使用已使用容量最低的业务节点存放
@@ -731,71 +1040,29 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Manager] 智能容量调度生效：选定已用容量最低的业务节点 %s (已用: %d MB, 剩余: %d MB) 存放日志包 %s",
 				targetWorker.Name, targetWorker.Resource.DiskUsedMB, targetWorker.Resource.DiskFreeMB, header.Filename)
 		}
-	} else if targetNodeID != "manager_primary" && targetNodeID != "local" {
+	} else {
 		targetWorker, _ = s.store.GetNode(targetNodeID)
 		// 如果用户指定的节点不在线，自动重新回退到容量最低的在线节点
 		if targetWorker == nil || targetWorker.Role != "worker" || targetWorker.Status != "online" {
-			log.Printf("[Manager] 用户指定的节点不可用，自动重定向至已用容量最低的在线业务节点")
+			log.Printf("[Manager] 用户指定的业务节点不可用，自动重定向至已用容量最低的在线业务节点")
 			targetWorker = s.scheduler.PickLowestUsageWorker(header.Size)
 		}
 	}
 
-	// 如果选定的业务节点在线，直接存储并分发至该业务节点已挂载的存储硬盘
-	if targetWorker != nil && targetWorker.Role == "worker" && targetWorker.Status == "online" {
-		ruleList, _ := s.store.ListRules()
-		log.Printf("[Manager] 用户 %s 选定将日志包 %s 存放在业务节点 %s (%s:%d)",
-			currentUser.Username, header.Filename, targetWorker.Name, targetWorker.IP, targetWorker.Port)
-
-		wRes, err := s.forwardUploadToWorker(targetWorker, file, header.Filename, archiveID, currentUser.Username, currentUser.ID, ruleList)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("上传至目标业务节点存储失败: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		archive := &model.LogArchive{
-			ID:              archiveID,
-			UserID:          currentUser.ID,
-			Username:        currentUser.Username,
-			Filename:        header.Filename,
-			Size:            header.Size,
-			Format:          detectArchiveFormat(header.Filename),
-			Status:          "ready",
-			FileCount:       len(wRes.Files),
-			TotalLines:      wRes.TotalLines,
-			ExtractPath:     wRes.ExtractPath,
-			StorageNodeID:   targetWorker.ID,
-			StorageNodeName: targetWorker.Name,
-			StorageNodeIP:   targetWorker.IP,
-			StorageNodePort: targetWorker.Port,
-			AssignedWorker:  targetWorker.Name,
-			UploadTime:      time.Now(),
-			FinishTime:      time.Now(),
-		}
-
-		_ = s.store.SaveArchive(archive)
-		if wRes.Report != nil {
-			_ = s.store.SaveReport(wRes.Report)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(archive)
+	// 若无可用的在线业务节点，直接拒绝并报错，避免占用管理节点系统盘
+	if targetWorker == nil || targetWorker.Role != "worker" || targetWorker.Status != "online" {
+		http.Error(w, "当前无可用业务存储节点（无在线业务节点或业务节点剩余磁盘容量不足），日志只能保存在业务存储节点上，禁止存入管理节点系统盘以防占满系统盘。请先接入或启动业务存储节点。", http.StatusBadRequest)
 		return
 	}
 
-	// 默认保存在管理节点本地
-	archiveDir := s.store.GetUserArchiveDir(currentUser.Username)
-	_ = os.MkdirAll(archiveDir, 0755)
+	// 直接存储并分发至选定的业务节点存储硬盘
+	ruleList, _ := s.store.ListRules()
+	log.Printf("[Manager] 用户 %s 选定将日志包 %s 存放在业务节点 %s (%s:%d)",
+		currentUser.Username, header.Filename, targetWorker.Name, targetWorker.IP, targetWorker.Port)
 
-	destFilePath := filepath.Join(archiveDir, fmt.Sprintf("%s_%s", archiveID, header.Filename))
-	destFile, err := os.Create(destFilePath)
+	wRes, err := s.forwardUploadToWorker(targetWorker, file, header.Filename, archiveID, currentUser.Username, currentUser.ID, ruleList)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("创建存储文件失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, file); err != nil {
-		http.Error(w, fmt.Sprintf("保存文件失败: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("上传至目标业务节点存储失败: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -803,17 +1070,28 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 		ID:              archiveID,
 		UserID:          currentUser.ID,
 		Username:        currentUser.Username,
-		Filename:        fmt.Sprintf("%s_%s", archiveID, header.Filename),
+		Filename:        header.Filename,
 		Size:            header.Size,
 		Format:          detectArchiveFormat(header.Filename),
-		Status:          "uploading",
-		StorageNodeID:   "manager_primary",
-		StorageNodeName: "管理节点本地存储",
+		Status:          "ready",
+		FileCount:       len(wRes.Files),
+		TotalLines:      wRes.TotalLines,
+		ExtractPath:     wRes.ExtractPath,
+		StorageNodeID:   targetWorker.ID,
+		StorageNodeName: targetWorker.Name,
+		StorageNodeIP:   targetWorker.IP,
+		StorageNodePort: targetWorker.Port,
+		AssignedWorker:  targetWorker.Name,
+		Tags:            tags,
+		Remark:          strings.TrimSpace(remark),
 		UploadTime:      time.Now(),
+		FinishTime:      time.Now(),
 	}
 
 	_ = s.store.SaveArchive(archive)
-	s.scheduler.DispatchAnalyzeTask(archive)
+	if wRes.Report != nil {
+		_ = s.store.SaveReport(wRes.Report)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(archive)
@@ -1078,6 +1356,54 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 更新归档包标签与备注信息
+	if len(parts) == 1 && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+		var req struct {
+			Tags   interface{} `json:"tags"`
+			Remark string      `json:"remark"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		switch t := req.Tags.(type) {
+		case string:
+			archive.Tags = parseTags(t)
+		case []interface{}:
+			var rawList []string
+			for _, item := range t {
+				if s, ok := item.(string); ok {
+					rawList = append(rawList, s)
+				}
+			}
+			data, _ := json.Marshal(rawList)
+			archive.Tags = parseTags(string(data))
+		}
+		archive.Remark = strings.TrimSpace(req.Remark)
+		if err := s.store.SaveArchive(archive); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(archive)
+		return
+	}
+
+	// 重新触发解包与分析调度
+	if len(parts) == 2 && parts[1] == "retry" && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
+		archive.Status = "extracting"
+		archive.ErrorMsg = ""
+		_ = s.store.SaveArchive(archive)
+		s.scheduler.DispatchAnalyzeTask(archive)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": "已重新触发解包与分析调度",
+		})
+		return
+	}
+
 	// 删除归档包
 	if r.Method == http.MethodDelete {
 		if err := s.store.DeleteArchive(archiveID, currentUser.Username, isAdmin); err != nil {
@@ -1234,9 +1560,11 @@ func (s *Server) handleRuleItem(w http.ResponseWriter, r *http.Request) {
 		rule.Severity = req.Severity
 		rule.Pattern = req.Pattern
 		rule.IsRegex = req.IsRegex
+		rule.FilePathPattern = req.FilePathPattern
 		rule.Description = req.Description
 		rule.Suggestion = req.Suggestion
 		rule.Enabled = req.Enabled
+		rule.UpdatedAt = time.Now()
 		_ = s.store.SaveRule(rule)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(rule)

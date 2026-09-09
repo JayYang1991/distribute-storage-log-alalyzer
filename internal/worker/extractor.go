@@ -58,6 +58,7 @@ func ExtractArchive(archivePath, targetDir string) ([]*model.LogFileItem, int64,
 	}
 
 	if err != nil {
+		_ = os.RemoveAll(targetDir)
 		return nil, 0, fmt.Errorf("解压缩失败: %w", err)
 	}
 

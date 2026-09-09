@@ -94,38 +94,66 @@ if [ -n "$ROLE" ]; then
 fi
 
 if [ "$IS_ROOT" = true ] && command -v systemctl >/dev/null 2>&1; then
-    for svc in "${SERVICES[@]}"; do
-        if systemctl list-units --type=service --all | grep -q "$svc" || [ -f "/etc/systemd/system/$svc" ]; then
-            echo "  ▶ 正在停止 Systemd 服务: $svc..."
-            systemctl stop "$svc" 2>/dev/null || true
-            systemctl disable "$svc" 2>/dev/null || true
-            if [ -f "/etc/systemd/system/$svc" ]; then
-                rm -f "/etc/systemd/system/$svc"
-                echo "  ▶ 已注销服务配置: /etc/systemd/system/$svc"
-            fi
+    # 自动通配扫描所有注册的服务 (支持 dist-log-manager 及任意多盘的 dist-log-worker-*.service)
+    FOUND_SVCS=()
+    for f in /etc/systemd/system/dist-log-*.service; do
+        if [ -f "$f" ]; then
+            FOUND_SVCS+=("$(basename "$f")")
+        fi
+    done
+    if [ ${#FOUND_SVCS[@]} -eq 0 ]; then
+        FOUND_SVCS=("dist-log-manager.service" "dist-log-worker.service")
+    fi
+
+    for svc in "${FOUND_SVCS[@]}"; do
+        if [ -n "$ROLE" ] && [[ "$svc" != *"$ROLE"* ]]; then
+            continue
+        fi
+        echo "  ▶ 正在停止 Systemd 服务: $svc..."
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+        if [ -f "/etc/systemd/system/$svc" ]; then
+            rm -f "/etc/systemd/system/$svc"
+            echo "  ▶ 已注销服务配置: /etc/systemd/system/$svc"
         fi
     done
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed 2>/dev/null || true
 fi
 
-# 4. 检查并终止可能的残留进程
+# 4. 检查并终止可能的残留进程 (安全排除当前脚本自身)
 echo "[2/4] 检查并终止后台运行的孤儿进程..."
-PIDS=$(pgrep -f "dist-log-analyzer" 2>/dev/null || true)
+CURRENT_PID=$$
+PIDS=$(pgrep -f "dist-log-analyzer (manager|worker)" 2>/dev/null || true)
+if [ -z "$PIDS" ]; then
+    PIDS=$(pgrep -f "/bin/dist-log-analyzer" 2>/dev/null || true)
+fi
+
+TARGET_PIDS=()
 if [ -n "$PIDS" ]; then
-    echo "  ▶ 发现运行中的 dist-log-analyzer 进程，正在退出..."
     for p in $PIDS; do
+        if [ "$p" != "$CURRENT_PID" ] && [ "$p" != "$PPID" ]; then
+            CMDLINE=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true)
+            if [[ "$CMDLINE" != *"uninstall.sh"* ]] && [[ "$CMDLINE" != *"install.sh"* ]]; then
+                TARGET_PIDS+=("$p")
+            fi
+        fi
+    done
+fi
+
+if [ ${#TARGET_PIDS[@]} -gt 0 ]; then
+    echo "  ▶ 发现运行中的 dist-log-analyzer 业务进程 (${TARGET_PIDS[*]}), 正在优雅退出..."
+    for p in "${TARGET_PIDS[@]}"; do
         kill "$p" 2>/dev/null || true
     done
     sleep 1
-    # 若仍在运行则强制 SIGKILL
-    REMAIN_PIDS=$(pgrep -f "dist-log-analyzer" 2>/dev/null || true)
-    if [ -n "$REMAIN_PIDS" ]; then
-        for rp in $REMAIN_PIDS; do
-            kill -9 "$rp" 2>/dev/null || true
-        done
-    fi
+    for p in "${TARGET_PIDS[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
 fi
+
 
 # 5. 清理程序文件与二进制
 echo "[3/4] 清理安装程序文件与依赖..."
@@ -143,6 +171,27 @@ else
     echo "  ℹ 未检测到目录 $INSTALL_DIR，跳过文件清理"
 fi
 
+if [ "$REMOVE_DATA" = true ] && [ "$IS_ROOT" = true ]; then
+    # 卸载并清理独立数据盘挂载点 /data/dist-log-storage
+    if [ -d "/data/dist-log-storage" ]; then
+        echo "  ▶ 检测到多盘挂载目录 /data/dist-log-storage，正在安全卸载磁盘并清理挂载点..."
+        for mnt in /data/dist-log-storage/disk-*; do
+            if [ -d "$mnt" ]; then
+                if mountpoint -q "$mnt" 2>/dev/null; then
+                    echo "  ▶ 正在卸载 $mnt..."
+                    umount "$mnt" 2>/dev/null || true
+                fi
+                rmdir "$mnt" 2>/dev/null || true
+            fi
+        done
+        # 清理 /etc/fstab 中含有 dist-log-storage 的行
+        if [ -f "/etc/fstab" ]; then
+            sed -i '/dist-log-storage/d' /etc/fstab 2>/dev/null || true
+        fi
+        rmdir "/data/dist-log-storage" 2>/dev/null || true
+    fi
+fi
+
 # 6. 检查自动检测到的其它常见路径 (例如 /opt/dist-log-analyzer-manager 或 worker)
 EXTRA_DIRS=("/opt/dist-log-analyzer-manager" "/opt/dist-log-analyzer-worker1")
 for extra in "${EXTRA_DIRS[@]}"; do
@@ -153,7 +202,7 @@ for extra in "${EXTRA_DIRS[@]}"; do
 done
 
 echo "[4/4] 验证卸载状态..."
-if pgrep -f "dist-log-analyzer" >/dev/null 2>&1; then
+if pgrep -f "dist-log-analyzer (manager|worker)" >/dev/null 2>&1 || pgrep -f "/bin/dist-log-analyzer" >/dev/null 2>&1; then
     echo "  [WARN] 仍有组件进程在运行，请执行 ps aux | grep dist-log-analyzer 排查"
 else
     echo "  ✔ 相关组件进程已全部停止退出"

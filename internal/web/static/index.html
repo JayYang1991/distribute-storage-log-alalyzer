@@ -19,31 +19,31 @@
       </div>
 
       <nav class="nav-menu">
-        <div class="nav-item active" data-tab="dashboard">
+        <div class="nav-item active" data-tab="dashboard" data-role="admin">
           <span class="icon">📊</span>
           <span>概览仪表盘</span>
         </div>
-        <div class="nav-item" data-tab="nodes">
+        <div class="nav-item" data-tab="nodes" data-role="admin">
           <span class="icon">🖥️</span>
           <span>集群节点与安装</span>
         </div>
-        <div class="nav-item" data-tab="users" id="nav-users">
+        <div class="nav-item" data-tab="users" id="nav-users" data-role="admin">
           <span class="icon">👥</span>
           <span>用户与存储空间</span>
         </div>
-        <div class="nav-item" data-tab="archives">
+        <div class="nav-item" data-tab="archives" data-role="all">
           <span class="icon">📦</span>
           <span>日志归档与文件</span>
         </div>
-        <div class="nav-item" data-tab="search">
+        <div class="nav-item" data-tab="search" data-role="all">
           <span class="icon">🔍</span>
           <span>日志全局检索</span>
         </div>
-        <div class="nav-item" data-tab="rules">
+        <div class="nav-item" data-tab="rules" data-role="admin">
           <span class="icon">🛡️</span>
           <span>故障规则与诊断</span>
         </div>
-        <div class="nav-item" data-tab="alarms" id="nav-alarms">
+        <div class="nav-item" data-tab="alarms" id="nav-alarms" data-role="admin">
           <span class="icon">🚨</span>
           <span>实时告警中心</span>
           <span class="badge badge-danger" id="nav-alarm-badge" style="display: none; margin-left: auto; font-size: 11px; padding: 2px 6px;">0</span>
@@ -70,11 +70,11 @@
           <p id="page-desc">实时监控分布式存储计算节点状态与日志分析全局指标</p>
         </div>
         <div class="top-actions">
-          <div id="alarm-top-indicator" onclick="app.switchTab('alarms')" style="cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 10px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);" title="点击查看活跃告警中心">
+          <div id="alarm-top-indicator" data-role="admin" onclick="app.switchTab('alarms')" style="cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 10px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);" title="点击查看活跃告警中心">
             <span>🚨</span>
             <span id="alarm-top-text">告警: 正常</span>
           </div>
-          <div id="ha-top-indicator" style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 12px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);">
+          <div id="ha-top-indicator" data-role="admin" style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-right: 12px; padding: 4px 10px; border-radius: 20px; background: rgba(30,41,59,0.6); border: 1px solid var(--border-color);">
             <span class="status-dot online"></span>
             <span id="ha-top-text">HA: 检测中</span>
           </div>
@@ -256,12 +256,32 @@
               <span class="card-title">⬆️ 上传存储日志压缩包 (.tar.gz, .tgz, .zip, .tar, .gz, .bz2)</span>
             </div>
             <div class="card-body">
-              <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 14px; background: rgba(15, 23, 42, 0.4); padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
-                <label class="form-label" style="margin: 0; white-space: nowrap; font-weight: 600; color: var(--primary);">🎯 存放业务计算节点:</label>
-                <select class="form-control" id="upload-target-node" style="flex: 1; max-width: 450px;">
-                  <option value="local">管理节点本地存储</option>
-                </select>
-                <span style="font-size: 11px; color: var(--text-dim);">* 上传的日志包将物理存储在该节点已格式化的硬盘上</span>
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 14px; background: rgba(15, 23, 42, 0.4); padding: 12px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+                <div>
+                  <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: var(--primary);">🎯 存放业务存储节点:</label>
+                  <select class="form-control" id="upload-target-node">
+                    <option value="" disabled selected>⚠️ 正在获取在线业务存储节点...</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: #38bdf8;">🏷️ 自定义标签 (逗号分隔):</label>
+                  <input type="text" class="form-control" id="upload-tags" placeholder="例如: Ceph, 生产故障, OSD" list="default-tags-datalist">
+                  <datalist id="default-tags-datalist">
+                    <option value="Ceph">
+                    <option value="HDFS">
+                    <option value="MinIO">
+                    <option value="GlusterFS">
+                    <option value="生产环境">
+                    <option value="测试环境">
+                    <option value="核心故障">
+                    <option value="慢请求">
+                    <option value="网络超时">
+                  </datalist>
+                </div>
+                <div>
+                  <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: #c084fc;">📝 备注说明:</label>
+                  <input type="text" class="form-control" id="upload-remark" placeholder="例如: 2026-09 集群03节点异常宕机排查日志">
+                </div>
               </div>
               <div class="dropzone" id="archive-dropzone">
                 <div class="dropzone-icon">📁</div>
@@ -285,8 +305,12 @@
 
           <!-- 归档列表 -->
           <div class="card">
-            <div class="card-header">
+            <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
               <span class="card-title">📦 日志包管理列表</span>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <input type="text" class="form-control form-control-sm" id="archive-filter-input" placeholder="🔍 搜标签、文件名或备注..." style="width: 250px;" oninput="app.filterArchives(this.value)">
+                <button class="btn btn-secondary btn-sm" id="btn-clear-archive-filter" onclick="app.clearArchiveFilter()" style="display: none; padding: 4px 8px; font-size: 11px;">清空筛选</button>
+              </div>
             </div>
             <div class="card-body">
               <div class="table-responsive">
@@ -294,6 +318,7 @@
                   <thead>
                     <tr>
                       <th>归档包名称</th>
+                      <th>标签 & 备注</th>
                       <th>格式</th>
                       <th>大小</th>
                       <th>文件数</th>
@@ -399,6 +424,7 @@
                       <th>存储类型</th>
                       <th>严重级别</th>
                       <th>匹配特征 (Pattern)</th>
+                      <th>作用文件/路径</th>
                       <th>类型</th>
                       <th>专家排查处置建议</th>
                       <th>状态</th>
@@ -517,20 +543,27 @@
             <input type="text" class="form-control" id="deploy-name" placeholder="worker-node-02">
           </div>
 
-          <!-- 存放日志的硬盘选择与格式化 -->
+          <!-- 存放日志的硬盘选择与格式化 (强制选盘 & 支持多盘多进程) -->
           <div style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 14px; margin-bottom: 14px;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-              <label class="form-label" style="margin: 0; font-weight: 600; color: var(--primary);">💾 选择存放日志的物理硬盘并格式化</label>
+              <label class="form-label" style="margin: 0; font-weight: 600; color: var(--primary);">💾 选择存放日志的物理硬盘 (必选，支持多盘多进程) *</label>
               <button type="button" class="btn btn-secondary btn-sm" id="btn-detect-disks" onclick="app.detectDisks()">🔍 探测目标磁盘</button>
+            </div>
+            <div style="font-size: 11px; color: var(--warning); margin-bottom: 8px; line-height: 1.4;">
+              ⚠️ 架构安全规范：严禁使用系统盘存放日志！必须至少勾选一块独立物理盘。勾选多块盘时将自动启动多 Worker 进程实现 I/O 隔离与容量均衡调度。
+            </div>
+            <!-- 多盘复选列表容器 -->
+            <div id="deploy-disk-list-box" style="max-height: 160px; overflow-y: auto; background: rgba(0,0,0,0.2); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 8px; margin-bottom: 8px; display: none;">
+              <!-- 由 JS 动态填充多盘复选框 -->
             </div>
             <div class="form-group" style="margin-bottom: 8px;">
               <select class="form-control" id="deploy-disk-select" onchange="app.onDiskSelectChange()">
-                <option value="">-- 请点击“探测目标磁盘”或手动填写设备路径 --</option>
+                <option value="">-- 请点击“探测目标磁盘”或手动在下方输入设备路径 --</option>
               </select>
             </div>
             <div id="deploy-disk-hint" style="display: none; font-size: 12px; line-height: 1.4; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--radius-sm);"></div>
             <div class="form-group" style="margin-bottom: 10px;">
-              <input type="text" class="form-control" id="deploy-disk-input" placeholder="设备路径，例如：/dev/sdb 或 /dev/vdb">
+              <input type="text" class="form-control" id="deploy-disk-input" placeholder="已选物理盘 (多盘以逗号分隔，例如：/dev/sdb, /dev/sdc)" required>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
               <div class="form-group" style="margin: 0;">
@@ -541,13 +574,13 @@
                 </select>
               </div>
               <div class="form-group" style="margin: 0;">
-                <label class="form-label">硬盘挂载目录</label>
+                <label class="form-label">硬盘挂载根目录</label>
                 <input type="text" class="form-control" id="deploy-mountpoint" value="/data/dist-log-storage">
               </div>
             </div>
             <div style="margin-top: 10px;">
               <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; color: var(--warning);">
-                <input type="checkbox" id="deploy-format-disk" checked> ⚡ 部署时自动格式化该硬盘并写入开机自动挂载 (/etc/fstab)
+                <input type="checkbox" id="deploy-format-disk" checked> ⚡ 部署时自动格式化选中的物理盘并写入开机自动挂载 (/etc/fstab)
               </label>
             </div>
           </div>
@@ -632,14 +665,19 @@
   <!-- 模态框 4: 在线文件树与日志查看器 (支持文件内搜索与压缩包内全局搜索) -->
   <div class="modal-overlay" id="modal-file-browser">
     <div class="modal-content" style="max-width: 1240px; width: 95vw; height: 88vh; display: flex; flex-direction: column;">
-      <div class="modal-header" style="flex-shrink: 0;">
-        <div style="display: flex; align-items: center; gap: 12px;">
-          <h3 class="modal-title" id="file-browser-title">📁 日志文件解包浏览与分析</h3>
-          <button id="btn-download-full-archive" class="btn btn-secondary btn-sm" style="display: inline-flex; align-items: center; gap: 4px;" onclick="app.downloadCurrentArchive()" title="下载上传的完整日志压缩包">
+      <div class="modal-header" style="flex-shrink: 0; user-select: none; cursor: pointer;" ondblclick="app.toggleFileBrowserMaximize()" title="双击标题栏切换最大化">
+        <div style="display: flex; align-items: center; gap: 12px; min-width: 0;">
+          <h3 class="modal-title" id="file-browser-title" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">📁 日志文件解包浏览与分析</h3>
+          <button id="btn-download-full-archive" class="btn btn-secondary btn-sm" style="display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;" onclick="event.stopPropagation(); app.downloadCurrentArchive()" title="下载上传的完整日志压缩包">
             📦 下载原压缩包
           </button>
         </div>
-        <button class="modal-close" onclick="app.closeModal('modal-file-browser')">&times;</button>
+        <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+          <button class="btn-modal-action" id="btn-file-browser-maximize" onclick="event.stopPropagation(); app.toggleFileBrowserMaximize()" title="最大化占满浏览器 (支持双击标题栏切换)">
+            <span id="icon-file-browser-maximize">⛶</span>
+          </button>
+          <button class="modal-close" onclick="event.stopPropagation(); app.closeModal('modal-file-browser')" title="关闭窗口">&times;</button>
+        </div>
       </div>
       <div class="modal-body" style="padding: 0; flex: 1; min-height: 0; overflow: hidden;">
         <div class="file-browser" style="height: 100%; display: flex;">
@@ -656,8 +694,10 @@
 
             <!-- Tab 1: 目录树 -->
             <div id="browser-tab-tree" class="browser-tab-content active">
-              <div style="padding: 8px 10px; border-bottom: 1px solid var(--border-color);">
-                <input type="text" class="form-control form-control-sm" id="browser-tree-filter" placeholder="🔍 快速过滤文件名..." oninput="app.filterFileTree(this.value)">
+              <div style="padding: 8px 10px; border-bottom: 1px solid var(--border-color); display: flex; gap: 6px; align-items: center;">
+                <input type="text" class="form-control form-control-sm" id="browser-tree-filter" placeholder="🔍 快速过滤文件或目录..." oninput="app.filterFileTree(this.value)" style="flex: 1; min-width: 0;">
+                <button class="btn btn-secondary btn-sm" onclick="app.expandAllTreeDirs()" title="全部展开" style="padding: 3px 8px; font-size: 11px; white-space: nowrap; flex-shrink: 0;">展开</button>
+                <button class="btn btn-secondary btn-sm" onclick="app.collapseAllTreeDirs()" title="全部折叠" style="padding: 3px 8px; font-size: 11px; white-space: nowrap; flex-shrink: 0;">折叠</button>
               </div>
               <div class="file-tree" id="file-tree-container"></div>
             </div>
@@ -702,9 +742,7 @@
                 <span id="viewer-meta" style="color: var(--text-dim); margin-left: 8px;"></span>
               </div>
               <div style="display: flex; gap: 8px; flex-shrink: 0; align-items: center;">
-                <button id="btn-load-more-lines" class="btn btn-secondary btn-sm" style="display: none;" onclick="app.loadMoreFileLines()">
-                  ➕ 加载更多行
-                </button>
+                <span id="viewer-scroll-status" class="badge badge-muted" style="font-size: 11px; display: none;">自动流式加载</span>
                 <button id="btn-download-current-file" class="btn btn-primary btn-sm" style="display: none;" onclick="app.downloadCurrentViewingFile()">
                   📥 下载此文件
                 </button>
@@ -733,8 +771,8 @@
               </div>
             </div>
 
-            <!-- 日志行容器 -->
-            <div class="file-viewer-content" id="viewer-content"></div>
+            <!-- 日志行容器 (支持无限滚动下拉自动加载与滑动窗口内存保护) -->
+            <div class="file-viewer-content" id="viewer-content" onscroll="app.onViewerScroll()"></div>
           </div>
         </div>
       </div>
@@ -761,6 +799,7 @@
       </div>
       <div class="modal-body">
         <form id="form-rule" onsubmit="event.preventDefault(); app.submitRule();">
+          <input type="hidden" id="rule-id" value="">
           <div class="form-group">
             <label class="form-label">规则名称 *</label>
             <input type="text" class="form-control" id="rule-name" placeholder="例如：Ceph OSD 下线告警" required>
@@ -794,6 +833,13 @@
             <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
               <input type="checkbox" id="rule-is-regex" checked> 按正则表达式匹配 (取消勾选则为精确字符串匹配)
             </label>
+          </div>
+          <div class="form-group">
+            <label class="form-label">指定作用文件名或路径 (可选)</label>
+            <input type="text" class="form-control" id="rule-file-path-pattern" placeholder="留空匹配全包所有日志。支持文件名、通配符或全路径，例如：ceph-osd*.log、dmesg.log、ceph/ceph-osd.0.log">
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
+              💡 留空则在全部日志文件中匹配；可指定文件名（如 <code>dmesg.log</code>）、通配符（如 <code>ceph-*.log</code>）或相对全路径（如 <code>sys/dmesg.log</code>），多个可用逗号或分号分隔。
+            </div>
           </div>
           <div class="form-group">
             <label class="form-label">故障描述</label>
@@ -906,6 +952,19 @@
         <h3 class="modal-title">🔐 登录系统</h3>
       </div>
       <div class="modal-body">
+        <div style="background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.25); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 14px; font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+          💡 <strong>双视图架构说明</strong>：系统维护两套独立视图：<br>
+          • <strong>管理员</strong>：展示所有运维功能、集群节点、高可用与系统配置；<br>
+          • <strong>业务用户</strong>：仅展示日志上传、文件浏览与全局检索分析，不支持配置。
+        </div>
+        <div style="display: flex; gap: 8px; margin-bottom: 14px;">
+          <button type="button" class="btn btn-secondary btn-sm" style="flex: 1; font-size: 12px; justify-content: center;" onclick="app.fillLoginForm('admin', 'admin123')">
+            🛡️ 管理员 (全量功能)
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" style="flex: 1; font-size: 12px; justify-content: center;" onclick="app.fillLoginForm('user', 'user123')">
+            👤 业务用户 (纯分析视图)
+          </button>
+        </div>
         <form id="form-login" onsubmit="event.preventDefault(); app.doLogin();">
           <div class="form-group">
             <label class="form-label">用户名</label>
@@ -918,6 +977,143 @@
           <div id="login-error" style="color: var(--danger); font-size: 12px; margin-bottom: 10px; display: none;"></div>
           <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center;">立即登录</button>
         </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 8: 移除业务节点与数据处置 -->
+  <div class="modal-overlay" id="modal-remove-node">
+    <div class="modal-content" style="max-width: 540px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🗑️ 移除业务存储节点</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-remove-node')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); border-radius: var(--radius-sm); padding: 12px; margin-bottom: 16px;">
+          <div style="font-weight: 600; color: var(--danger); margin-bottom: 4px;">⚠️ 准备从集群中移除业务节点:</div>
+          <div style="font-size: 13px; color: var(--text-primary);" id="remove-node-info">节点名称: - (IP: -)</div>
+          <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;" id="remove-node-stats">当前存储日志包: 0 个 | 占用存储: 0.0 MB</div>
+        </div>
+
+        <form id="form-remove-node" onsubmit="event.preventDefault(); app.confirmRemoveNode();">
+          <input type="hidden" id="remove-node-id">
+
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">日志数据处置策略 *</label>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 6px;">
+              <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: rgba(30,41,59,0.4);">
+                <input type="radio" name="remove-node-action" value="migrate" checked onchange="app.onRemoveActionChange()" style="margin-top: 3px;">
+                <div>
+                  <div style="font-weight: 600; color: var(--primary);">📦 迁移日志数据到其他节点 (推荐)</div>
+                  <div style="font-size: 12px; color: var(--text-muted);">自动将该节点所有日志包压缩文件与解压索引平滑迁移至目标存活节点，日志检索与分析无缝接管。</div>
+                </div>
+              </label>
+
+              <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: rgba(30,41,59,0.4);">
+                <input type="radio" name="remove-node-action" value="retain" onchange="app.onRemoveActionChange()" style="margin-top: 3px;">
+                <div>
+                  <div style="font-weight: 600; color: var(--text-primary);">💾 保留节点本地日志数据</div>
+                  <div style="font-size: 12px; color: var(--text-muted);">仅从管理控制台拓扑中注销此节点，节点本地硬盘上已存储的文件完整保留，不做删除。</div>
+                </div>
+              </label>
+
+              <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); background: rgba(30,41,59,0.4);">
+                <input type="radio" name="remove-node-action" value="delete" onchange="app.onRemoveActionChange()" style="margin-top: 3px;">
+                <div>
+                  <div style="font-weight: 600; color: var(--danger);">🗑️ 彻底删除节点日志数据</div>
+                  <div style="font-size: 12px; color: var(--text-muted);">注销节点并同步向其下发数据销毁指令，清理挂载盘上的日志压缩包与解压目录，释放硬盘。</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group" id="group-target-node">
+            <label class="form-label" style="font-weight: 600;">目标接收节点 *</label>
+            <select class="form-control" id="remove-target-node" required>
+            </select>
+            <small class="form-text" style="color: var(--text-muted);">系统已自动排查剩余存活节点，并根据容量调度策略优先推荐已用容量最低的节点。</small>
+          </div>
+
+          <div id="remove-node-progress" style="display: none; margin-top: 12px; padding: 8px 12px; background: rgba(59,130,246,0.1); border-radius: var(--radius-sm); font-size: 12px; color: var(--primary);">
+            ⏳ 正在执行节点数据处理与迁移，请稍候...
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0; margin-top: 16px;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-remove-node')">取消</button>
+            <button type="submit" class="btn btn-danger" id="btn-confirm-remove-node">确认移除节点</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 6: 修改日志包自定义标签与备注 -->
+  <div class="modal-overlay" id="modal-archive-meta">
+    <div class="modal-content" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🏷️ 修改日志包标签与备注</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-archive-meta')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-archive-meta" onsubmit="event.preventDefault(); app.submitArchiveMeta();">
+          <input type="hidden" id="archive-meta-id">
+          <div class="form-group">
+            <label class="form-label">日志包文件名</label>
+            <input type="text" class="form-control" id="archive-meta-filename" disabled style="opacity: 0.7; cursor: not-allowed;">
+          </div>
+          <div class="form-group">
+            <label class="form-label">自定义标签 (支持多个，逗号分隔)</label>
+            <input type="text" class="form-control" id="archive-meta-tags" placeholder="例如: Ceph, 生产故障, OSD" list="default-tags-datalist">
+            <small style="color: var(--text-dim); font-size: 11px; margin-top: 4px; display: block;">打上标签后可在搜索栏直接输入或点击标签徽章快速过滤定位该日志包</small>
+          </div>
+          <div class="form-group">
+            <label class="form-label">备注说明信息</label>
+            <textarea class="form-control" id="archive-meta-remark" rows="3" placeholder="填写关于该日志包的背景、节点环境、异常现象等说明..."></textarea>
+          </div>
+          <div class="modal-footer" style="padding: 14px 0 0 0; margin-top: 10px;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-archive-meta')">取消</button>
+            <button type="submit" class="btn btn-primary">保存修改</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 7: 日志包解包/分析失败详细原因与处置方案 -->
+  <div class="modal-overlay" id="modal-archive-error">
+    <div class="modal-content" style="max-width: 580px;">
+      <div class="modal-header">
+        <h3 class="modal-title" style="color: #f87171;">❌ 日志包解包/分析失败详情</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-archive-error')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 16px;">
+          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+            <span id="archive-error-icon" style="font-size: 22px;">💾</span>
+            <strong id="archive-error-title" style="font-size: 15px; color: #fca5a5;">磁盘存储空间不足</strong>
+          </div>
+          <div id="archive-error-detail" style="font-size: 13px; color: #e2e8f0; line-height: 1.5; margin-left: 32px;"></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" style="font-weight: 600; color: #38bdf8;">💡 推荐处置建议与解决方案</label>
+          <div id="archive-error-solution" style="padding: 10px 14px; background: rgba(56, 189, 248, 0.06); border: 1px dashed rgba(56, 189, 248, 0.25); border-radius: var(--radius-sm); color: #bae6fd; font-size: 12px; line-height: 1.6; white-space: pre-line;"></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" style="font-size: 12px; color: var(--text-dim);">关联日志包元数据</label>
+          <div id="archive-error-meta" style="font-size: 12px; color: var(--text-muted); font-family: monospace;"></div>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label" style="font-size: 12px; color: var(--text-dim);">底层系统错误输出 (Raw Trace)</label>
+          <pre id="archive-error-raw" style="background: #090d16; border: 1px solid var(--border-color); border-radius: 4px; padding: 10px; font-size: 11px; color: #f87171; white-space: pre-wrap; word-break: break-all; max-height: 140px; overflow-y: auto;"></pre>
+        </div>
+
+        <div class="modal-footer" style="padding: 16px 0 0 0; margin-top: 14px; display: flex; justify-content: space-between; align-items: center;">
+          <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-archive-error')">关闭</button>
+          <button type="button" class="btn btn-warning" id="btn-archive-error-retry" onclick="app.retryArchiveFromModal()">🔄 重新调度分析</button>
+        </div>
       </div>
     </div>
   </div>

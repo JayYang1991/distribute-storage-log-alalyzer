@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,8 +66,13 @@ func (sc *Scheduler) runLocalAnalyze(archive *model.LogArchive, archivePath, ext
 	files, totalLines, err := worker.ExtractArchive(archivePath, extractDir)
 	if err != nil {
 		archive.Status = "failed"
-		archive.ErrorMsg = fmt.Sprintf("解压失败: %v", err)
+		errMsg := err.Error()
+		if strings.Contains(strings.ToLower(errMsg), "no space left on device") {
+			errMsg = fmt.Sprintf("存储磁盘空间不足 (no space left on device): %v", err)
+		}
+		archive.ErrorMsg = fmt.Sprintf("解压失败: %s", errMsg)
 		_ = sc.store.SaveArchive(archive)
+		_ = os.RemoveAll(extractDir)
 		return
 	}
 

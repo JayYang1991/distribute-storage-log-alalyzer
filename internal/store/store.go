@@ -19,13 +19,14 @@ import (
 )
 
 var (
-	bucketUsers    = []byte("users")
-	bucketNodes    = []byte("nodes")
-	bucketArchives = []byte("archives")
-	bucketRules    = []byte("rules")
-	bucketReports  = []byte("reports")
-	bucketSettings = []byte("settings")
-	bucketAlarms   = []byte("alarms")
+	bucketUsers               = []byte("users")
+	bucketNodes               = []byte("nodes")
+	bucketArchives            = []byte("archives")
+	bucketRules               = []byte("rules")
+	bucketReports             = []byte("reports")
+	bucketSettings            = []byte("settings")
+	bucketAlarms              = []byte("alarms")
+	bucketDecommissionedNodes = []byte("decommissioned_nodes")
 )
 
 type Store struct {
@@ -52,7 +53,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化各 bucket
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms} {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms, bucketDecommissionedNodes} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -69,6 +70,8 @@ func NewStore(cfg *config.Config) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// 初始化默认普通业务用户(用于多视图与权限分离体验)
+	_ = s.initDefaultUser("user", "user123")
 
 	return s, nil
 }
@@ -171,6 +174,32 @@ func (s *Store) initAdmin(username, password string) error {
 		return err
 	}
 	// 创建物理目录
+	return s.EnsureUserDirectories(username)
+}
+
+func (s *Store) initDefaultUser(username, password string) error {
+	existing, err := s.GetUserByUsername(username)
+	if err == nil && existing != nil {
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	u := &model.User{
+		ID:               "usr_default_002",
+		Username:         username,
+		PasswordHash:     string(hash),
+		Role:             model.RoleUser,
+		SpaceQuotaBytes:  10 * 1024 * 1024 * 1024, // 默认 10GB 配额
+		UsedStorageBytes: 0,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+	if err := s.SaveUser(u); err != nil {
+		return err
+	}
 	return s.EnsureUserDirectories(username)
 }
 
@@ -344,6 +373,27 @@ func (s *Store) CalculateNodeStorageUsage(nodeID string) (int64, error) {
 	return totalBytes, err
 }
 
+// ListArchivesByNode 查询属于指定节点的所有日志归档包
+func (s *Store) ListArchivesByNode(nodeID string) ([]*model.LogArchive, error) {
+	var list []*model.LogArchive
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var a model.LogArchive
+			if err := json.Unmarshal(v, &a); err == nil {
+				if a.StorageNodeID == nodeID {
+					list = append(list, &a)
+				}
+			}
+			return nil
+		})
+	})
+	return list, err
+}
+
 func (s *Store) ListNodes() ([]*model.Node, error) {
 	var list []*model.Node
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -372,6 +422,42 @@ func (s *Store) DeleteNode(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketNodes)
 		return b.Delete([]byte(id))
+	})
+}
+
+// DecommissionNode 将节点从活跃列表删除并写入注销/下线黑名单，防止其心跳自动复活
+func (s *Store) DecommissionNode(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		_ = tx.Bucket(bucketNodes).Delete([]byte(id))
+		b := tx.Bucket(bucketDecommissionedNodes)
+		if b != nil {
+			return b.Put([]byte(id), []byte(time.Now().Format(time.RFC3339)))
+		}
+		return nil
+	})
+}
+
+// IsNodeDecommissioned 检查节点是否属于已注销节点
+func (s *Store) IsNodeDecommissioned(id string) bool {
+	var decommissioned bool
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDecommissionedNodes)
+		if b != nil && b.Get([]byte(id)) != nil {
+			decommissioned = true
+		}
+		return nil
+	})
+	return decommissioned
+}
+
+// ClearDecommissionedNode 清理节点的注销标记（当用户显式重新部署/添加该节点时调用）
+func (s *Store) ClearDecommissionedNode(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketDecommissionedNodes)
+		if b != nil {
+			return b.Delete([]byte(id))
+		}
+		return nil
 	})
 }
 

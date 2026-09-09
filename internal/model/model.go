@@ -88,6 +88,8 @@ type LogArchive struct {
 	StorageNodeIP   string    `json:"storage_node_ip,omitempty"`   // 存放业务节点IP
 	StorageNodePort int       `json:"storage_node_port,omitempty"` // 存放业务节点端口
 	AssignedWorker  string    `json:"assigned_worker,omitempty"`
+	Tags            []string  `json:"tags,omitempty"`              // 自定义标签列表，如 ["Ceph", "OSD故障", "生产环境"]
+	Remark          string    `json:"remark,omitempty"`            // 备注说明信息
 	UploadTime      time.Time `json:"upload_time"`
 	FinishTime      time.Time `json:"finish_time"`
 }
@@ -112,17 +114,18 @@ const (
 
 // Rule 故障匹配规则
 type Rule struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	StorageType string    `json:"storage_type"` // Ceph, HDFS, MinIO, GlusterFS, Generic
-	Severity    string    `json:"severity"`     // FATAL, CRITICAL, WARNING, INFO
-	Pattern     string    `json:"pattern"`      // 正则或关键词
-	IsRegex     bool      `json:"is_regex"`
-	Description string    `json:"description"`
-	Suggestion  string    `json:"suggestion"`   // 专家排查建议
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	StorageType     string    `json:"storage_type"`      // Ceph, HDFS, MinIO, GlusterFS, Generic
+	Severity        string    `json:"severity"`          // FATAL, CRITICAL, WARNING, INFO
+	Pattern         string    `json:"pattern"`           // 正则或关键词
+	IsRegex         bool      `json:"is_regex"`
+	FilePathPattern string    `json:"file_path_pattern"` // 指定匹配的文件名或全路径 (支持通配符，为空匹配全部日志)
+	Description     string    `json:"description"`
+	Suggestion      string    `json:"suggestion"`        // 专家排查建议
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // DiagnosisEvent 诊断命中的故障事件

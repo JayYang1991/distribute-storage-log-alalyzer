@@ -26,7 +26,7 @@ VIP_INTERFACE=""
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --role=*)
+        --role=*|--component=*)
             ROLE="${1#*=}"
             ;;
         --port=*)
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
         --gateway-ip=*)
             GATEWAY_IP="${1#*=}"
             ;;
-        --manager-url=*)
+        --manager-url=*|--manager=*)
             MANAGER_URL="${1#*=}"
             ;;
         --cluster-token=*)
@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
         --node-name=*)
             NODE_NAME="${1#*=}"
             ;;
-        --disk=*)
+        --disk=*|--disks=*)
             DISK_DEVICE="${1#*=}"
             ;;
         --fstype=*)
@@ -73,6 +73,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-start)
             AUTO_START=false
+            ;;
+        -y|--yes)
+            # 无需确认
             ;;
         -h|--help)
             echo "分布式存储日志分析系统 一键安装程序"
@@ -152,13 +155,63 @@ else
     exit 1
 fi
 
-# 2. 停止可能运行的旧服务
+# 2. Worker 角色强制物理磁盘安全检查与多盘解析
+DISK_LIST=()
+if [ "$ROLE" == "worker" ]; then
+    if [ -z "$DISK_DEVICE" ]; then
+        echo "=================================================================="
+        echo "  ❌ [安全策略拦截] 严禁使用系统盘存放日志！"
+        echo "=================================================================="
+        echo "  架构安全规范: 业务 Worker 计算节点必须使用独立的物理数据盘，"
+        echo "  严禁将分析日志、解压文件与系统根分区混合存放以防写满宕机。"
+        echo ""
+        echo "  请通过 --disk 参数指定至少一块独立物理硬盘，支持单盘或多盘:"
+        echo "    单盘示例: sudo ./install.sh --role=worker --disk=/dev/sdb --format"
+        echo "    多盘示例: sudo ./install.sh --role=worker --disk=/dev/sdb,/dev/sdc --format"
+        echo "=================================================================="
+        exit 1
+    fi
+
+    # 解析可能以逗号分隔的多块物理硬盘
+    IFS=',' read -r -a RAW_DISKS <<< "$DISK_DEVICE"
+    for d in "${RAW_DISKS[@]}"; do
+        clean_d=$(echo "$d" | xargs)
+        if [ -n "$clean_d" ]; then
+            DISK_LIST+=("$clean_d")
+        fi
+    done
+
+    if [ ${#DISK_LIST[@]} -eq 0 ]; then
+        echo "[ERROR] 未解析到有效的物理硬盘设备路径！"
+        exit 1
+    fi
+
+    # 逐一执行系统盘防呆检测
+    for d in "${DISK_LIST[@]}"; do
+        if command -v lsblk >/dev/null 2>&1; then
+            for mp in $(lsblk -n -o MOUNTPOINT "$d" 2>/dev/null); do
+                if [ "$mp" == "/" ] || [ "$mp" == "/boot" ] || [[ "$mp" == "/boot/"* ]] || [ "$mp" == "/home" ] || [ "$mp" == "/usr" ] || [ "$mp" == "/var" ] || [[ "$mp" == *swap* ]] || [[ "$mp" == *SWAP* ]]; then
+                    echo "=================================================================="
+                    echo "  🚫 [安全防呆拦截] 严禁使用系统关键磁盘！"
+                    echo "=================================================================="
+                    echo "  检测到目标设备 $d 关联系统关键分区 ($mp)！"
+                    echo "  为保证操作系统稳定与数据安全，严禁使用系统盘作为日志存储盘。"
+                    echo "  请选择未被操作系统占用的独立物理数据盘 (如 /dev/sdb)。"
+                    echo "=================================================================="
+                    exit 1
+                fi
+            done
+        fi
+    done
+fi
+
+# 3. 停止可能运行的旧服务
 echo "[1/4] 检查并停止可能运行的旧版本服务..."
 pkill -f "$INSTALL_DIR/bin/dist-log-analyzer $ROLE" 2>/dev/null || true
 
-# 3. 创建目录结构并部署文件
+# 4. 创建目录结构并部署文件
 echo "[2/4] 部署文件到目标目录: $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/conf" "$INSTALL_DIR/logs" "$INSTALL_DIR/run" "$DATA_DIR"
+mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/conf" "$INSTALL_DIR/logs" "$INSTALL_DIR/run"
 
 cp -f "$SRC_BIN" "$INSTALL_DIR/bin/dist-log-analyzer"
 chmod +x "$INSTALL_DIR/bin/dist-log-analyzer"
@@ -184,7 +237,7 @@ elif [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
     chmod +x "$INSTALL_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
 fi
 
-# 4. 获取本机 IP
+# 5. 获取本机 IP
 LOCAL_IP="127.0.0.1"
 if command -v hostname >/dev/null 2>&1; then
     IP_CANDIDATE=$(hostname -I 2>/dev/null | awk '{print $1}')
@@ -193,28 +246,32 @@ if command -v hostname >/dev/null 2>&1; then
     fi
 fi
 
-# 5. 配置 Systemd 服务 (仅 root 用户且支持 systemd)
+# 6. 配置并启动服务 (多盘多进程支持)
 SYSTEMD_ENABLED=false
 if [ "$IS_ROOT" = true ] && command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
-    echo "[3/4] 注册 Systemd 守护服务..."
-    SERVICE_NAME="dist-log-$ROLE.service"
-    SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
+    SYSTEMD_ENABLED=true
+fi
 
-    if [ "$ROLE" == "manager" ]; then
-        MGR_HA_ARGS="--ha-mode=$HA_MODE"
-        if [ -n "$PEER_URL" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --peer-url=$PEER_URL"; fi
-        if [ -n "$VIP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip=$VIP"; fi
-        if [ -n "$VIP_INTERFACE" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip-interface=$VIP_INTERFACE"; fi
-        if [ -n "$GATEWAY_IP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --gateway-ip=$GATEWAY_IP"; fi
-        EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer manager --port=$PORT --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN $MGR_HA_ARGS"
-    else
-        EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer worker --port=$PORT --manager-url=$MANAGER_URL --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN"
-    fi
+INSTALLED_INSTANCES=()
 
-    cat > "$SERVICE_PATH" <<EOF
+if [ "$ROLE" == "manager" ]; then
+    echo "[3/4] 注册 Manager Systemd 守护服务..."
+    mkdir -p "$DATA_DIR"
+    MGR_HA_ARGS="--ha-mode=$HA_MODE"
+    if [ -n "$PEER_URL" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --peer-url=$PEER_URL"; fi
+    if [ -n "$VIP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip=$VIP"; fi
+    if [ -n "$VIP_INTERFACE" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip-interface=$VIP_INTERFACE"; fi
+    if [ -n "$GATEWAY_IP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --gateway-ip=$GATEWAY_IP"; fi
+    EXEC_CMD="$INSTALL_DIR/bin/dist-log-analyzer manager --port=$PORT --data-dir=$DATA_DIR --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN $MGR_HA_ARGS"
+
+    if [ "$SYSTEMD_ENABLED" = true ]; then
+        SERVICE_NAME="dist-log-manager.service"
+        cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
 [Unit]
-Description=Distributed Storage Log Analyzer ($ROLE)
+Description=Distributed Storage Log Analyzer (manager)
 After=network.target
+StartLimitIntervalSec=60s
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -222,51 +279,144 @@ User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$EXEC_CMD
 Restart=always
-RestartSec=5s
+RestartSec=3s
 LimitNOFILE=65536
+TimeoutStopSec=15s
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    SYSTEMD_ENABLED=true
-fi
-
-# 6. 启动服务
-if [ "$AUTO_START" = true ]; then
-    echo "[4/4] 启动分布式日志分析系统服务..."
-    if [ "$SYSTEMD_ENABLED" = true ]; then
-        systemctl restart "dist-log-$ROLE.service"
-        sleep 1
-        systemctl status "dist-log-$ROLE.service" --no-pager | head -n 8
-    else
-        # 独立脚本方式常驻后台启动
-        if [ "$ROLE" == "manager" ]; then
-            MGR_HA_ARGS="--ha-mode=$HA_MODE"
-            if [ -n "$PEER_URL" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --peer-url=$PEER_URL"; fi
-            if [ -n "$VIP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip=$VIP"; fi
-            if [ -n "$VIP_INTERFACE" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --vip-interface=$VIP_INTERFACE"; fi
-            if [ -n "$GATEWAY_IP" ]; then MGR_HA_ARGS="$MGR_HA_ARGS --gateway-ip=$GATEWAY_IP"; fi
-            nohup "$INSTALL_DIR/bin/dist-log-analyzer" manager \
-                --port="$PORT" \
-                --data-dir="$DATA_DIR" \
-                --advertise-ip="$LOCAL_IP" \
-                --cluster-token="$CLUSTER_TOKEN" \
-                $MGR_HA_ARGS </dev/null >> "$INSTALL_DIR/logs/$ROLE.log" 2>&1 &
-        else
-            nohup "$INSTALL_DIR/bin/dist-log-analyzer" worker \
-                --port="$PORT" \
-                --manager-url="$MANAGER_URL" \
-                --data-dir="$DATA_DIR" \
-                --advertise-ip="$LOCAL_IP" \
-                --cluster-token="$CLUSTER_TOKEN" </dev/null >> "$INSTALL_DIR/logs/$ROLE.log" 2>&1 &
+        systemctl daemon-reload
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if [ "$AUTO_START" = true ]; then
+            echo "[4/4] 启动 Manager 服务并验证健康状态..."
+            systemctl restart "$SERVICE_NAME"
+            sleep 1
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+                echo "  ✔ [健康自检通过] Systemd 服务 $SERVICE_NAME 处于 active 运行状态，故障 3 秒自动拉起 (Restart=always) 已生效！"
+                systemctl status "$SERVICE_NAME" --no-pager | head -n 8
+            else
+                echo "  ❌ [健康自检失败] Systemd 服务 $SERVICE_NAME 未处于 active 运行状态！"
+                systemctl status "$SERVICE_NAME" --no-pager || true
+                exit 1
+            fi
         fi
-        DAEMON_PID=$!
-        disown $DAEMON_PID 2>/dev/null || true
-        echo $DAEMON_PID > "$INSTALL_DIR/run/service.pid"
+    else
+        if [ "$AUTO_START" = true ]; then
+            echo "[4/4] 启动 Manager 进程..."
+            nohup $EXEC_CMD </dev/null >> "$INSTALL_DIR/logs/manager.log" 2>&1 &
+            echo $! > "$INSTALL_DIR/run/manager.pid"
+        fi
+    fi
+    INSTALLED_INSTANCES+=("Manager: http://$LOCAL_IP:$PORT")
+
+else
+    # Worker 角色：为每块物理硬盘启动独立的 Worker 进程实例 (多进程隔离架构)
+    echo "[3/4] 为选定的 ${#DISK_LIST[@]} 块物理存储盘配置专属 Worker 独立进程与挂载点..."
+    BASE_STORAGE_MOUNT="/data/dist-log-storage"
+
+    for idx in "${!DISK_LIST[@]}"; do
+        disk_dev="${DISK_LIST[$idx]}"
+        disk_name=$(basename "$disk_dev")
+        inst_port=$((PORT + idx))
+        inst_name="${NODE_NAME:-$(hostname)}-$disk_name"
+        inst_mount="$BASE_STORAGE_MOUNT/disk-$disk_name"
+        inst_data_dir="$inst_mount/data"
+
+        echo "  --------------------------------------------------"
+        echo "  ▶ 正在配置第 $((idx + 1))/${#DISK_LIST[@]} 块磁盘: $disk_dev"
+        echo "     实例名称: $inst_name"
+        echo "     服务端口: $inst_port"
+        echo "     专用挂载点: $inst_mount"
+
+        # 检查是否格式化与挂载
+        if [ "$IS_ROOT" = true ]; then
+            mkdir -p "$inst_mount"
+            # 检查该磁盘是否已被挂载
+            if ! grep -qs "$inst_mount" /proc/mounts; then
+                if [ "$FORMAT_DISK" = true ]; then
+                    echo "     ⚡ 正在执行磁盘格式化 ($FS_TYPE: $disk_dev)..."
+                    umount "$disk_dev" 2>/dev/null || true
+                    if [ "$FS_TYPE" == "xfs" ]; then
+                        mkfs.xfs -f "$disk_dev" >/dev/null 2>&1 || true
+                    else
+                        mkfs.ext4 -F "$disk_dev" >/dev/null 2>&1 || true
+                    fi
+                fi
+                echo "     正在挂载磁盘 $disk_dev 到 $inst_mount..."
+                mount "$disk_dev" "$inst_mount" 2>/dev/null || mount -o defaults "$disk_dev" "$inst_mount" 2>/dev/null || true
+
+                # 写入 /etc/fstab (若未存在)
+                if ! grep -qs "$inst_mount" /etc/fstab; then
+                    echo "$disk_dev $inst_mount $FS_TYPE defaults 0 0" >> /etc/fstab
+                fi
+            else
+                echo "     ✔ 磁盘已处于挂载状态 ($inst_mount)"
+            fi
+        fi
+
+        mkdir -p "$inst_data_dir"
+        inst_exec="$INSTALL_DIR/bin/dist-log-analyzer worker --port=$inst_port --manager-url=$MANAGER_URL --data-dir=$inst_data_dir --advertise-ip=$LOCAL_IP --cluster-token=$CLUSTER_TOKEN --node-name=$inst_name"
+
+        if [ "$SYSTEMD_ENABLED" = true ]; then
+            svc_file="dist-log-worker-$disk_name.service"
+            cat > "/etc/systemd/system/$svc_file" <<EOF
+[Unit]
+Description=Distributed Storage Log Analyzer Worker (Disk: $disk_dev, Port: $inst_port)
+After=network.target
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$inst_exec
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+TimeoutStopSec=15s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable "$svc_file" >/dev/null 2>&1 || true
+            if [ "$AUTO_START" = true ]; then
+                systemctl restart "$svc_file"
+            fi
+        else
+            if [ "$AUTO_START" = true ]; then
+                nohup $inst_exec </dev/null >> "$INSTALL_DIR/logs/worker-$disk_name.log" 2>&1 &
+                echo $! > "$INSTALL_DIR/run/worker-$disk_name.pid"
+            fi
+        fi
+        INSTALLED_INSTANCES+=("Worker 实例 (磁盘: $disk_dev): $LOCAL_IP:$inst_port -> 挂载点: $inst_mount")
+    done
+
+    if [ "$AUTO_START" = true ]; then
         sleep 1
+        echo "[4/4] 验证所有 Worker 实例服务健康状态..."
+        if [ "$SYSTEMD_ENABLED" = true ]; then
+            ALL_HEALTHY=true
+            for idx in "${!DISK_LIST[@]}"; do
+                d_name=$(basename "${DISK_LIST[$idx]}")
+                s_file="dist-log-worker-$d_name.service"
+                if systemctl is-active --quiet "$s_file"; then
+                    echo "  ✔ [健康自检通过] Systemd 守护服务 $s_file 处于 active 运行状态，故障 3 秒自动拉起 (Restart=always) 已生效！"
+                else
+                    echo "  ❌ [健康自检失败] Systemd 守护服务 $s_file 未处于 active 状态！"
+                    systemctl status "$s_file" --no-pager || true
+                    ALL_HEALTHY=false
+                fi
+            done
+            if [ "$ALL_HEALTHY" != true ]; then
+                echo "[ERROR] 部分 Worker 实例启动健康检查未通过，请检查日志！"
+                exit 1
+            fi
+        fi
     fi
 fi
 
@@ -280,23 +430,28 @@ if [ "$ROLE" == "manager" ]; then
     echo "  ▶ 初始管理员密码: admin123"
     echo "  ▶ 数据存储隔离目录: $DATA_DIR"
     echo "  ▶ ⚙️ 高可用与网络配置: 登录 Web 控制台 -> [集群节点] -> [⚙️ 高可用与网络配置]"
-    echo "     (支持在线随时设置主备 HA 模式、网关防脑裂 IP (--gateway-ip)、双重仲裁与 VIP，即时生效)"
     echo "  ▶ 业务组件后续安装: 登录 Web 控制台 -> [集群节点] -> 一键远程安装 (SSH)"
+    echo ""
+    if [ "$SYSTEMD_ENABLED" = true ]; then
+        echo "  ▶ 服务控制命令:"
+        echo "     systemctl status dist-log-manager"
+        echo "     systemctl restart dist-log-manager"
+        echo "     systemctl stop dist-log-manager"
+    fi
 else
-    echo "  ▶ 业务计算节点已接入: $LOCAL_IP:$PORT"
-    echo "  ▶ 所属管理节点: $MANAGER_URL"
-fi
-echo ""
-if [ "$SYSTEMD_ENABLED" = true ]; then
-    echo "  ▶ 服务控制命令:"
-    echo "     systemctl status dist-log-$ROLE"
-    echo "     systemctl restart dist-log-$ROLE"
-    echo "     systemctl stop dist-log-$ROLE"
-else
-    echo "  ▶ 服务控制命令:"
-    echo "     $INSTALL_DIR/service.sh status"
-    echo "     $INSTALL_DIR/service.sh restart"
-    echo "     $INSTALL_DIR/service.sh stop"
+    echo "  ▶ 业务节点所属管理端: $MANAGER_URL"
+    echo "  ▶ 本机成功拉起 ${#DISK_LIST[@]} 个独立物理磁盘的 Worker 存储进程:"
+    for inst in "${INSTALLED_INSTANCES[@]}"; do
+        echo "     ✔ $inst"
+    done
+    echo ""
+    if [ "$SYSTEMD_ENABLED" = true ]; then
+        echo "  ▶ 实例服务控制命令 (以第一块盘为例):"
+        first_disk=$(basename "${DISK_LIST[0]}")
+        echo "     systemctl status dist-log-worker-$first_disk"
+        echo "     systemctl restart dist-log-worker-$first_disk"
+        echo "     systemctl stop dist-log-worker-$first_disk"
+    fi
 fi
 echo ""
 echo "  ▶ 一键卸载命令:"

@@ -5,10 +5,12 @@ const app = {
   currentUser: null,
   activeTab: "dashboard",
   archives: [],
+  archiveFilterText: "",
   nodes: [],
   users: [],
   rules: [],
   currentViewingArchiveID: null,
+  currentErrorArchiveID: null,
 
   init() {
     this.bindEvents();
@@ -102,6 +104,15 @@ const app = {
     }
   },
 
+  fillLoginForm(username, password) {
+    const uInput = document.getElementById("login-username");
+    const pInput = document.getElementById("login-password");
+    if (uInput) uInput.value = username;
+    if (pInput) pInput.value = password;
+    const errBox = document.getElementById("login-error");
+    if (errBox) errBox.style.display = "none";
+  },
+
   async fetchMe() {
     try {
       const res = await this.api("/api/auth/me");
@@ -127,25 +138,54 @@ const app = {
 
   updateUserUI() {
     if (!this.currentUser) return;
+    const isAdmin = this.currentUser.role === "admin";
+
     document.getElementById("user-name").innerText = this.currentUser.username;
-    document.getElementById("user-role").innerText = this.currentUser.role === "admin" ? "系统管理员" : "业务用户";
+    document.getElementById("user-role").innerText = isAdmin ? "系统超级管理员" : "业务分析用户";
     document.getElementById("user-avatar").innerText = this.currentUser.username.substring(0, 1).toUpperCase();
 
-    // 权限控制：普通用户隐藏多用户管理与规则修改
-    const userNav = document.getElementById("nav-users");
+    // 1. 侧边栏导航双视图维护：根据 data-role 控制显隐
+    // 管理员：展示全部功能；普通业务用户：只展示日志上传与分析(archives, search)，不展示运维与配置菜单
+    document.querySelectorAll(".nav-item").forEach(item => {
+      const requiredRole = item.dataset.role;
+      if (requiredRole === "admin") {
+        item.style.display = isAdmin ? "flex" : "none";
+      } else {
+        item.style.display = "flex";
+      }
+    });
+
+    // 2. 顶部运维状态指示器：普通用户视图下隐藏
+    const alarmIndicator = document.getElementById("alarm-top-indicator");
+    const haIndicator = document.getElementById("ha-top-indicator");
+    if (alarmIndicator) alarmIndicator.style.display = isAdmin ? "flex" : "none";
+    if (haIndicator) haIndicator.style.display = isAdmin ? "flex" : "none";
+
+    // 3. 页面内配置与修改入口隔离
     const adminRuleActions = document.getElementById("admin-rule-actions");
-    if (this.currentUser.role !== "admin") {
-      userNav.style.display = "none";
-      if (adminRuleActions) adminRuleActions.style.display = "none";
-    } else {
-      userNav.style.display = "flex";
-      if (adminRuleActions) adminRuleActions.style.display = "flex";
+    if (adminRuleActions) adminRuleActions.style.display = isAdmin ? "flex" : "none";
+
+    // 4. 路由隔离与默认着陆页：
+    // 普通业务用户登录时，自动切换到“日志归档与文件”视图；管理员默认停留在概览仪表盘
+    const allowedUserTabs = ["archives", "search"];
+    if (!isAdmin && !allowedUserTabs.includes(this.activeTab)) {
+      this.switchTab("archives");
+    } else if (isAdmin && (!this.activeTab || this.activeTab === "")) {
+      this.switchTab("dashboard");
     }
   },
 
   // ================= 导航切换 =================
 
   switchTab(tabName) {
+    // 权限守卫：非管理员试图访问管理/配置视图时，强制拦截并保留在日志分析视图
+    const isAdmin = this.currentUser ? this.currentUser.role === "admin" : false;
+    const allowedUserTabs = ["archives", "search"];
+    if (!isAdmin && !allowedUserTabs.includes(tabName)) {
+      console.warn(`[Permission Denied] 用户无权访问视图: ${tabName}，自动重定向至日志归档分析视图`);
+      tabName = "archives";
+    }
+
     this.activeTab = tabName;
     document.querySelectorAll(".nav-item").forEach(item => {
       item.classList.toggle("active", item.dataset.tab === tabName);
@@ -173,7 +213,7 @@ const app = {
     // 切换到对应 tab 触发加载
     if (tabName === "search") {
       this.populateSearchArchiveSelect();
-    } else if (tabName === "alarms") {
+    } else if (tabName === "alarms" && isAdmin) {
       this.fetchAlarms();
     }
   },
@@ -181,31 +221,46 @@ const app = {
   // ================= 数据刷新 =================
 
   async refreshData() {
-    await Promise.all([
-      this.loadNodes(),
-      this.loadArchives(),
-      this.loadRules(),
-      this.fetchHAStatus(),
-      this.fetchAlarmSummary(),
-      this.currentUser && this.currentUser.role === "admin" ? this.loadUsers() : Promise.resolve(),
-    ]);
-    if (this.activeTab === "alarms") {
-      await this.fetchAlarms();
+    const isAdmin = this.currentUser && this.currentUser.role === "admin";
+    if (isAdmin) {
+      await Promise.all([
+        this.loadNodes(),
+        this.loadArchives(),
+        this.loadRules(),
+        this.fetchHAStatus(),
+        this.fetchAlarmSummary(),
+        this.loadUsers(),
+      ]);
+      if (this.activeTab === "alarms") {
+        await this.fetchAlarms();
+      }
+      this.updateDashboardStats();
+    } else {
+      // 普通业务用户视图：仅加载归档包列表和规则特征库供分析
+      await Promise.all([
+        this.loadNodes(),
+        this.loadArchives(),
+        this.loadRules(),
+      ]);
     }
-    this.updateDashboardStats();
   },
 
   async silentRefresh() {
-    await Promise.all([
-      this.loadNodes(true),
-      this.loadArchives(true),
-      this.fetchHAStatus(),
-      this.fetchAlarmSummary(),
-    ]);
-    if (this.activeTab === "alarms") {
-      await this.fetchAlarms();
+    const isAdmin = this.currentUser && this.currentUser.role === "admin";
+    if (isAdmin) {
+      await Promise.all([
+        this.loadNodes(true),
+        this.loadArchives(true),
+        this.fetchHAStatus(),
+        this.fetchAlarmSummary(),
+      ]);
+      if (this.activeTab === "alarms") {
+        await this.fetchAlarms();
+      }
+      this.updateDashboardStats();
+    } else {
+      await this.loadArchives(true);
     }
-    this.updateDashboardStats();
   },
 
   // ================= 高可用 (HA) 状态管理 =================
@@ -440,7 +495,8 @@ const app = {
     try {
       const res = await this.api("/api/nodes");
       if (res.ok) {
-        this.nodes = await res.json();
+        const data = await res.json();
+        this.nodes = Array.isArray(data) ? data : [];
         this.renderNodes();
         this.populateUploadNodes();
       }
@@ -471,7 +527,7 @@ const app = {
     if (workers.length > 0) {
       const lowest = workers[0];
       const lowestUsed = lowest.resource?.disk_used_mb ? `${(lowest.resource.disk_used_mb / 1024).toFixed(2)} GB` : '0 MB';
-      opts += `<option value="auto">🎯 智能调度 (优先存放至已用容量最低节点: ${this.escape(lowest.name)}，已用 ${lowestUsed})</option>`;
+      opts += `<option value="auto">🎯 智能容量调度 (推荐: 优先存放至已用容量最低节点: ${this.escape(lowest.name)}，已用 ${lowestUsed})</option>`;
 
       workers.forEach((n, idx) => {
         const usedMB = (n.resource && n.resource.disk_used_mb) ? n.resource.disk_used_mb : (n.storage_used_bytes ? Math.round(n.storage_used_bytes / (1024 * 1024)) : 0);
@@ -483,12 +539,13 @@ const app = {
 
         opts += `<option value="${n.id}">${this.escape(n.name)} - ${n.ip}:${n.port}${diskInfo} (已用: ${usedStr}${pctStr}, 剩余可用: ${freeGB})${recBadge}</option>`;
       });
+    } else {
+      opts = '<option value="" disabled selected>⚠️ 当前无可用业务存储节点 (日志只能存入业务存储，禁止存入管理系统盘)</option>';
     }
 
-    opts += '<option value="manager_primary">管理节点本地存储 (Local Manager)</option>';
     sel.innerHTML = opts;
 
-    if (currentVal && Array.from(sel.options).some(o => o.value === currentVal)) {
+    if (currentVal && Array.from(sel.options).some(o => o.value === currentVal && !o.disabled)) {
       sel.value = currentVal;
     } else if (workers.length > 0) {
       sel.value = "auto";
@@ -535,7 +592,7 @@ const app = {
         <td>${lastHb}</td>
         <td>
           ${n.role !== "manager" && this.currentUser?.role === "admin" ? `
-            <button class="btn btn-danger btn-sm" onclick="app.deleteNode('${n.id}')">移除</button>
+            <button class="btn btn-danger btn-sm" onclick="app.openRemoveNodeModal('${n.id}')">移除</button>
           ` : '<span style="color: var(--text-dim); font-size: 11px;">核心管理节点</span>'}
         </td>
       `;
@@ -546,6 +603,18 @@ const app = {
   openDeployModal() {
     document.getElementById("deploy-terminal-box").style.display = "none";
     document.getElementById("btn-deploy-submit").disabled = false;
+    document.getElementById("deploy-disk-input").value = "";
+    document.getElementById("deploy-disk-select").innerHTML = '<option value="">-- 请点击“探测目标磁盘”或手动在下方输入设备路径 --</option>';
+    const listBox = document.getElementById("deploy-disk-list-box");
+    if (listBox) {
+      listBox.innerHTML = "";
+      listBox.style.display = "none";
+    }
+    const hint = document.getElementById("deploy-disk-hint");
+    if (hint) {
+      hint.style.display = "none";
+    }
+    this._lastDetectedDisks = [];
     this.openModal("modal-deploy");
   },
 
@@ -573,50 +642,72 @@ const app = {
       this._lastDetectedDisks = disks || [];
       const select = document.getElementById("deploy-disk-select");
       const diskInput = document.getElementById("deploy-disk-input");
+      const listBox = document.getElementById("deploy-disk-list-box");
 
-      select.innerHTML = '<option value="">-- 请选择检测到的物理硬盘 --</option>';
+      select.innerHTML = '<option value="">-- 请选择检测到的物理硬盘 (亦可上方多选) --</option>';
 
       if (!disks || disks.length === 0) {
         select.innerHTML = '<option value="">未检测到物理磁盘，请检查目标主机权限</option>';
+        if (listBox) listBox.style.display = "none";
         if (hint) {
           hint.style.display = "block";
           hint.style.background = "rgba(245, 158, 11, 0.15)";
           hint.style.border = "1px solid #f59e0b";
           hint.style.color = "#fbbf24";
-          hint.innerText = "⚠️ 未检测到可用的磁盘设备，请确认目标主机是否有外挂独立物理硬盘。";
+          hint.innerText = "⚠️ 未检测到可用的独立物理磁盘设备，系统严禁使用系统盘，请确认目标主机已挂载物理数据盘。";
         }
       } else {
-        let firstSafeDisk = null;
-        disks.forEach(d => {
+        let listHtml = '';
+        let checkedDisks = [];
+
+        disks.forEach((d, idx) => {
           const modelInfo = d.model ? ` [${d.model}]` : '';
-          if (d.can_format) {
-            if (!firstSafeDisk) firstSafeDisk = d;
-            select.innerHTML += `<option value="${d.path}">✅ [安全推荐: 裸盘] ${d.path} (${d.size})${modelInfo} - 无文件系统，安全可用</option>`;
+          const isSys = d.is_system;
+          const isSafe = d.can_format && !isSys;
+          
+          if (isSafe && !isSys) {
+            checkedDisks.push(d.path);
+          }
+
+          listHtml += `
+            <label style="display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; margin-bottom: 4px; border-radius: 4px; background: ${isSys ? 'rgba(239, 68, 68, 0.1)' : 'rgba(255, 255, 255, 0.04)'}; cursor: ${isSys ? 'not-allowed' : 'pointer'};">
+              <span style="display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" name="deploy_disk_cb" value="${d.path}" ${isSys ? 'disabled' : (isSafe ? 'checked' : '')} onchange="app.onDiskCheckboxChange()">
+                <strong style="color: ${isSys ? '#f87171' : (isSafe ? '#34d399' : '#e2e8f0')}">${d.path}</strong>
+                <span style="font-size: 11px; color: var(--text-muted);">(${d.size})${modelInfo}</span>
+              </span>
+              <span style="font-size: 11px; color: ${isSys ? '#f87171' : (isSafe ? '#34d399' : '#fbbf24')};">
+                ${isSys ? '🚫 严禁使用 (系统盘)' : (isSafe ? '✅ 安全裸盘 (推荐)' : '⚠️ 已有分区/FS')}
+              </span>
+            </label>
+          `;
+
+          if (isSafe && !isSys) {
+            select.innerHTML += `<option value="${d.path}">✅ [安全裸盘 (推荐)] ${d.path} (${d.size})${modelInfo}</option>`;
           } else {
-            select.innerHTML += `<option value="${d.path}" disabled style="color: #94a3b8; background: rgba(30,41,59,0.8);">🚫 [防呆锁定] ${d.path} (${d.size})${modelInfo} - ${d.status_text || '已有文件系统'}</option>`;
+            select.innerHTML += `<option value="${d.path}" ${isSys ? 'disabled' : ''} style="color: #94a3b8;">${isSys ? '🚫 [系统关键盘]' : '⚠️ [已有数据/分区]'} ${d.path} (${d.size})${modelInfo} - ${d.status_text || ''}</option>`;
           }
         });
 
-        if (firstSafeDisk) {
-          // 自动选中第一个未格式化纯净裸盘
-          select.value = firstSafeDisk.path;
-          diskInput.value = firstSafeDisk.path;
-          if (hint) {
-            hint.style.display = "block";
+        if (listBox) {
+          listBox.innerHTML = listHtml;
+          listBox.style.display = "block";
+        }
+
+        diskInput.value = checkedDisks.join(", ");
+
+        if (hint) {
+          hint.style.display = "block";
+          if (checkedDisks.length > 0) {
             hint.style.background = "rgba(16, 185, 129, 0.15)";
             hint.style.border = "1px solid #10b981";
             hint.style.color = "#34d399";
-            hint.innerHTML = `<strong>✅ 智能防呆已就绪：</strong>自动优选未格式化的纯净裸物理盘 <code>${firstSafeDisk.path}</code> (${firstSafeDisk.size})。已有文件系统或系统分区的磁盘已被自动锁定，避免误格式化破坏数据。`;
-          }
-        } else {
-          // 全部盘都已有文件系统
-          diskInput.value = "";
-          if (hint) {
-            hint.style.display = "block";
+            hint.innerHTML = `<strong>✅ 智能多盘防呆已就绪：</strong>已优选 ${checkedDisks.length} 块纯净裸物理盘 (<code>${checkedDisks.join(", ")}</code>)。系统盘已被自动标红锁定，系统将为勾选的各盘分别启动独立 Worker 进程。`;
+          } else {
             hint.style.background = "rgba(239, 68, 68, 0.15)";
             hint.style.border = "1px solid #ef4444";
             hint.style.color = "#f87171";
-            hint.innerHTML = `<strong>⚠️ 防呆保护告警：</strong>目标主机探测到的所有磁盘均已有文件系统或系统分区，已全部防呆锁定禁止格式化！如确需使用，请为目标主机挂载全新物理裸盘，或取消勾选下方的“自动格式化”。`;
+            hint.innerHTML = `<strong>⚠️ 保护提示：</strong>未检测到纯净裸盘，系统关键分区已被强制锁定！请勾选独立数据盘，或手动提供专用存储盘设备路径。`;
           }
         }
       }
@@ -628,10 +719,27 @@ const app = {
     }
   },
 
+  onDiskCheckboxChange() {
+    const cbs = document.querySelectorAll('input[name="deploy_disk_cb"]:checked');
+    const vals = Array.from(cbs).map(c => c.value);
+    document.getElementById("deploy-disk-input").value = vals.join(", ");
+  },
+
   onDiskSelectChange() {
     const val = document.getElementById("deploy-disk-select").value;
     if (val) {
-      document.getElementById("deploy-disk-input").value = val;
+      if (this._lastDetectedDisks) {
+        const target = this._lastDetectedDisks.find(d => d.path === val || d.name === val);
+        if (target && target.is_system) {
+          alert(`【安全防呆拦截】${val} 属于系统关键分区，严禁选用！`);
+          document.getElementById("deploy-disk-select").value = "";
+          return;
+        }
+      }
+      const cur = document.getElementById("deploy-disk-input").value.trim();
+      const set = new Set(cur ? cur.split(",").map(s => s.trim()).filter(Boolean) : []);
+      set.add(val);
+      document.getElementById("deploy-disk-input").value = Array.from(set).join(", ");
     }
   },
 
@@ -642,17 +750,27 @@ const app = {
     const password = document.getElementById("deploy-pass").value;
     const nodeName = document.getElementById("deploy-name").value.trim();
 
-    const diskDevice = document.getElementById("deploy-disk-input").value.trim();
+    const diskInputVal = document.getElementById("deploy-disk-input").value.trim();
+    const selectedDisks = diskInputVal ? diskInputVal.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+    // 强制校验：严禁使用系统盘 & 必须选盘
+    if (selectedDisks.length === 0) {
+      alert("【安全架构限制】严禁使用系统盘存放日志！\n增加 Worker 节点时必须至少指定一块独立的物理存储盘。\n请点击“探测目标磁盘”并勾选物理裸盘，或手动输入设备路径（如 /dev/sdb）。");
+      return;
+    }
+
     const fsType = document.getElementById("deploy-fstype").value;
     const mountPoint = document.getElementById("deploy-mountpoint").value.trim();
     const formatDisk = document.getElementById("deploy-format-disk").checked;
 
-    // 前端防呆校验：如果勾选了格式化，且选中的磁盘在探测结果中标记为不可格式化
-    if (formatDisk && diskDevice && this._lastDetectedDisks && this._lastDetectedDisks.length > 0) {
-      const matchDisk = this._lastDetectedDisks.find(d => d.path === diskDevice || d.name === diskDevice);
-      if (matchDisk && !matchDisk.can_format) {
-        alert(`【安全防呆拦截】目标磁盘 ${diskDevice} 检测到包含已有文件系统或系统关键分区（${matchDisk.status_text}）！\n为防止重要数据丢失或系统崩溃，系统拒绝执行格式化操作。\n请更换为未格式化的裸盘，或取消勾选“自动格式化该硬盘”。`);
-        return;
+    // 前端防呆校验：系统盘拦截
+    if (this._lastDetectedDisks && this._lastDetectedDisks.length > 0) {
+      for (const dPath of selectedDisks) {
+        const matchDisk = this._lastDetectedDisks.find(d => d.path === dPath || d.name === dPath);
+        if (matchDisk && matchDisk.is_system) {
+          alert(`【安全防呆拦截】目标磁盘 ${dPath} 属于系统关键分区，严禁用于日志存储！已中止提交以防系统崩溃。`);
+          return;
+        }
       }
     }
 
@@ -662,8 +780,9 @@ const app = {
 
     termBox.style.display = "block";
     term.innerText = `[1/4] 准备向目标 ${host}:${port} 发起 SSH 远程一键部署...\n` +
-      (diskDevice ? `[磁盘配置] 目标硬盘: ${diskDevice}, 文件系统: ${fsType}, 格式化: ${formatDisk}\n` : '') +
-      `[2/4] 正在传输安装包并执行配置，请稍候...\n`;
+      `[多盘配置] 共选定 ${selectedDisks.length} 块物理硬盘: ${selectedDisks.join(', ')}\n` +
+      `[架构机制] 将为各盘分别拉起独立 Worker 进程实例 (服务端口: 8081~${8080 + selectedDisks.length}) 实现 I/O 隔离\n` +
+      `[2/4] 正在传输安装包并执行磁盘格式化与挂载，请稍候...\n`;
     btn.disabled = true;
 
     try {
@@ -673,7 +792,8 @@ const app = {
         username,
         password,
         node_name: nodeName,
-        disk_device: diskDevice,
+        disk_device: selectedDisks.join(","),
+        disk_devices: selectedDisks,
         fs_type: fsType,
         mount_point: mountPoint,
         format_disk: formatDisk,
@@ -682,7 +802,7 @@ const app = {
         const err = await res.text();
         throw new Error(err);
       }
-      term.innerText += `[3/4] 远程磁盘挂载与服务启动执行成功，等待 Worker 注册上线...\n`;
+      term.innerText += `[3/4] 远程磁盘配置与多 Worker 实例启动指令执行成功，等待各实例注册上线...\n`;
       
       setTimeout(() => this.loadNodes(), 2500);
       setTimeout(() => {
@@ -696,10 +816,131 @@ const app = {
     }
   },
 
+  openRemoveNodeModal(id) {
+    const nodes = Array.isArray(this.nodes) ? this.nodes : [];
+    const node = nodes.find(n => n && n.id === id);
+    if (!node) return;
+
+    document.getElementById("remove-node-id").value = id;
+    document.getElementById("remove-node-info").innerText = `节点名称: ${node.name || id} (IP: ${node.ip || '127.0.0.1'}, 端口: ${node.port})`;
+
+    // 计算当前存储日志包数量和空间
+    const archives = Array.isArray(this.archives) ? this.archives : [];
+    const nodeArchives = archives.filter(a => a && a.storage_node_id === id);
+    const totalBytes = nodeArchives.reduce((acc, a) => acc + (a.size || 0), 0);
+    const sizeStr = (totalBytes / 1024 / 1024).toFixed(1) + " MB";
+    document.getElementById("remove-node-stats").innerText = `当前物理存储日志包: ${nodeArchives.length} 个 | 占用存储: ${sizeStr}`;
+
+    // 重置策略为 migrate
+    const radios = document.getElementsByName("remove-node-action");
+    radios.forEach(r => r.checked = (r.value === "migrate"));
+    document.getElementById("group-target-node").style.display = "block";
+    document.getElementById("remove-node-progress").style.display = "none";
+    document.getElementById("btn-confirm-remove-node").disabled = false;
+
+    // 填充目标候选节点列表：过滤掉自身
+    const targetSelect = document.getElementById("remove-target-node");
+    targetSelect.innerHTML = "";
+
+    // 候选的 worker 节点 (排序：已用容量升序，优先推荐容量最低的存活节点)
+    const candidateWorkers = nodes
+      .filter(n => n && n.id !== id && n.role !== "manager" && n.status === "online")
+      .sort((a, b) => (a.resource?.disk_used_mb || 0) - (b.resource?.disk_used_mb || 0));
+
+    if (candidateWorkers.length > 0) {
+      candidateWorkers.forEach((n, idx) => {
+        const opt = document.createElement("option");
+        opt.value = n.id;
+        const usedMB = n.resource?.disk_used_mb || 0;
+        const freeMB = n.resource?.disk_free_mb || 0;
+        opt.text = `${idx === 0 ? '⭐ [推荐最低容量] ' : ''}${n.name || n.id} (${n.ip}:${n.port} - 已用: ${usedMB} MB, 剩余: ${freeMB} MB)`;
+        targetSelect.appendChild(opt);
+      });
+    } else {
+      const optEmpty = document.createElement("option");
+      optEmpty.value = "";
+      optEmpty.disabled = true;
+      optEmpty.selected = true;
+      optEmpty.text = "⚠️ 无其他在线业务存储节点可供迁移 (禁止迁移至管理节点系统盘)";
+      targetSelect.appendChild(optEmpty);
+    }
+
+    this.openModal("modal-remove-node");
+  },
+
+  onRemoveActionChange() {
+    const radios = document.getElementsByName("remove-node-action");
+    let selectedAction = "migrate";
+    for (const r of radios) {
+      if (r.checked) {
+        selectedAction = r.value;
+        break;
+      }
+    }
+    const groupTarget = document.getElementById("group-target-node");
+    const targetSelect = document.getElementById("remove-target-node");
+    if (selectedAction === "migrate") {
+      groupTarget.style.display = "block";
+      targetSelect.required = true;
+    } else {
+      groupTarget.style.display = "none";
+      targetSelect.required = false;
+    }
+  },
+
+  async confirmRemoveNode() {
+    const id = document.getElementById("remove-node-id").value;
+    if (!id) return;
+
+    const radios = document.getElementsByName("remove-node-action");
+    let action = "migrate";
+    for (const r of radios) {
+      if (r.checked) {
+        action = r.value;
+        break;
+      }
+    }
+
+    const targetNodeSelect = document.getElementById("remove-target-node");
+    const targetNodeID = targetNodeSelect ? targetNodeSelect.value : "";
+
+    if (action === "migrate" && (!targetNodeID || targetNodeID === "manager_primary" || targetNodeID === "local")) {
+      alert("⚠️ 当前无其他可用在线业务存储节点！日志只能保存在业务存储节点上，禁止迁移至管理节点系统盘。请先接入新业务节点或选择其他移除方式。");
+      return;
+    }
+
+    const btn = document.getElementById("btn-confirm-remove-node");
+    const progressBox = document.getElementById("remove-node-progress");
+    btn.disabled = true;
+    progressBox.style.display = "block";
+    progressBox.innerText = action === "migrate" ? "⏳ 正在平滑迁移日志文件至目标业务节点并更新索引，请稍候..." : "⏳ 正在执行节点移除处置，请稍候...";
+
+    try {
+      const res = await this.api(`/api/nodes/${id}/remove`, "POST", {
+        action: action,
+        target_node_id: targetNodeID,
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText || "服务端返回异常");
+      }
+
+      const data = await res.json().catch(() => ({}));
+      alert(`🎉 ${data.message || "节点已成功移除！"}`);
+
+      this.closeModal("modal-remove-node");
+      await this.refreshData();
+    } catch (err) {
+      alert(`❌ 移除节点失败: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      progressBox.style.display = "none";
+    }
+  },
+
   async deleteNode(id) {
-    if (!confirm("确定要从集群中移除该业务节点吗？")) return;
-    await this.api(`/api/nodes/${id}`, "DELETE");
-    this.loadNodes();
+    this.openRemoveNodeModal(id);
   },
 
   openAgentScriptModal() {
@@ -810,7 +1051,8 @@ const app = {
     try {
       const res = await this.api("/api/archives");
       if (res.ok) {
-        this.archives = await res.json();
+        const data = await res.json();
+        this.archives = Array.isArray(data) ? data : [];
         this.renderArchives();
       }
     } catch (e) {
@@ -824,9 +1066,23 @@ const app = {
       if (!tbody) return;
       tbody.innerHTML = "";
 
-      const list = isRecentOnly ? this.archives.slice(0, 5) : this.archives;
+      let list = isRecentOnly ? this.archives.slice(0, 5) : this.archives;
+      if (!isRecentOnly && this.archiveFilterText) {
+        const q = this.archiveFilterText.toLowerCase();
+        list = list.filter(a => {
+          if (a.filename && a.filename.toLowerCase().includes(q)) return true;
+          if (a.remark && a.remark.toLowerCase().includes(q)) return true;
+          if (a.tags && a.tags.some(t => t.toLowerCase().includes(q))) return true;
+          return false;
+        });
+      }
+
       if (list.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-dim); padding: 24px;">暂无日志归档包，请点击上方“上传日志包”按钮开始分析</td></tr>`;
+        if (!isRecentOnly && this.archiveFilterText) {
+          tbody.innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-dim); padding: 24px;">未找到匹配 “<strong>${this.escape(this.archiveFilterText)}</strong>” 的日志包，<a href="javascript:void(0)" onclick="app.clearArchiveFilter()" style="color: var(--primary); text-decoration: underline;">点击清空筛选条件</a></td></tr>`;
+        } else {
+          tbody.innerHTML = `<tr><td colspan="${isRecentOnly ? 7 : 10}" style="text-align: center; color: var(--text-dim); padding: 24px;">暂无日志归档包，请点击上方“上传日志包”按钮开始分析</td></tr>`;
+        }
         return;
       }
 
@@ -834,11 +1090,23 @@ const app = {
         const tr = document.createElement("tr");
         const sizeMB = (a.size / (1024 * 1024)).toFixed(2);
         const isReady = a.status === "ready";
-        const statusBadge = isReady
-          ? '<span class="badge badge-success">分析就绪</span>'
-          : a.status === "failed"
-          ? `<span class="badge badge-danger" title="${this.escape(a.error_msg || '')}">失败</span>`
-          : '<span class="badge badge-warning">解包诊断中</span>';
+
+        let statusBadge = "";
+        if (isReady) {
+          statusBadge = '<span class="badge badge-success">分析就绪</span>';
+        } else if (a.status === "failed") {
+          const errInfo = this.formatArchiveError(a.error_msg);
+          statusBadge = `
+            <div style="display: flex; flex-direction: column; gap: 4px; align-items: flex-start;">
+              <span class="badge badge-danger">失败</span>
+              <span class="archive-error-tag" onclick="app.showArchiveError('${a.id}')" title="点击查看详细失败原因与处置方案">
+                ${errInfo.icon} ${this.escape(errInfo.title)}
+              </span>
+            </div>
+          `;
+        } else {
+          statusBadge = '<span class="badge badge-warning">解包诊断中</span>';
+        }
 
         const storageNodeBadge = a.storage_node_name
           ? `<span class="badge badge-info" title="${this.escape(a.extract_path || '')}">💾 ${this.escape(a.storage_node_name)}</span>`
@@ -857,12 +1125,29 @@ const app = {
                 <button class="btn btn-secondary btn-sm" onclick="app.viewFiles('${a.id}')">浏览</button>
                 <button class="btn btn-primary btn-sm" onclick="app.viewDiagnosis('${a.id}')">诊断报告</button>
                 <button class="btn btn-secondary btn-sm" title="下载原日志压缩包" onclick="app.downloadArchive('${a.id}')">📥 下载</button>
-              ` : '-'}
+              ` : (a.status === 'failed' ? `
+                <button class="btn btn-danger btn-sm" title="查看详细失败原因与解决方案" onclick="app.showArchiveError('${a.id}')">❓ 原因</button>
+                <button class="btn btn-warning btn-sm" title="重新尝试解包与分析" onclick="app.retryArchive('${a.id}')">🔄 重试</button>
+              ` : '-')}
             </td>
           `;
         } else {
+          let tagsHtml = "";
+          if (a.tags && a.tags.length > 0) {
+            tagsHtml = `<div style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 2px;">` +
+              a.tags.map(t => `<span class="badge-tag" onclick="app.setArchiveTagFilter('${this.escape(t)}')" title="点击筛选此标签">🏷️ ${this.escape(t)}</span>`).join("") +
+              `</div>`;
+          } else {
+            tagsHtml = `<div style="color: var(--text-dim); font-size: 11px; margin-bottom: 2px;">无标签</div>`;
+          }
+          let remarkHtml = "";
+          if (a.remark) {
+            remarkHtml = `<div class="archive-remark" title="${this.escape(a.remark)}">📝 ${this.escape(a.remark)}</div>`;
+          }
+
           tr.innerHTML = `
             <td><strong>${this.escape(a.filename)}</strong></td>
+            <td>${tagsHtml}${remarkHtml}</td>
             <td><code>.${a.format}</code></td>
             <td>${sizeMB} MB</td>
             <td>${a.file_count || 0}</td>
@@ -876,6 +1161,11 @@ const app = {
                 <button class="btn btn-primary btn-sm" onclick="app.viewDiagnosis('${a.id}')">🛡️ 报告</button>
                 <button class="btn btn-secondary btn-sm" title="下载原日志压缩包" onclick="app.downloadArchive('${a.id}')">📥 下载</button>
               ` : ''}
+              ${a.status === 'failed' ? `
+                <button class="btn btn-danger btn-sm" title="查看详细失败原因与解决方案" onclick="app.showArchiveError('${a.id}')">❓ 原因</button>
+                <button class="btn btn-warning btn-sm" title="重新尝试解包与分析" onclick="app.retryArchive('${a.id}')">🔄 重试</button>
+              ` : ''}
+              <button class="btn btn-secondary btn-sm" title="修改标签与备注" onclick="app.openEditArchiveMetaModal('${a.id}')">🏷️ 标记</button>
               <button class="btn btn-danger btn-sm" onclick="app.deleteArchive('${a.id}')">删除</button>
             </td>
           `;
@@ -888,14 +1178,172 @@ const app = {
     renderTable("#table-all-archives tbody", false);
   },
 
+  formatArchiveError(errorMsg) {
+    if (!errorMsg) {
+      return {
+        title: "分析失败",
+        icon: "⚠️",
+        detail: "系统未捕获到具体的异常描述信息。",
+        solution: "建议直接点击“🔄 重新调度分析”，若仍失败请检查后台系统运行日志。"
+      };
+    }
+    const lower = errorMsg.toLowerCase();
+    if (lower.includes("no space left on device") || lower.includes("space left") || lower.includes("disk full") || lower.includes("存储空间不足") || lower.includes("磁盘空间不足")) {
+      return {
+        title: "磁盘存储空间不足",
+        icon: "💾",
+        detail: "目标节点存储磁盘或操作系统根分区已无剩余可用写入空间，无法完成大文件解压缩落盘。",
+        solution: "建议处置方案：\n1. 清理目标节点磁盘无用文件或扩容 LVM 存储逻辑卷（如 lvextend）；\n2. 将日志归档存储路径配置或软链接至大容量物理数据盘（如专属挂载的 SSD/HDD 盘）；\n3. 完成磁盘空间扩充后，直接点击下方“🔄 重新调度分析”一键恢复分析！"
+      };
+    }
+    if (lower.includes("permission denied") || lower.includes("access denied") || lower.includes("权限不足")) {
+      return {
+        title: "磁盘目录写入权限不足",
+        icon: "🔒",
+        detail: "分析进程缺少向目标数据存储目录写入或创建解压文件的系统读写权限。",
+        solution: "建议处置方案：请检查目标节点运行用户的读写权限（如 chown/chmod 数据存储目录）后点击重试。"
+      };
+    }
+    if (lower.includes("connection refused") || lower.includes("timeout") || lower.includes("no route to host") || lower.includes("network") || lower.includes("节点通信")) {
+      return {
+        title: "存储业务节点通信异常/离线",
+        icon: "🌐",
+        detail: "管理节点向分派的 Worker 存储节点发起通信调度时连接超时或被拒绝连接。",
+        solution: "建议处置方案：请检查对应 Worker 节点服务运行状态与端口监听（8081/8082等），确认网络通畅后点击重试。"
+      };
+    }
+    if (lower.includes("unexpected eof") || lower.includes("invalid header") || lower.includes("corrupted") || lower.includes("损坏") || lower.includes("unrecognized archive")) {
+      return {
+        title: "压缩文件损坏或格式不完整",
+        icon: "📦",
+        detail: "日志压缩包在上传传输过程中损坏、截断或解压算法无法识别文件头结构。",
+        solution: "建议处置方案：请使用 tar/gzip 等工具检查原压缩包完整性，重新打包后重新上传。"
+      };
+    }
+    if (lower.includes("killed") || lower.includes("out of memory") || lower.includes("oom")) {
+      return {
+        title: "系统内存耗尽 (OOM Killed)",
+        icon: "⚡",
+        detail: "解压或分析过程占用了过多系统内存被操作系统内核 OOM 保护机制强制终止。",
+        solution: "建议处置方案：提升虚拟机/物理机内存容量，或配置系统 Swap 交换空间后重试。"
+      };
+    }
+    return {
+      title: "解包分析失败",
+      icon: "⚠️",
+      detail: errorMsg.length > 80 ? errorMsg.substring(0, 80) + "..." : errorMsg,
+      solution: "建议处置方案：确认存储与系统运行环境正常后点击“🔄 重新调度分析”，或核对下方底层系统错误输出排查。"
+    };
+  },
+
+  showArchiveError(archiveID) {
+    const a = this.archives.find(item => item.id === archiveID);
+    if (!a) return;
+    const errInfo = this.formatArchiveError(a.error_msg);
+    document.getElementById("archive-error-icon").innerText = errInfo.icon;
+    document.getElementById("archive-error-title").innerText = errInfo.title;
+    document.getElementById("archive-error-detail").innerText = errInfo.detail;
+    document.getElementById("archive-error-solution").innerText = errInfo.solution;
+    document.getElementById("archive-error-meta").innerText = `归档包: ${a.filename} | 存储节点: ${a.storage_node_name || a.assigned_worker || '本地存储'} | 上传时间: ${new Date(a.upload_time).toLocaleString()}`;
+    document.getElementById("archive-error-raw").innerText = a.error_msg || "无底层详细报错信息";
+    this.currentErrorArchiveID = a.id;
+    this.openModal("modal-archive-error");
+  },
+
+  retryArchiveFromModal() {
+    if (this.currentErrorArchiveID) {
+      this.retryArchive(this.currentErrorArchiveID);
+      this.closeModal("modal-archive-error");
+    }
+  },
+
+  async retryArchive(id) {
+    const res = await this.api(`/api/archives/${id}/retry`, "POST");
+    if (res && res.error) {
+      alert("重新调度分析失败: " + res.error);
+      return;
+    }
+    this.loadArchives();
+    setTimeout(() => this.loadArchives(), 2000);
+    setTimeout(() => this.loadArchives(), 5000);
+  },
+
+  filterArchives(val) {
+    this.archiveFilterText = (val || "").trim();
+    const btnClear = document.getElementById("btn-clear-archive-filter");
+    if (btnClear) {
+      btnClear.style.display = this.archiveFilterText ? "inline-block" : "none";
+    }
+    this.renderArchives();
+  },
+
+  clearArchiveFilter() {
+    this.archiveFilterText = "";
+    const input = document.getElementById("archive-filter-input");
+    if (input) input.value = "";
+    const btnClear = document.getElementById("btn-clear-archive-filter");
+    if (btnClear) btnClear.style.display = "none";
+    this.renderArchives();
+  },
+
+  setArchiveTagFilter(tag) {
+    const input = document.getElementById("archive-filter-input");
+    if (input) input.value = tag;
+    this.filterArchives(tag);
+  },
+
+  openEditArchiveMetaModal(id) {
+    const a = this.archives.find(item => item.id === id);
+    if (!a) return;
+    document.getElementById("archive-meta-id").value = a.id;
+    document.getElementById("archive-meta-filename").value = a.filename;
+    document.getElementById("archive-meta-tags").value = (a.tags || []).join(", ");
+    document.getElementById("archive-meta-remark").value = a.remark || "";
+    this.openModal("modal-archive-meta");
+  },
+
+  async submitArchiveMeta() {
+    const id = document.getElementById("archive-meta-id").value;
+    const tagsVal = document.getElementById("archive-meta-tags").value;
+    const remarkVal = document.getElementById("archive-meta-remark").value;
+
+    const res = await this.api(`/api/archives/${id}`, "PUT", {
+      tags: tagsVal,
+      remark: remarkVal
+    });
+
+    if (res && res.error) {
+      alert("更新标签备注失败: " + res.error);
+      return;
+    }
+
+    this.closeModal("modal-archive-meta");
+    this.loadArchives();
+  },
+
   async uploadFile(file) {
     const pBox = document.getElementById("upload-progress-box");
     const pBar = document.getElementById("upload-progress-bar");
     const pPercent = document.getElementById("upload-percent");
     const pName = document.getElementById("upload-filename");
 
+    const onlineWorkers = (this.nodes || []).filter(n => n.role !== "manager" && n.status === "online");
+    if (onlineWorkers.length === 0) {
+      alert("⚠️ 上传失败：当前集群无任何在线可用的业务存储节点！\n\n日志包只能保存在业务存储节点上，严禁存入管理节点系统盘以避免系统盘被占满。\n请先接入并启动业务节点服务后再上传日志。");
+      return;
+    }
+
     const targetNodeSelect = document.getElementById("upload-target-node");
-    const targetNodeID = targetNodeSelect ? targetNodeSelect.value : "manager_primary";
+    const targetNodeID = targetNodeSelect ? targetNodeSelect.value : "auto";
+    if (!targetNodeID || targetNodeID === "manager_primary" || targetNodeID === "local") {
+      alert("⚠️ 上传失败：禁止选择管理节点系统盘存储日志！日志包只能保存在业务存储节点上以避免系统盘被占满。");
+      return;
+    }
+
+    const tagsInput = document.getElementById("upload-tags");
+    const remarkInput = document.getElementById("upload-remark");
+    const tagsVal = tagsInput ? tagsInput.value.trim() : "";
+    const remarkVal = remarkInput ? remarkInput.value.trim() : "";
 
     pBox.style.display = "block";
     pName.innerText = `正在上传: ${file.name} (${(file.size / (1024 * 1024)).toFixed(2)} MB)`;
@@ -905,6 +1353,8 @@ const app = {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("target_node_id", targetNodeID);
+    if (tagsVal) fd.append("tags", tagsVal);
+    if (remarkVal) fd.append("remark", remarkVal);
 
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/archives/upload");
@@ -923,6 +1373,8 @@ const app = {
     xhr.onload = () => {
       pBox.style.display = "none";
       if (xhr.status >= 200 && xhr.status < 300) {
+        if (tagsInput) tagsInput.value = "";
+        if (remarkInput) remarkInput.value = "";
         this.loadArchives();
         // 自动轮询几次以跟进解压与诊断进度
         setTimeout(() => this.loadArchives(), 2000);
@@ -954,14 +1406,31 @@ const app = {
     this.browserFiles = [];
     this.viewerMatches = [];
     this.viewerMatchIndex = -1;
+    this.expandedDirs = new Set();
+    this.fileTreeRoot = null;
+    this.currentTreeFilter = "";
 
     document.getElementById("viewer-filepath").innerText = "请从左侧选择文件...";
     document.getElementById("viewer-content").innerHTML = "";
     document.getElementById("viewer-meta").innerText = "";
     const dlBtn = document.getElementById("btn-download-current-file");
     if (dlBtn) dlBtn.style.display = "none";
-    const moreBtn = document.getElementById("btn-load-more-lines");
-    if (moreBtn) moreBtn.style.display = "none";
+    const statusBadge = document.getElementById("viewer-scroll-status");
+    if (statusBadge) statusBadge.style.display = "none";
+
+    this.viewerStream = {
+      loadedLines: [],
+      baseStartLine: 1,
+      renderedStartIdx: 0,
+      topSpacerHeight: 0,
+      isLoadingMore: false,
+      hasMore: false,
+      totalLines: 0,
+      batchSize: 500,
+      maxDomLines: 1200,
+      pruneThreshold: 400,
+    };
+    this.currentFileLines = [];
 
     const filterInput = document.getElementById("browser-tree-filter");
     if (filterInput) filterInput.value = "";
@@ -985,7 +1454,38 @@ const app = {
       const fileCountEl = document.getElementById("browser-file-count");
       if (fileCountEl) fileCountEl.innerText = this.browserFiles.filter(f => !f.is_directory).length;
 
+      this.fileTreeRoot = this.buildFileTree(this.browserFiles);
+      // 默认展开所有层级目录，便于用户直观浏览全部文件结构
+      this.expandAllTreeDirs(false);
+
+      // 若当前未选中任何文件，默认打开第一个非目录文件，并展开其父目录
+      const firstFile = this.browserFiles.find(f => !f.is_directory);
+      if (firstFile) {
+        this.ensureParentDirsExpanded(firstFile.relative_path);
+      }
+
       this.renderFileTree(archiveID, this.browserFiles);
+
+      if (firstFile) {
+        this.loadFileContent(archiveID, firstFile.relative_path, firstFile.size);
+      }
+
+      // 检查并恢复用户偏好的全屏最大化状态
+      const modal = document.getElementById("modal-file-browser");
+      if (localStorage.getItem("fileBrowserMaximized") === "true") {
+        modal?.classList.add("maximized");
+        const icon = document.getElementById("icon-file-browser-maximize");
+        const btn = document.getElementById("btn-file-browser-maximize");
+        if (icon) icon.innerHTML = "&#x1F5D7;";
+        if (btn) btn.title = "还原窗口大小 (支持双击标题栏还原)";
+      } else {
+        modal?.classList.remove("maximized");
+        const icon = document.getElementById("icon-file-browser-maximize");
+        const btn = document.getElementById("btn-file-browser-maximize");
+        if (icon) icon.innerHTML = "⛶";
+        if (btn) btn.title = "最大化占满浏览器 (支持双击标题栏最大化)";
+      }
+
       this.openModal("modal-file-browser");
     } catch (e) {
       alert("获取文件树失败: " + e.message);
@@ -1012,57 +1512,276 @@ const app = {
     }
   },
 
-  filterFileTree(query) {
-    if (!this.browserFiles) return;
-    const q = (query || "").trim().toLowerCase();
-    if (!q) {
-      this.renderFileTree(this.currentViewingArchiveID, this.browserFiles);
-      return;
+  // 构建目录层级树结构
+  buildFileTree(files) {
+    const root = {
+      name: "",
+      path: "",
+      isDirectory: true,
+      children: {},
+      file: null,
+      totalFiles: 0,
+    };
+
+    (files || []).forEach(f => {
+      const cleanPath = (f.relative_path || "").replace(/^[./\\]+/, "");
+      if (!cleanPath) return;
+
+      const parts = cleanPath.split("/").filter(Boolean);
+      let curr = root;
+      let accPath = "";
+
+      parts.forEach((part, idx) => {
+        accPath = accPath ? `${accPath}/${part}` : part;
+        const isLast = idx === parts.length - 1;
+
+        if (!curr.children[part]) {
+          curr.children[part] = {
+            name: part,
+            path: accPath,
+            isDirectory: isLast ? !!f.is_directory : true,
+            children: {},
+            file: isLast && !f.is_directory ? f : null,
+            totalFiles: 0,
+          };
+        } else if (isLast) {
+          if (!f.is_directory) {
+            curr.children[part].file = f;
+            curr.children[part].isDirectory = false;
+          }
+        }
+        curr = curr.children[part];
+      });
+    });
+
+    function calcTotalFiles(node) {
+      if (!node.isDirectory) return 1;
+      let sum = 0;
+      Object.values(node.children).forEach(child => {
+        sum += calcTotalFiles(child);
+      });
+      node.totalFiles = sum;
+      return sum;
     }
-    const filtered = this.browserFiles.filter(f => f.relative_path.toLowerCase().includes(q));
-    this.renderFileTree(this.currentViewingArchiveID, filtered);
+    calcTotalFiles(root);
+
+    return root;
   },
 
-  renderFileTree(archiveID, files) {
+  // 确保指定文件的所有父层级目录均已展开
+  ensureParentDirsExpanded(filePath) {
+    if (!this.expandedDirs) this.expandedDirs = new Set();
+    const parts = (filePath || "").split("/").filter(Boolean);
+    let acc = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      acc = acc ? `${acc}/${parts[i]}` : parts[i];
+      this.expandedDirs.add(acc);
+    }
+  },
+
+  // 全部展开目录树
+  expandAllTreeDirs(doRender = true) {
+    if (!this.expandedDirs) this.expandedDirs = new Set();
+    if (!this.fileTreeRoot) return;
+    const addDirs = (node) => {
+      if (node.isDirectory && node.path) {
+        this.expandedDirs.add(node.path);
+      }
+      Object.values(node.children || {}).forEach(addDirs);
+    };
+    addDirs(this.fileTreeRoot);
+    if (doRender) {
+      this.renderFileTree(this.currentViewingArchiveID, this.browserFiles, this.currentTreeFilter);
+    }
+  },
+
+  // 全部折叠目录树
+  collapseAllTreeDirs() {
+    if (!this.expandedDirs) this.expandedDirs = new Set();
+    this.expandedDirs.clear();
+    if (this.currentViewingFile && this.currentViewingFile.relPath) {
+      this.ensureParentDirsExpanded(this.currentViewingFile.relPath);
+    }
+    this.renderFileTree(this.currentViewingArchiveID, this.browserFiles, this.currentTreeFilter);
+  },
+
+  // 点击切换单个目录展开/折叠
+  toggleDir(archiveID, dirPath) {
+    if (!this.expandedDirs) this.expandedDirs = new Set();
+    if (this.expandedDirs.has(dirPath)) {
+      this.expandedDirs.delete(dirPath);
+    } else {
+      this.expandedDirs.add(dirPath);
+    }
+    this.renderFileTree(archiveID, this.browserFiles, this.currentTreeFilter);
+  },
+
+  // 过滤目录树（支持文件名和目录名匹配，匹配项父路径自动展开）
+  filterFileTree(query) {
+    this.currentTreeFilter = (query || "").trim();
+    this.renderFileTree(this.currentViewingArchiveID, this.browserFiles, this.currentTreeFilter);
+  },
+
+  // 针对搜索关键字剪枝树结构
+  pruneTree(node, query) {
+    const q = (query || "").toLowerCase();
+    const nameMatches = node.name.toLowerCase().includes(q) || (node.path && node.path.toLowerCase().includes(q));
+
+    if (!node.isDirectory) {
+      return nameMatches ? node : null;
+    }
+
+    const prunedChildren = {};
+    let hasMatchingChild = false;
+
+    Object.entries(node.children).forEach(([key, child]) => {
+      const pruned = this.pruneTree(child, query);
+      if (pruned) {
+        prunedChildren[key] = pruned;
+        hasMatchingChild = true;
+      }
+    });
+
+    if (nameMatches || hasMatchingChild) {
+      if (node.path) {
+        this.expandedDirs.add(node.path);
+      }
+      return {
+        ...node,
+        children: prunedChildren
+      };
+    }
+    return null;
+  },
+
+  // 关键字高亮渲染辅助函数
+  highlightMatch(text, query) {
+    if (!query) return text;
+    const q = this.escapeRegex(query.trim());
+    if (!q) return text;
+    const reg = new RegExp(`(${q})`, "gi");
+    return text.replace(reg, '<mark class="v-match">$1</mark>');
+  },
+
+  // 渲染层级目录树
+  renderFileTree(archiveID, files, filterQuery = "") {
     const container = document.getElementById("file-tree-container");
+    if (!container) return;
     container.innerHTML = "";
 
     if (!files || files.length === 0) {
-      container.innerHTML = `<div style="padding: 16px; color: var(--text-dim); text-align: center; font-size: 12px;">无匹配文件</div>`;
+      container.innerHTML = `<div style="padding: 16px; color: var(--text-dim); text-align: center; font-size: 12px;">无文件列表</div>`;
       return;
     }
 
-    files.forEach(f => {
-      const div = document.createElement("div");
-      div.className = "file-tree-item";
-      if (this.currentViewingFile && this.currentViewingFile.relPath === f.relative_path) {
-        div.classList.add("active");
+    if (!this.fileTreeRoot) {
+      this.fileTreeRoot = this.buildFileTree(files);
+    }
+
+    let displayRoot = this.fileTreeRoot;
+    if (filterQuery) {
+      displayRoot = this.pruneTree(this.fileTreeRoot, filterQuery);
+      if (!displayRoot || Object.keys(displayRoot.children).length === 0) {
+        container.innerHTML = `<div style="padding: 16px; color: var(--text-dim); text-align: center; font-size: 12px;">无匹配文件或目录</div>`;
+        return;
       }
+    }
 
-      const icon = f.is_directory ? "📁" : "📄";
-      const escapedPath = this.escape(f.relative_path);
-      const downloadBtn = !f.is_directory
-        ? `<button class="btn-tree-download" title="下载此文件 (${(f.size/1024).toFixed(1)} KB)" onclick="event.stopPropagation(); app.downloadFile('${archiveID}', '${this.escape(f.relative_path)}')">📥</button>`
-        : '';
-
-      div.innerHTML = `<span>${icon}</span> <span class="file-tree-name" title="${escapedPath}">${escapedPath}</span> ${downloadBtn}`;
-
-      if (!f.is_directory) {
-        div.addEventListener("click", () => {
-          document.querySelectorAll(".file-tree-item").forEach(el => el.classList.remove("active"));
-          div.classList.add("active");
-          this.loadFileContent(archiveID, f.relative_path, f.size);
-        });
+    const sortedChildren = Object.values(displayRoot.children).sort((a, b) => {
+      if (a.isDirectory !== b.isDirectory) {
+        return a.isDirectory ? -1 : 1;
       }
-      container.appendChild(div);
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
     });
 
-    // 若当前未选中任何文件，默认打开第一个非目录文件
-    if (!this.currentViewingFile) {
-      const first = files.find(f => !f.is_directory);
-      if (first) {
-        this.loadFileContent(archiveID, first.relative_path, first.size);
+    sortedChildren.forEach(child => {
+      const el = this.renderTreeNode(archiveID, child, 0, filterQuery);
+      if (el) container.appendChild(el);
+    });
+  },
+
+  // 递归渲染目录或文件树节点
+  renderTreeNode(archiveID, node, depth, filterQuery) {
+    if (node.isDirectory) {
+      const isExpanded = this.expandedDirs.has(node.path);
+      const folderWrapper = document.createElement("div");
+      folderWrapper.className = "file-tree-group";
+
+      const row = document.createElement("div");
+      row.className = `file-tree-item file-tree-folder ${isExpanded ? 'expanded' : ''}`;
+      row.style.paddingLeft = `${8 + depth * 14}px`;
+
+      const arrow = `<span class="tree-arrow">${isExpanded ? '▼' : '▶'}</span>`;
+      const icon = `<span class="tree-icon">${isExpanded ? '📂' : '📁'}</span>`;
+      const nameHtml = this.highlightMatch(this.escape(node.name), filterQuery);
+      const countBadge = `<span class="tree-badge">${node.totalFiles}</span>`;
+
+      row.innerHTML = `${arrow}${icon}<span class="file-tree-name" title="${this.escape(node.path)}">${nameHtml}</span>${countBadge}`;
+
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.toggleDir(archiveID, node.path);
+      });
+
+      folderWrapper.appendChild(row);
+
+      if (isExpanded) {
+        const childrenContainer = document.createElement("div");
+        childrenContainer.className = "file-tree-children";
+
+        const sortedChildren = Object.values(node.children).sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) {
+            return a.isDirectory ? -1 : 1;
+          }
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        });
+
+        sortedChildren.forEach(child => {
+          const childEl = this.renderTreeNode(archiveID, child, depth + 1, filterQuery);
+          if (childEl) {
+            childrenContainer.appendChild(childEl);
+          }
+        });
+        folderWrapper.appendChild(childrenContainer);
       }
+
+      return folderWrapper;
+    } else {
+      const fileRow = document.createElement("div");
+      fileRow.className = "file-tree-item file-tree-file";
+      fileRow.style.paddingLeft = `${8 + depth * 14}px`;
+      if (this.currentViewingFile && this.currentViewingFile.relPath === node.path) {
+        fileRow.classList.add("active");
+      }
+      fileRow.dataset.path = node.path;
+
+      const spacer = `<span class="tree-spacer"></span>`;
+      const ext = node.name.split('.').pop().toLowerCase();
+      let icon = "📄";
+      if (["conf", "cfg", "ini", "yaml", "yml", "json", "toml", "xml"].includes(ext)) {
+        icon = "⚙️";
+      } else if (["log", "txt", "out", "err"].includes(ext)) {
+        icon = "📝";
+      } else if (["tar", "gz", "zip", "bz2", "xz"].includes(ext)) {
+        icon = "📦";
+      }
+
+      const nameHtml = this.highlightMatch(this.escape(node.name), filterQuery);
+      const f = node.file;
+      const sizeStr = f && f.size > 0 ? (f.size > 1024 * 1024 ? `${(f.size / (1024 * 1024)).toFixed(1)} MB` : `${(f.size / 1024).toFixed(1)} KB`) : '';
+      const sizeBadge = sizeStr ? `<span class="tree-size" style="font-size: 10px; color: var(--text-dim); margin-right: 2px;">${sizeStr}</span>` : '';
+
+      const downloadBtn = f ? `<button class="btn-tree-download" title="下载此文件 (${sizeStr})" onclick="event.stopPropagation(); app.downloadFile('${archiveID}', '${this.escape(node.path)}')">📥</button>` : '';
+
+      fileRow.innerHTML = `${spacer}<span class="tree-icon">${icon}</span><span class="file-tree-name" title="${this.escape(node.path)}">${nameHtml}</span>${sizeBadge}${downloadBtn}`;
+
+      fileRow.addEventListener("click", () => {
+        document.querySelectorAll(".file-tree-file").forEach(el => el.classList.remove("active"));
+        fileRow.classList.add("active");
+        this.loadFileContent(archiveID, node.path, f ? f.size : 0);
+      });
+
+      return fileRow;
     }
   },
 
@@ -1142,6 +1861,8 @@ const app = {
         `;
 
         item.addEventListener("click", () => {
+          this.ensureParentDirsExpanded(h.file_path);
+          this.renderFileTree(archiveID, this.browserFiles, this.currentTreeFilter);
           this.loadFileContent(archiveID, h.file_path, 0, h.line_number, keyword);
         });
 
@@ -1152,6 +1873,8 @@ const app = {
     }
   },
 
+  // ================= 极速流式日志查看器 (无限下拉触底加载 + DOM滑动窗口防爆内存) =================
+
   // 加载具体文件内容 (支持跳转至指定行及高亮搜索词)
   async loadFileContent(archiveID, relPath, size = 0, targetLine = 0, highlightKeyword = "", startLine = 1, limit = 500) {
     if (targetLine > 0) {
@@ -1160,16 +1883,43 @@ const app = {
     }
 
     this.currentViewingFile = { archiveID, relPath, size };
-    this.currentFileLines = [];
-    this.currentFileStartLine = startLine;
-    this.currentFileLimit = limit;
     this.viewerMatches = [];
     this.viewerMatchIndex = -1;
 
+    // 初始化流式与滑动窗口状态
+    this.viewerStream = {
+      loadedLines: [],          // 所有已加载的行纯文本
+      baseStartLine: startLine, // loadedLines[0] 对应的实际文件行号
+      renderedStartIdx: 0,      // DOM 当前第一个子节点在 loadedLines 中的下标
+      topSpacerHeight: 0,       // 顶部被剪枝行的高度占位 (px)
+      isLoadingMore: false,
+      hasMore: false,
+      totalLines: 0,
+      batchSize: 500,
+      maxDomLines: 1200,        // DOM 容纳的最大行数，超过则剪枝顶部
+      pruneThreshold: 400,      // 每次剪枝或恢复的批次大小
+    };
+    this.currentFileLines = [];
+
     const viewer = document.getElementById("viewer-content");
-    viewer.innerHTML = '<div style="padding: 20px 16px; color: var(--text-muted);">正在读取日志文件内容...</div>';
+    viewer.innerHTML = `
+      <div id="v-top-spacer" style="height: 0px; width: 100%; flex-shrink: 0;"></div>
+      <div id="v-lines-container" style="display: flex; flex-direction: column; width: 100%;"></div>
+      <div id="v-bottom-sentinel" class="v-sentinel">
+        <span class="spinner-border spinner-border-sm" style="margin-right: 6px;"></span>正在读取日志文件内容...
+      </div>
+    `;
+    viewer.scrollTop = 0;
+
     document.getElementById("viewer-filepath").innerText = relPath;
     document.getElementById("viewer-meta").innerText = size > 0 ? `大小: ${(size / 1024).toFixed(1)} KB` : "";
+
+    const statusBadge = document.getElementById("viewer-scroll-status");
+    if (statusBadge) {
+      statusBadge.style.display = "inline-flex";
+      statusBadge.className = "badge badge-info";
+      statusBadge.innerText = "流式载入中...";
+    }
 
     const dlBtn = document.getElementById("btn-download-current-file");
     if (dlBtn) {
@@ -1181,21 +1931,58 @@ const app = {
     try {
       const res = await this.api(`/api/archives/${archiveID}/file-content?path=${encodeURIComponent(relPath)}&start_line=${startLine}&limit=${limit}`);
       if (!res.ok) {
-        viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--danger);">读取文件失败: ${await res.text()}</div>`;
+        const sentinel = document.getElementById("v-bottom-sentinel");
+        if (sentinel) sentinel.innerHTML = `<span style="color: var(--danger);">读取文件失败: ${await res.text()}</span>`;
+        if (statusBadge) statusBadge.style.display = "none";
         return;
       }
       const data = await res.json();
-      this.currentFileLines = data.lines || [];
-      this.currentFileHasMore = !!data.has_more;
+      const lines = data.lines || [];
+      this.viewerStream.loadedLines = lines;
+      this.viewerStream.hasMore = !!data.has_more;
+      this.currentFileLines = lines;
 
-      document.getElementById("viewer-meta").innerText = `已展示 ${this.currentFileStartLine} ~ ${this.currentFileStartLine + this.currentFileLines.length - 1} 行${data.has_more ? ' (更多行可展开)' : ' (全文件)'}`;
+      // 提取文件总行数
+      const fileItem = this.browserFiles ? this.browserFiles.find(f => f.relative_path === relPath) : null;
+      this.viewerStream.totalLines = (fileItem && fileItem.line_count > 0) ? fileItem.line_count : (data.total_lines || 0);
 
-      const moreBtn = document.getElementById("btn-load-more-lines");
-      if (moreBtn) {
-        moreBtn.style.display = data.has_more ? "inline-flex" : "none";
+      const container = document.getElementById("v-lines-container");
+      if (lines.length === 0) {
+        const sentinel = document.getElementById("v-bottom-sentinel");
+        if (sentinel) sentinel.innerHTML = `<span style="color: var(--text-dim);">该日志文件为空</span>`;
+        if (statusBadge) statusBadge.style.display = "none";
+        return;
       }
 
-      this.renderViewerLines(targetLine);
+      const fragment = document.createDocumentFragment();
+      for (let i = 0; i < lines.length; i++) {
+        const lineNo = this.viewerStream.baseStartLine + i;
+        const lineDiv = this.createLineElement(lineNo, lines[i], targetLine);
+        fragment.appendChild(lineDiv);
+      }
+      container.appendChild(fragment);
+
+      this.updateViewerStatusUI();
+
+      // 更新左侧目录树中的高亮选中状态与视口定位
+      document.querySelectorAll(".file-tree-file").forEach(el => {
+        if (el.dataset.path === relPath) {
+          el.classList.add("active");
+          el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } else {
+          el.classList.remove("active");
+        }
+      });
+
+      // 如果指定了目标行，平滑滚动定位
+      if (targetLine > 0) {
+        setTimeout(() => {
+          const targetEl = document.getElementById(`v-line-${targetLine}`);
+          if (targetEl) {
+            targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
+          }
+        }, 60);
+      }
 
       // 如果有指定的高亮关键词，自动填充至文件内搜索栏并触发匹配
       if (highlightKeyword) {
@@ -1206,90 +1993,220 @@ const app = {
         }
       }
     } catch (e) {
-      viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--danger);">读取异常: ${e.message}</div>`;
+      const sentinel = document.getElementById("v-bottom-sentinel");
+      if (sentinel) sentinel.innerHTML = `<span style="color: var(--danger);">读取异常: ${e.message}</span>`;
+      if (statusBadge) statusBadge.style.display = "none";
     }
   },
 
-  // 渲染查看器中的行
-  renderViewerLines(targetLine = 0) {
-    const viewer = document.getElementById("viewer-content");
-    viewer.innerHTML = "";
+  // 创建单行 DOM 节点
+  createLineElement(lineNo, text, highlightLine = 0) {
+    const lineDiv = document.createElement("div");
+    lineDiv.className = "v-line";
+    lineDiv.id = `v-line-${lineNo}`;
+    lineDiv.dataset.line = lineNo;
+    if (highlightLine > 0 && lineNo === highlightLine) {
+      lineDiv.classList.add("v-line-highlight");
+    }
+    lineDiv.innerHTML = `<span class="v-line-no">${lineNo}</span><span class="v-line-text">${this.escape(text)}</span>`;
+    return lineDiv;
+  },
 
-    if (!this.currentFileLines || this.currentFileLines.length === 0) {
-      viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--text-dim); text-align: center;">该日志文件为空</div>`;
-      return;
+  // 更新查看器状态栏信息（已载入行数统计与触底流式状态）
+  updateViewerStatusUI() {
+    if (!this.viewerStream) return;
+    const { baseStartLine, loadedLines, hasMore, totalLines, renderedStartIdx } = this.viewerStream;
+    const container = document.getElementById("v-lines-container");
+    const domCount = container ? container.children.length : 0;
+    const startNo = baseStartLine + renderedStartIdx;
+    const endNo = domCount > 0 ? (startNo + domCount - 1) : startNo;
+    const totalLoaded = loadedLines.length;
+
+    const totalStr = totalLines > 0 ? ` (共 ${totalLines.toLocaleString()} 行)` : '';
+    const metaEl = document.getElementById("viewer-meta");
+    if (metaEl) {
+      metaEl.innerText = `已载入 ${totalLoaded.toLocaleString()} 行 · 视口第 ${startNo.toLocaleString()} ~ ${endNo.toLocaleString()} 行${totalStr}`;
     }
 
-    const fragment = document.createDocumentFragment();
-    this.currentFileLines.forEach((text, idx) => {
-      const lineNo = this.currentFileStartLine + idx;
-      const lineDiv = document.createElement("div");
-      lineDiv.className = "v-line";
-      lineDiv.id = `v-line-${lineNo}`;
-      lineDiv.dataset.line = lineNo;
+    const statusBadge = document.getElementById("viewer-scroll-status");
+    const sentinel = document.getElementById("v-bottom-sentinel");
 
-      if (targetLine > 0 && lineNo === targetLine) {
-        lineDiv.classList.add("v-line-highlight");
+    if (!hasMore) {
+      if (statusBadge) {
+        statusBadge.style.display = "inline-flex";
+        statusBadge.className = "badge badge-success";
+        statusBadge.innerText = "已加载全部内容";
       }
-
-      lineDiv.innerHTML = `<span class="v-line-no">${lineNo}</span><span class="v-line-text">${this.escape(text)}</span>`;
-      fragment.appendChild(lineDiv);
-    });
-
-    viewer.appendChild(fragment);
-
-    // 平滑滚动定位到目标行
-    if (targetLine > 0) {
-      setTimeout(() => {
-        const targetEl = document.getElementById(`v-line-${targetLine}`);
-        if (targetEl) {
-          targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
-        }
-      }, 80);
+      if (sentinel) {
+        sentinel.innerHTML = `<span style="color: var(--text-dim); font-size: 11px;">✔ 已到达尾部，全部日志已就绪 (共 ${totalLoaded.toLocaleString()} 行)</span>`;
+      }
+    } else {
+      if (statusBadge) {
+        statusBadge.style.display = "inline-flex";
+        statusBadge.className = "badge badge-primary";
+        statusBadge.innerText = "下拉自动加载更多";
+      }
+      if (sentinel) {
+        sentinel.innerHTML = `<span style="color: var(--text-muted); font-size: 11px;">⬇ 下拉至尾部自动加载更多日志...</span>`;
+      }
     }
   },
 
-  // 加载更多文件行
-  async loadMoreFileLines() {
-    if (!this.currentViewingFile) return;
-    const moreBtn = document.getElementById("btn-load-more-lines");
-    if (moreBtn) moreBtn.disabled = true;
+  // 滚动事件：触底自动加载 + 滑动窗口 DOM 剪枝与恢复 (杜绝内存占满)
+  onViewerScroll() {
+    const viewer = document.getElementById("viewer-content");
+    if (!viewer || !this.viewerStream || !this.currentViewingFile) return;
 
-    const currentLen = this.currentFileLines.length;
-    const nextStart = this.currentFileStartLine + currentLen;
-    const limit = 500;
+    const { scrollTop, clientHeight, scrollHeight } = viewer;
+
+    // 1. 触底检测与自动拉取下一批日志
+    if (scrollHeight - (scrollTop + clientHeight) < 350) {
+      if (!this.viewerStream.isLoadingMore && this.viewerStream.hasMore) {
+        this.loadNextBatchLines();
+      }
+    }
+
+    // 2. 向下滚动过多时的 DOM 剪枝（严格限制 DOM 节点总数 <= 1200，杜绝 DOM 膨胀占用内存）
+    const container = document.getElementById("v-lines-container");
+    if (container && container.children.length > this.viewerStream.maxDomLines) {
+      this.pruneTopDomLines();
+    }
+
+    // 3. 向上滚动接近顶部时的 DOM 恢复（无缝回填已剪枝行）
+    if (scrollTop < 250 && this.viewerStream.renderedStartIdx > 0) {
+      this.restoreTopDomLines();
+    }
+  },
+
+  // 加载下一批日志行
+  async loadNextBatchLines() {
+    if (!this.viewerStream || this.viewerStream.isLoadingMore || !this.viewerStream.hasMore) return;
+    this.viewerStream.isLoadingMore = true;
+
+    const sentinel = document.getElementById("v-bottom-sentinel");
+    if (sentinel) {
+      sentinel.innerHTML = `<span class="spinner-border spinner-border-sm" style="margin-right: 6px;"></span>正在自动加载更多日志...`;
+    }
+
+    const nextStartLine = this.viewerStream.baseStartLine + this.viewerStream.loadedLines.length;
+    const limit = this.viewerStream.batchSize;
 
     try {
-      const res = await this.api(`/api/archives/${this.currentViewingFile.archiveID}/file-content?path=${encodeURIComponent(this.currentViewingFile.relPath)}&start_line=${nextStart}&limit=${limit}`);
-      if (!res.ok) return;
+      const res = await this.api(`/api/archives/${this.currentViewingFile.archiveID}/file-content?path=${encodeURIComponent(this.currentViewingFile.relPath)}&start_line=${nextStartLine}&limit=${limit}`);
+      if (!res.ok) {
+        if (sentinel) sentinel.innerHTML = `<span style="color: var(--danger);">加载失败: ${await res.text()}</span>`;
+        return;
+      }
       const data = await res.json();
       const newLines = data.lines || [];
+      this.viewerStream.hasMore = !!data.has_more;
+
       if (newLines.length > 0) {
-        const viewer = document.getElementById("viewer-content");
+        const container = document.getElementById("v-lines-container");
         const fragment = document.createDocumentFragment();
-        newLines.forEach((text, idx) => {
-          const lineNo = nextStart + idx;
-          const lineDiv = document.createElement("div");
-          lineDiv.className = "v-line";
-          lineDiv.id = `v-line-${lineNo}`;
-          lineDiv.dataset.line = lineNo;
-          lineDiv.innerHTML = `<span class="v-line-no">${lineNo}</span><span class="v-line-text">${this.escape(text)}</span>`;
+
+        for (let i = 0; i < newLines.length; i++) {
+          const lineNo = nextStartLine + i;
+          const lineDiv = this.createLineElement(lineNo, newLines[i], 0);
           fragment.appendChild(lineDiv);
-        });
-        viewer.appendChild(fragment);
+        }
+        container.appendChild(fragment);
 
-        this.currentFileLines = this.currentFileLines.concat(newLines);
-        this.currentFileHasMore = !!data.has_more;
-        document.getElementById("viewer-meta").innerText = `已展示 ${this.currentFileStartLine} ~ ${this.currentFileStartLine + this.currentFileLines.length - 1} 行${data.has_more ? ' (更多行可展开)' : ' (全文件)'}`;
-        if (moreBtn) moreBtn.style.display = data.has_more ? "inline-flex" : "none";
+        this.viewerStream.loadedLines = this.viewerStream.loadedLines.concat(newLines);
+        this.currentFileLines = this.viewerStream.loadedLines;
 
-        // 重新同步搜索高亮
-        this.onViewerSearchInput();
+        // 剪枝检查
+        if (container.children.length > this.viewerStream.maxDomLines) {
+          this.pruneTopDomLines();
+        }
+
+        this.updateViewerStatusUI();
+
+        // 若有活跃搜索词，更新高亮
+        if (document.getElementById("viewer-search-kw")?.value) {
+          this.onViewerSearchInput();
+        }
       } else {
-        if (moreBtn) moreBtn.style.display = "none";
+        this.viewerStream.hasMore = false;
+        this.updateViewerStatusUI();
       }
+    } catch (e) {
+      if (sentinel) sentinel.innerHTML = `<span style="color: var(--danger);">自动加载异常: ${e.message}</span>`;
     } finally {
-      if (moreBtn) moreBtn.disabled = false;
+      this.viewerStream.isLoadingMore = false;
+    }
+  },
+
+  // 剪除顶部多余 DOM 节点并增加占位垫片高度（内存保护）
+  pruneTopDomLines() {
+    const container = document.getElementById("v-lines-container");
+    const topSpacer = document.getElementById("v-top-spacer");
+    const viewer = document.getElementById("viewer-content");
+    if (!container || !topSpacer || !viewer) return;
+
+    const pruneCount = Math.min(this.viewerStream.pruneThreshold, container.children.length - 400);
+    if (pruneCount <= 0) return;
+
+    let removedHeight = 0;
+    for (let i = 0; i < pruneCount; i++) {
+      const child = container.children[i];
+      removedHeight += child.offsetHeight;
+    }
+
+    for (let i = 0; i < pruneCount; i++) {
+      container.removeChild(container.firstChild);
+    }
+
+    this.viewerStream.renderedStartIdx += pruneCount;
+    this.viewerStream.topSpacerHeight += removedHeight;
+    topSpacer.style.height = `${this.viewerStream.topSpacerHeight}px`;
+
+    this.updateViewerStatusUI();
+  },
+
+  // 向上滚动时恢复顶部剪除的 DOM 节点
+  restoreTopDomLines() {
+    const container = document.getElementById("v-lines-container");
+    const topSpacer = document.getElementById("v-top-spacer");
+    const viewer = document.getElementById("viewer-content");
+    if (!container || !topSpacer || !viewer || this.viewerStream.renderedStartIdx <= 0) return;
+
+    const restoreCount = Math.min(this.viewerStream.pruneThreshold, this.viewerStream.renderedStartIdx);
+    if (restoreCount <= 0) return;
+
+    const newStartIdx = this.viewerStream.renderedStartIdx - restoreCount;
+    const fragment = document.createDocumentFragment();
+
+    for (let i = 0; i < restoreCount; i++) {
+      const idx = newStartIdx + i;
+      const lineNo = this.viewerStream.baseStartLine + idx;
+      const text = this.viewerStream.loadedLines[idx];
+      const lineDiv = this.createLineElement(lineNo, text, 0);
+      fragment.appendChild(lineDiv);
+    }
+
+    container.insertBefore(fragment, container.firstChild);
+
+    let restoredHeight = 0;
+    for (let i = 0; i < restoreCount; i++) {
+      restoredHeight += container.children[i].offsetHeight;
+    }
+
+    this.viewerStream.renderedStartIdx = newStartIdx;
+    this.viewerStream.topSpacerHeight = Math.max(0, this.viewerStream.topSpacerHeight - restoredHeight);
+    topSpacer.style.height = `${this.viewerStream.topSpacerHeight}px`;
+
+    // 补偿滚动高度，视觉上无任何闪烁跳跃
+    viewer.scrollTop += restoredHeight;
+
+    this.updateViewerStatusUI();
+
+    // 如果下方节点过多，剪枝底部节点
+    if (container.children.length > this.viewerStream.maxDomLines + 200) {
+      const excess = container.children.length - this.viewerStream.maxDomLines;
+      for (let k = 0; k < excess; k++) {
+        container.removeChild(container.lastChild);
+      }
     }
   },
 
@@ -1306,12 +2223,16 @@ const app = {
     this.viewerMatches = [];
     this.viewerMatchIndex = -1;
 
-    // 先重置所有文本为原始纯文本
-    const lines = document.querySelectorAll("#viewer-content .v-line");
-    lines.forEach((lineEl, idx) => {
+    // 先重置当前 DOM 节点的文本为原始纯文本
+    const lines = document.querySelectorAll("#v-lines-container .v-line");
+    lines.forEach((lineEl) => {
+      const lineNo = parseInt(lineEl.dataset.line, 10);
       const textSpan = lineEl.querySelector(".v-line-text");
-      if (textSpan && this.currentFileLines[idx] !== undefined) {
-        textSpan.innerText = this.currentFileLines[idx];
+      if (textSpan && this.viewerStream) {
+        const rawIdx = lineNo - this.viewerStream.baseStartLine;
+        if (rawIdx >= 0 && this.viewerStream.loadedLines[rawIdx] !== undefined) {
+          textSpan.innerText = this.viewerStream.loadedLines[rawIdx];
+        }
       }
     });
 
@@ -1329,10 +2250,12 @@ const app = {
       return;
     }
 
-    // 遍历 DOM 文本替换高亮
+    // 遍历当前 DOM 文本替换高亮
     let matchTotal = 0;
-    lines.forEach((lineEl, idx) => {
-      const raw = this.currentFileLines[idx];
+    lines.forEach((lineEl) => {
+      const lineNo = parseInt(lineEl.dataset.line, 10);
+      const rawIdx = lineNo - this.viewerStream.baseStartLine;
+      const raw = this.viewerStream.loadedLines[rawIdx];
       if (!raw || !reg.test(raw)) return;
       reg.lastIndex = 0; // 重置正则索引
 
@@ -1347,7 +2270,7 @@ const app = {
     });
 
     // 收集所有 mark
-    this.viewerMatches = Array.from(document.querySelectorAll("#viewer-content mark.v-match"));
+    this.viewerMatches = Array.from(document.querySelectorAll("#v-lines-container mark.v-match"));
 
     if (this.viewerMatches.length > 0) {
       this.viewerMatchIndex = 0;
@@ -1403,7 +2326,7 @@ const app = {
       targetEl.classList.add("v-line-highlight");
       targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
     } else if (this.currentViewingFile) {
-      // 若当前行未在已渲染窗口中，从服务端加载包含该行的窗口
+      // 若当前行未在已渲染视口中，从服务端加载以该行为中心的新窗口
       this.loadFileContent(this.currentViewingFile.archiveID, this.currentViewingFile.relPath, 0, lineNo, "");
     }
   },
@@ -1411,6 +2334,8 @@ const app = {
   // 跨页面或从搜索结果中打开日志查看器并直达指定行
   async openViewerAndJump(archiveID, relPath, lineNo, keyword = "") {
     await this.viewFiles(archiveID);
+    this.ensureParentDirsExpanded(relPath);
+    this.renderFileTree(archiveID, this.browserFiles, this.currentTreeFilter);
     this.loadFileContent(archiveID, relPath, 0, lineNo, keyword);
   },
 
@@ -1545,7 +2470,8 @@ const app = {
     sel.innerHTML = '<option value="">-- 请选择日志包 --</option>';
     this.archives.forEach(a => {
       if (a.status === "ready") {
-        sel.innerHTML += `<option value="${a.id}">${this.escape(a.filename)} (${(a.size / (1024 * 1024)).toFixed(1)} MB)</option>`;
+        const tagText = a.tags && a.tags.length > 0 ? ` [${a.tags.join(", ")}]` : "";
+        sel.innerHTML += `<option value="${a.id}">${this.escape(a.filename)}${this.escape(tagText)} (${(a.size / (1024 * 1024)).toFixed(1)} MB)</option>`;
       }
     });
   },
@@ -1671,18 +2597,25 @@ const app = {
     this.rules.forEach(r => {
       const tr = document.createElement("tr");
       const sevClass = r.severity.toLowerCase();
+      const pathScope = r.file_path_pattern 
+        ? `<code style="font-size: 11px; color: #38bdf8; background: rgba(56, 189, 248, 0.1); padding: 2px 6px; border-radius: 4px;">${this.escape(r.file_path_pattern)}</code>`
+        : `<span class="badge badge-muted">全部日志</span>`;
 
       tr.innerHTML = `
         <td><strong>${this.escape(r.name)}</strong></td>
         <td><span class="badge badge-info">${r.storage_type}</span></td>
         <td><span class="badge badge-${sevClass}">${r.severity}</span></td>
         <td><code style="font-size: 11px;">${this.escape(r.pattern)}</code></td>
+        <td>${pathScope}</td>
         <td><span class="badge badge-muted">${r.is_regex ? "正则" : "关键词"}</span></td>
-        <td style="max-width: 320px; font-size: 12px; color: var(--text-muted);">${this.escape(r.suggestion)}</td>
+        <td style="max-width: 300px; font-size: 12px; color: var(--text-muted);">${this.escape(r.suggestion)}</td>
         <td><span class="badge ${r.enabled ? "badge-success" : "badge-muted"}">${r.enabled ? "已启用" : "已禁用"}</span></td>
         <td>
           ${this.currentUser?.role === "admin" ? `
-            <button class="btn btn-danger btn-sm" onclick="app.deleteRule('${r.id}')">删除</button>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-secondary btn-sm" onclick="app.openEditRuleModal('${r.id}')">编辑</button>
+              <button class="btn btn-danger btn-sm" onclick="app.deleteRule('${r.id}')">删除</button>
+            </div>
           ` : '-'}
         </td>
       `;
@@ -1691,33 +2624,60 @@ const app = {
   },
 
   openCreateRuleModal() {
+    document.getElementById("rule-id").value = "";
     document.getElementById("rule-name").value = "";
+    document.getElementById("rule-storage").value = "Ceph";
+    document.getElementById("rule-severity").value = "FATAL";
     document.getElementById("rule-pattern").value = "";
+    document.getElementById("rule-is-regex").checked = true;
+    document.getElementById("rule-file-path-pattern").value = "";
     document.getElementById("rule-desc").value = "";
     document.getElementById("rule-suggestion").value = "";
     this.openModal("modal-rule");
   },
 
+  openEditRuleModal(id) {
+    const r = this.rules.find(item => item.id === id);
+    if (!r) return;
+    document.getElementById("rule-id").value = r.id;
+    document.getElementById("rule-name").value = r.name || "";
+    document.getElementById("rule-storage").value = r.storage_type || "Generic";
+    document.getElementById("rule-severity").value = r.severity || "CRITICAL";
+    document.getElementById("rule-pattern").value = r.pattern || "";
+    document.getElementById("rule-is-regex").checked = !!r.is_regex;
+    document.getElementById("rule-file-path-pattern").value = r.file_path_pattern || "";
+    document.getElementById("rule-desc").value = r.description || "";
+    document.getElementById("rule-suggestion").value = r.suggestion || "";
+    this.openModal("modal-rule");
+  },
+
   async submitRule() {
+    const id = document.getElementById("rule-id").value.trim();
     const name = document.getElementById("rule-name").value.trim();
     const storageType = document.getElementById("rule-storage").value;
     const severity = document.getElementById("rule-severity").value;
     const pattern = document.getElementById("rule-pattern").value.trim();
     const isRegex = document.getElementById("rule-is-regex").checked;
+    const filePathPattern = document.getElementById("rule-file-path-pattern").value.trim();
     const desc = document.getElementById("rule-desc").value.trim();
     const sugg = document.getElementById("rule-suggestion").value.trim();
 
     try {
-      const res = await this.api("/api/rules", "POST", {
+      const payload = {
         name,
         storage_type: storageType,
         severity,
         pattern,
         is_regex: isRegex,
+        file_path_pattern: filePathPattern,
         description: desc,
         suggestion: sugg,
         enabled: true,
-      });
+      };
+
+      const url = id ? `/api/rules/${id}` : "/api/rules";
+      const method = id ? "PUT" : "POST";
+      const res = await this.api(url, method, payload);
       if (!res.ok) throw new Error(await res.text());
       this.closeModal("modal-rule");
       this.loadRules();
@@ -1953,6 +2913,24 @@ const app = {
 
   closeModal(id) {
     document.getElementById(id).classList.remove("active");
+  },
+
+  // 切换日志浏览窗口最大化/还原 (占满浏览器)
+  toggleFileBrowserMaximize() {
+    const modal = document.getElementById("modal-file-browser");
+    if (!modal) return;
+    const isMax = modal.classList.toggle("maximized");
+    const icon = document.getElementById("icon-file-browser-maximize");
+    const btn = document.getElementById("btn-file-browser-maximize");
+    if (isMax) {
+      if (icon) icon.innerHTML = "&#x1F5D7;"; // 🗗 还原图标
+      if (btn) btn.title = "还原窗口大小 (支持双击标题栏还原)";
+      localStorage.setItem("fileBrowserMaximized", "true");
+    } else {
+      if (icon) icon.innerHTML = "⛶"; // ⛶ 最大化图标
+      if (btn) btn.title = "最大化占满浏览器 (支持双击标题栏最大化)";
+      localStorage.setItem("fileBrowserMaximized", "false");
+    }
   },
 
   escape(str) {
