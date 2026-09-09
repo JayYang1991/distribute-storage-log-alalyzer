@@ -951,12 +951,28 @@ const app = {
   async viewFiles(archiveID) {
     this.currentViewingArchiveID = archiveID;
     this.currentViewingFile = null;
-    document.getElementById("viewer-filepath").innerText = "请从左侧选择文件...";
-    document.getElementById("viewer-content").innerText = "";
-    document.getElementById("viewer-meta").innerText = "";
+    this.browserFiles = [];
+    this.viewerMatches = [];
+    this.viewerMatchIndex = -1;
 
+    document.getElementById("viewer-filepath").innerText = "请从左侧选择文件...";
+    document.getElementById("viewer-content").innerHTML = "";
+    document.getElementById("viewer-meta").innerText = "";
     const dlBtn = document.getElementById("btn-download-current-file");
     if (dlBtn) dlBtn.style.display = "none";
+    const moreBtn = document.getElementById("btn-load-more-lines");
+    if (moreBtn) moreBtn.style.display = "none";
+
+    const filterInput = document.getElementById("browser-tree-filter");
+    if (filterInput) filterInput.value = "";
+    const searchKw = document.getElementById("archive-search-keyword");
+    if (searchKw) searchKw.value = "";
+    const searchSummary = document.getElementById("archive-search-summary");
+    if (searchSummary) searchSummary.style.display = "none";
+    const searchResults = document.getElementById("archive-search-results");
+    if (searchResults) searchResults.innerHTML = '<div style="text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 12px;">输入关键词并在当前日志压缩包内执行全局搜索</div>';
+
+    this.switchBrowserTab("tree");
 
     try {
       const res = await this.api(`/api/archives/${archiveID}/files`);
@@ -965,20 +981,63 @@ const app = {
         return;
       }
       const files = await res.json();
-      this.renderFileTree(archiveID, files);
+      this.browserFiles = files || [];
+      const fileCountEl = document.getElementById("browser-file-count");
+      if (fileCountEl) fileCountEl.innerText = this.browserFiles.filter(f => !f.is_directory).length;
+
+      this.renderFileTree(archiveID, this.browserFiles);
       this.openModal("modal-file-browser");
     } catch (e) {
       alert("获取文件树失败: " + e.message);
     }
   },
 
+  switchBrowserTab(tab) {
+    const btnTree = document.getElementById("tab-btn-tree");
+    const btnSearch = document.getElementById("tab-btn-search");
+    const tabTree = document.getElementById("browser-tab-tree");
+    const tabSearch = document.getElementById("browser-tab-search");
+
+    if (tab === "search") {
+      btnTree?.classList.remove("active");
+      btnSearch?.classList.add("active");
+      if (tabTree) tabTree.style.display = "none";
+      if (tabSearch) tabSearch.style.display = "flex";
+      setTimeout(() => document.getElementById("archive-search-keyword")?.focus(), 50);
+    } else {
+      btnSearch?.classList.remove("active");
+      btnTree?.classList.add("active");
+      if (tabSearch) tabSearch.style.display = "none";
+      if (tabTree) tabTree.style.display = "flex";
+    }
+  },
+
+  filterFileTree(query) {
+    if (!this.browserFiles) return;
+    const q = (query || "").trim().toLowerCase();
+    if (!q) {
+      this.renderFileTree(this.currentViewingArchiveID, this.browserFiles);
+      return;
+    }
+    const filtered = this.browserFiles.filter(f => f.relative_path.toLowerCase().includes(q));
+    this.renderFileTree(this.currentViewingArchiveID, filtered);
+  },
+
   renderFileTree(archiveID, files) {
     const container = document.getElementById("file-tree-container");
     container.innerHTML = "";
 
+    if (!files || files.length === 0) {
+      container.innerHTML = `<div style="padding: 16px; color: var(--text-dim); text-align: center; font-size: 12px;">无匹配文件</div>`;
+      return;
+    }
+
     files.forEach(f => {
       const div = document.createElement("div");
       div.className = "file-tree-item";
+      if (this.currentViewingFile && this.currentViewingFile.relPath === f.relative_path) {
+        div.classList.add("active");
+      }
 
       const icon = f.is_directory ? "📁" : "📄";
       const escapedPath = this.escape(f.relative_path);
@@ -998,19 +1057,119 @@ const app = {
       container.appendChild(div);
     });
 
-    // 默认打开第一个文件
-    const first = files.find(f => !f.is_directory);
-    if (first) {
-      this.loadFileContent(archiveID, first.relative_path, first.size);
+    // 若当前未选中任何文件，默认打开第一个非目录文件
+    if (!this.currentViewingFile) {
+      const first = files.find(f => !f.is_directory);
+      if (first) {
+        this.loadFileContent(archiveID, first.relative_path, first.size);
+      }
     }
   },
 
-  async loadFileContent(archiveID, relPath, size) {
+  // 压缩包内全局搜索
+  async searchInsideArchive() {
+    const kwInput = document.getElementById("archive-search-keyword");
+    const keyword = (kwInput ? kwInput.value : "").trim();
+    if (!keyword) {
+      alert("请输入要检索的关键词");
+      return;
+    }
+
+    const archiveID = this.currentViewingArchiveID;
+    if (!archiveID) return;
+
+    const level = document.getElementById("archive-search-level")?.value || "ALL";
+    const isRegex = !!document.getElementById("archive-search-regex")?.checked;
+    const caseSensitive = !!document.getElementById("archive-search-case")?.checked;
+
+    const resultsBox = document.getElementById("archive-search-results");
+    const summaryBox = document.getElementById("archive-search-summary");
+
+    resultsBox.innerHTML = '<div style="text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 12px;">正在全包检索中...</div>';
+    if (summaryBox) summaryBox.style.display = "none";
+
+    try {
+      const res = await this.api("/api/search", "POST", {
+        archive_id: archiveID,
+        keyword,
+        level,
+        is_regex: isRegex,
+        case_sensitive: caseSensitive,
+        context_lines: 1,
+        page: 1,
+        page_size: 100,
+      });
+
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+
+      const data = await res.json();
+      const hits = data.hits || [];
+
+      if (summaryBox) {
+        summaryBox.style.display = "block";
+        summaryBox.innerText = `找到 ${data.total_hits} 处匹配 (耗时 ${data.cost_ms} ms)`;
+      }
+
+      if (hits.length === 0) {
+        resultsBox.innerHTML = '<div style="text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 12px;">未匹配到符合条件的日志行</div>';
+        return;
+      }
+
+      resultsBox.innerHTML = "";
+      hits.forEach(h => {
+        const item = document.createElement("div");
+        item.className = "archive-hit-item";
+
+        let highlightedSnippet = this.escape(h.content || "");
+        if (keyword) {
+          const reg = new RegExp(`(${this.escapeRegex(keyword)})`, caseSensitive ? "g" : "gi");
+          highlightedSnippet = highlightedSnippet.replace(reg, '<mark class="v-match">$1</mark>');
+        }
+
+        const fileName = h.file_path.split("/").pop();
+        const levelBadge = h.level === "ERROR" || h.level === "FATAL"
+          ? '<span class="badge badge-danger" style="font-size: 10px;">' + h.level + '</span>'
+          : (h.level === "WARN" ? '<span class="badge badge-warning" style="font-size: 10px;">WARN</span>' : '');
+
+        item.innerHTML = `
+          <div class="archive-hit-header">
+            <span style="font-weight: 500; color: var(--primary);">${this.escape(fileName)} <span style="color: var(--text-dim); font-size: 11px;">(第 ${h.line_number} 行)</span></span>
+            ${levelBadge}
+          </div>
+          <div class="archive-hit-snippet" title="${this.escape(h.content)}">${highlightedSnippet}</div>
+        `;
+
+        item.addEventListener("click", () => {
+          this.loadFileContent(archiveID, h.file_path, 0, h.line_number, keyword);
+        });
+
+        resultsBox.appendChild(item);
+      });
+    } catch (e) {
+      resultsBox.innerHTML = `<div style="text-align: center; color: var(--danger); padding: 20px 10px; font-size: 12px;">检索异常: ${e.message}</div>`;
+    }
+  },
+
+  // 加载具体文件内容 (支持跳转至指定行及高亮搜索词)
+  async loadFileContent(archiveID, relPath, size = 0, targetLine = 0, highlightKeyword = "", startLine = 1, limit = 500) {
+    if (targetLine > 0) {
+      startLine = Math.max(1, targetLine - 50);
+      limit = Math.max(500, targetLine - startLine + 100);
+    }
+
     this.currentViewingFile = { archiveID, relPath, size };
+    this.currentFileLines = [];
+    this.currentFileStartLine = startLine;
+    this.currentFileLimit = limit;
+    this.viewerMatches = [];
+    this.viewerMatchIndex = -1;
+
     const viewer = document.getElementById("viewer-content");
-    viewer.innerText = "正在读取日志内容...";
+    viewer.innerHTML = '<div style="padding: 20px 16px; color: var(--text-muted);">正在读取日志文件内容...</div>';
     document.getElementById("viewer-filepath").innerText = relPath;
-    document.getElementById("viewer-meta").innerText = `大小: ${(size / 1024).toFixed(1)} KB (前 500 行)`;
+    document.getElementById("viewer-meta").innerText = size > 0 ? `大小: ${(size / 1024).toFixed(1)} KB` : "";
 
     const dlBtn = document.getElementById("btn-download-current-file");
     if (dlBtn) {
@@ -1020,16 +1179,239 @@ const app = {
     }
 
     try {
-      const res = await this.api(`/api/archives/${archiveID}/file-content?path=${encodeURIComponent(relPath)}&start_line=1&limit=500`);
+      const res = await this.api(`/api/archives/${archiveID}/file-content?path=${encodeURIComponent(relPath)}&start_line=${startLine}&limit=${limit}`);
       if (!res.ok) {
-        viewer.innerText = "读取文件失败: " + (await res.text());
+        viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--danger);">读取文件失败: ${await res.text()}</div>`;
         return;
       }
       const data = await res.json();
-      viewer.innerText = data.lines.join("\n");
+      this.currentFileLines = data.lines || [];
+      this.currentFileHasMore = !!data.has_more;
+
+      document.getElementById("viewer-meta").innerText = `已展示 ${this.currentFileStartLine} ~ ${this.currentFileStartLine + this.currentFileLines.length - 1} 行${data.has_more ? ' (更多行可展开)' : ' (全文件)'}`;
+
+      const moreBtn = document.getElementById("btn-load-more-lines");
+      if (moreBtn) {
+        moreBtn.style.display = data.has_more ? "inline-flex" : "none";
+      }
+
+      this.renderViewerLines(targetLine);
+
+      // 如果有指定的高亮关键词，自动填充至文件内搜索栏并触发匹配
+      if (highlightKeyword) {
+        const searchInput = document.getElementById("viewer-search-kw");
+        if (searchInput) {
+          searchInput.value = highlightKeyword;
+          this.onViewerSearchInput();
+        }
+      }
     } catch (e) {
-      viewer.innerText = "读取失败: " + e.message;
+      viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--danger);">读取异常: ${e.message}</div>`;
     }
+  },
+
+  // 渲染查看器中的行
+  renderViewerLines(targetLine = 0) {
+    const viewer = document.getElementById("viewer-content");
+    viewer.innerHTML = "";
+
+    if (!this.currentFileLines || this.currentFileLines.length === 0) {
+      viewer.innerHTML = `<div style="padding: 20px 16px; color: var(--text-dim); text-align: center;">该日志文件为空</div>`;
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    this.currentFileLines.forEach((text, idx) => {
+      const lineNo = this.currentFileStartLine + idx;
+      const lineDiv = document.createElement("div");
+      lineDiv.className = "v-line";
+      lineDiv.id = `v-line-${lineNo}`;
+      lineDiv.dataset.line = lineNo;
+
+      if (targetLine > 0 && lineNo === targetLine) {
+        lineDiv.classList.add("v-line-highlight");
+      }
+
+      lineDiv.innerHTML = `<span class="v-line-no">${lineNo}</span><span class="v-line-text">${this.escape(text)}</span>`;
+      fragment.appendChild(lineDiv);
+    });
+
+    viewer.appendChild(fragment);
+
+    // 平滑滚动定位到目标行
+    if (targetLine > 0) {
+      setTimeout(() => {
+        const targetEl = document.getElementById(`v-line-${targetLine}`);
+        if (targetEl) {
+          targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
+        }
+      }, 80);
+    }
+  },
+
+  // 加载更多文件行
+  async loadMoreFileLines() {
+    if (!this.currentViewingFile) return;
+    const moreBtn = document.getElementById("btn-load-more-lines");
+    if (moreBtn) moreBtn.disabled = true;
+
+    const currentLen = this.currentFileLines.length;
+    const nextStart = this.currentFileStartLine + currentLen;
+    const limit = 500;
+
+    try {
+      const res = await this.api(`/api/archives/${this.currentViewingFile.archiveID}/file-content?path=${encodeURIComponent(this.currentViewingFile.relPath)}&start_line=${nextStart}&limit=${limit}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const newLines = data.lines || [];
+      if (newLines.length > 0) {
+        const viewer = document.getElementById("viewer-content");
+        const fragment = document.createDocumentFragment();
+        newLines.forEach((text, idx) => {
+          const lineNo = nextStart + idx;
+          const lineDiv = document.createElement("div");
+          lineDiv.className = "v-line";
+          lineDiv.id = `v-line-${lineNo}`;
+          lineDiv.dataset.line = lineNo;
+          lineDiv.innerHTML = `<span class="v-line-no">${lineNo}</span><span class="v-line-text">${this.escape(text)}</span>`;
+          fragment.appendChild(lineDiv);
+        });
+        viewer.appendChild(fragment);
+
+        this.currentFileLines = this.currentFileLines.concat(newLines);
+        this.currentFileHasMore = !!data.has_more;
+        document.getElementById("viewer-meta").innerText = `已展示 ${this.currentFileStartLine} ~ ${this.currentFileStartLine + this.currentFileLines.length - 1} 行${data.has_more ? ' (更多行可展开)' : ' (全文件)'}`;
+        if (moreBtn) moreBtn.style.display = data.has_more ? "inline-flex" : "none";
+
+        // 重新同步搜索高亮
+        this.onViewerSearchInput();
+      } else {
+        if (moreBtn) moreBtn.style.display = "none";
+      }
+    } finally {
+      if (moreBtn) moreBtn.disabled = false;
+    }
+  },
+
+  // ================= 文件内搜索 (In-File Search) =================
+
+  onViewerSearchInput() {
+    const input = document.getElementById("viewer-search-kw");
+    const keyword = (input ? input.value : "").trim();
+    const isCase = !!document.getElementById("viewer-search-case")?.checked;
+    const isRegex = !!document.getElementById("viewer-search-regex")?.checked;
+    const counter = document.getElementById("viewer-search-counter");
+
+    // 清空现有匹配
+    this.viewerMatches = [];
+    this.viewerMatchIndex = -1;
+
+    // 先重置所有文本为原始纯文本
+    const lines = document.querySelectorAll("#viewer-content .v-line");
+    lines.forEach((lineEl, idx) => {
+      const textSpan = lineEl.querySelector(".v-line-text");
+      if (textSpan && this.currentFileLines[idx] !== undefined) {
+        textSpan.innerText = this.currentFileLines[idx];
+      }
+    });
+
+    if (!keyword) {
+      if (counter) counter.innerText = "0 / 0";
+      return;
+    }
+
+    let reg;
+    try {
+      const pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      reg = new RegExp(`(${pattern})`, isCase ? "g" : "gi");
+    } catch (e) {
+      if (counter) counter.innerText = "正则错误";
+      return;
+    }
+
+    // 遍历 DOM 文本替换高亮
+    let matchTotal = 0;
+    lines.forEach((lineEl, idx) => {
+      const raw = this.currentFileLines[idx];
+      if (!raw || !reg.test(raw)) return;
+      reg.lastIndex = 0; // 重置正则索引
+
+      const textSpan = lineEl.querySelector(".v-line-text");
+      if (!textSpan) return;
+
+      const replaced = this.escape(raw).replace(reg, (match) => {
+        matchTotal++;
+        return `<mark class="v-match" id="v-match-${matchTotal}">${match}</mark>`;
+      });
+      textSpan.innerHTML = replaced;
+    });
+
+    // 收集所有 mark
+    this.viewerMatches = Array.from(document.querySelectorAll("#viewer-content mark.v-match"));
+
+    if (this.viewerMatches.length > 0) {
+      this.viewerMatchIndex = 0;
+      this.viewerMatches[0].classList.add("v-match-active");
+      this.viewerMatches[0].scrollIntoView({ block: "center", behavior: "smooth" });
+      if (counter) counter.innerText = `1 / ${this.viewerMatches.length}`;
+    } else {
+      if (counter) counter.innerText = "0 / 0";
+    }
+  },
+
+  viewerSearchNext() {
+    if (this.viewerMatches.length === 0) return;
+    this.viewerMatches[this.viewerMatchIndex].classList.remove("v-match-active");
+    this.viewerMatchIndex = (this.viewerMatchIndex + 1) % this.viewerMatches.length;
+    const active = this.viewerMatches[this.viewerMatchIndex];
+    active.classList.add("v-match-active");
+    active.scrollIntoView({ block: "center", behavior: "smooth" });
+    const counter = document.getElementById("viewer-search-counter");
+    if (counter) counter.innerText = `${this.viewerMatchIndex + 1} / ${this.viewerMatches.length}`;
+  },
+
+  viewerSearchPrev() {
+    if (this.viewerMatches.length === 0) return;
+    this.viewerMatches[this.viewerMatchIndex].classList.remove("v-match-active");
+    this.viewerMatchIndex = (this.viewerMatchIndex - 1 + this.viewerMatches.length) % this.viewerMatches.length;
+    const active = this.viewerMatches[this.viewerMatchIndex];
+    active.classList.add("v-match-active");
+    active.scrollIntoView({ block: "center", behavior: "smooth" });
+    const counter = document.getElementById("viewer-search-counter");
+    if (counter) counter.innerText = `${this.viewerMatchIndex + 1} / ${this.viewerMatches.length}`;
+  },
+
+  onViewerSearchKeydown(event) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        this.viewerSearchPrev();
+      } else {
+        this.viewerSearchNext();
+      }
+    }
+  },
+
+  jumpToLineNo() {
+    const input = document.getElementById("viewer-jump-lineno");
+    const lineNo = parseInt(input ? input.value : "", 10);
+    if (!lineNo || lineNo < 1) return;
+
+    const targetEl = document.getElementById(`v-line-${lineNo}`);
+    if (targetEl) {
+      document.querySelectorAll(".v-line.v-line-highlight").forEach(el => el.classList.remove("v-line-highlight"));
+      targetEl.classList.add("v-line-highlight");
+      targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
+    } else if (this.currentViewingFile) {
+      // 若当前行未在已渲染窗口中，从服务端加载包含该行的窗口
+      this.loadFileContent(this.currentViewingFile.archiveID, this.currentViewingFile.relPath, 0, lineNo, "");
+    }
+  },
+
+  // 跨页面或从搜索结果中打开日志查看器并直达指定行
+  async openViewerAndJump(archiveID, relPath, lineNo, keyword = "") {
+    await this.viewFiles(archiveID);
+    this.loadFileContent(archiveID, relPath, 0, lineNo, keyword);
   },
 
   // 下载指定归档包内的具体日志文件
@@ -1253,7 +1635,10 @@ const app = {
         <div class="hit-header">
           <span><code>${this.escape(h.file_path)} : 第 ${h.line_number} 行</code></span>
           <div style="display: flex; align-items: center; gap: 6px;">
-            ${searchArchID ? `<button class="btn btn-secondary btn-xs" title="下载此日志文件" onclick="app.downloadFile('${searchArchID}', '${this.escape(h.file_path)}')">📥 下载日志</button>` : ''}
+            ${searchArchID ? `
+              <button class="btn btn-primary btn-xs" title="在解包查看器中定位此行并阅读上下文" onclick="app.openViewerAndJump('${searchArchID}', '${this.escape(h.file_path)}', ${h.line_number}, '${this.escape(keyword || '')}')">👁️ 定位查看</button>
+              <button class="btn btn-secondary btn-xs" title="下载此日志文件" onclick="app.downloadFile('${searchArchID}', '${this.escape(h.file_path)}')">📥 下载日志</button>
+            ` : ''}
             <span class="badge ${h.level === "ERROR" || h.level === "FATAL" ? "badge-danger" : h.level === "WARN" ? "badge-warning" : "badge-muted"}">${h.level}</span>
             <span style="color: var(--text-dim); font-size: 11px; margin-left: 4px;">${h.timestamp || ""}</span>
           </div>

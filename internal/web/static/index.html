@@ -629,31 +629,111 @@
     </div>
   </div>
 
-  <!-- 模态框 4: 在线文件树与日志查看器 -->
+  <!-- 模态框 4: 在线文件树与日志查看器 (支持文件内搜索与压缩包内全局搜索) -->
   <div class="modal-overlay" id="modal-file-browser">
-    <div class="modal-content" style="max-width: 960px; height: 80vh;">
-      <div class="modal-header">
+    <div class="modal-content" style="max-width: 1240px; width: 95vw; height: 88vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="flex-shrink: 0;">
         <div style="display: flex; align-items: center; gap: 12px;">
-          <h3 class="modal-title" id="file-browser-title">📁 日志文件解包目录树</h3>
+          <h3 class="modal-title" id="file-browser-title">📁 日志文件解包浏览与分析</h3>
           <button id="btn-download-full-archive" class="btn btn-secondary btn-sm" style="display: inline-flex; align-items: center; gap: 4px;" onclick="app.downloadCurrentArchive()" title="下载上传的完整日志压缩包">
             📦 下载原压缩包
           </button>
         </div>
         <button class="modal-close" onclick="app.closeModal('modal-file-browser')">&times;</button>
       </div>
-      <div class="modal-body" style="padding: 0;">
-        <div class="file-browser">
-          <div class="file-tree" id="file-tree-container"></div>
-          <div class="file-viewer">
+      <div class="modal-body" style="padding: 0; flex: 1; min-height: 0; overflow: hidden;">
+        <div class="file-browser" style="height: 100%; display: flex;">
+          <!-- 左侧侧边栏: 支持目录树与包内全局检索 Tab 切换 -->
+          <div class="file-browser-sidebar">
+            <div class="browser-sidebar-tabs">
+              <button id="tab-btn-tree" class="browser-tab-btn active" onclick="app.switchBrowserTab('tree')">
+                📁 文件目录 (<span id="browser-file-count">0</span>)
+              </button>
+              <button id="tab-btn-search" class="browser-tab-btn" onclick="app.switchBrowserTab('search')">
+                🔍 包内全局搜索
+              </button>
+            </div>
+
+            <!-- Tab 1: 目录树 -->
+            <div id="browser-tab-tree" class="browser-tab-content active">
+              <div style="padding: 8px 10px; border-bottom: 1px solid var(--border-color);">
+                <input type="text" class="form-control form-control-sm" id="browser-tree-filter" placeholder="🔍 快速过滤文件名..." oninput="app.filterFileTree(this.value)">
+              </div>
+              <div class="file-tree" id="file-tree-container"></div>
+            </div>
+
+            <!-- Tab 2: 压缩包内全局检索 -->
+            <div id="browser-tab-search" class="browser-tab-content" style="display: none;">
+              <div class="archive-search-box">
+                <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+                  <input type="text" class="form-control form-control-sm" id="archive-search-keyword" placeholder="输入搜索关键词，回车检索..." onkeydown="if(event.key==='Enter') app.searchInsideArchive()">
+                  <button class="btn btn-primary btn-sm" onclick="app.searchInsideArchive()" style="flex-shrink: 0;">检索</button>
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; align-items: center;">
+                  <select id="archive-search-level" class="form-control form-control-sm" style="width: auto; padding: 2px 6px;">
+                    <option value="ALL">全部级别</option>
+                    <option value="ERROR">ERROR / FATAL</option>
+                    <option value="WARN">WARN</option>
+                    <option value="INFO">INFO</option>
+                  </select>
+                  <label style="display: flex; align-items: center; gap: 3px; cursor: pointer;">
+                    <input type="checkbox" id="archive-search-regex"> 正则
+                  </label>
+                  <label style="display: flex; align-items: center; gap: 3px; cursor: pointer;">
+                    <input type="checkbox" id="archive-search-case"> 大小写
+                  </label>
+                </div>
+              </div>
+              <div id="archive-search-summary" style="padding: 6px 12px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border-color); display: none;"></div>
+              <div id="archive-search-results" class="archive-search-hits">
+                <div style="text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 12px;">
+                  输入关键词并在当前日志压缩包内执行全局搜索
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右侧查看器 -->
+          <div class="file-viewer" style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
+            <!-- 顶栏 1: 当前文件信息与操作 -->
             <div class="file-viewer-header">
               <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px;">
                 <span id="viewer-filepath" style="color: var(--primary); font-weight: 500;">请选择左侧文件查看</span>
                 <span id="viewer-meta" style="color: var(--text-dim); margin-left: 8px;"></span>
               </div>
-              <button id="btn-download-current-file" class="btn btn-primary btn-sm" style="display: none; flex-shrink: 0; align-items: center; gap: 4px;" onclick="app.downloadCurrentViewingFile()">
-                📥 下载此日志文件
-              </button>
+              <div style="display: flex; gap: 8px; flex-shrink: 0; align-items: center;">
+                <button id="btn-load-more-lines" class="btn btn-secondary btn-sm" style="display: none;" onclick="app.loadMoreFileLines()">
+                  ➕ 加载更多行
+                </button>
+                <button id="btn-download-current-file" class="btn btn-primary btn-sm" style="display: none;" onclick="app.downloadCurrentViewingFile()">
+                  📥 下载此文件
+                </button>
+              </div>
             </div>
+
+            <!-- 顶栏 2: 文件内搜索工具栏 (In-File Search Toolbar) -->
+            <div class="file-viewer-search-bar" id="viewer-search-bar">
+              <div style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;">
+                <span style="font-size: 13px;">🔍</span>
+                <input type="text" id="viewer-search-kw" class="form-control form-control-sm" style="flex: 1; max-width: 320px;" placeholder="在当前文件内搜索 (Enter 下一个, Shift+Enter 上一个)..." oninput="app.onViewerSearchInput()" onkeydown="app.onViewerSearchKeydown(event)">
+                <span id="viewer-search-counter" class="badge badge-muted" style="font-size: 11px;">0 / 0</span>
+                <button class="btn btn-secondary btn-xs" title="上一个匹配 (Shift+Enter)" onclick="app.viewerSearchPrev()">⬆️</button>
+                <button class="btn btn-secondary btn-xs" title="下一个匹配 (Enter)" onclick="app.viewerSearchNext()">⬇️</button>
+                <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer; margin-left: 6px;">
+                  <input type="checkbox" id="viewer-search-case" onchange="app.onViewerSearchInput()"> 大小写
+                </label>
+                <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer;">
+                  <input type="checkbox" id="viewer-search-regex" onchange="app.onViewerSearchInput()"> 正则
+                </label>
+              </div>
+              <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 11px;">
+                <span style="color: var(--text-dim);">跳转行:</span>
+                <input type="number" id="viewer-jump-lineno" class="form-control form-control-sm" style="width: 70px; padding: 2px 6px;" min="1" placeholder="行号" onkeydown="if(event.key==='Enter') app.jumpToLineNo()">
+                <button class="btn btn-secondary btn-xs" onclick="app.jumpToLineNo()">跳转</button>
+              </div>
+            </div>
+
+            <!-- 日志行容器 -->
             <div class="file-viewer-content" id="viewer-content"></div>
           </div>
         </div>

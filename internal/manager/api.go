@@ -926,6 +926,9 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		if limit <= 0 {
 			limit = 500
 		}
+		if limit > 5000 {
+			limit = 5000
+		}
 		if startLine <= 0 {
 			startLine = 1
 		}
@@ -947,12 +950,18 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		hasMore := false
+		if len(lines) >= limit && scanner.Scan() {
+			hasMore = true
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"file_path":  relPath,
 			"start_line": startLine,
 			"line_count": len(lines),
 			"lines":      lines,
+			"has_more":   hasMore,
 		})
 		return
 	}
