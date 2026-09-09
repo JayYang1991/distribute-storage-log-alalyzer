@@ -2,7 +2,6 @@ package manager
 
 import (
 	"bufio"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -30,11 +29,11 @@ func DetectDefaultGateway() string {
 			if len(fields) >= 3 && fields[1] == "00000000" {
 				gwHex := fields[2]
 				if gwHex != "00000000" && len(gwHex) == 8 {
-					// 解码小端序 IPv4
+					// 解码十六进制 IPv4 字节序 (例如 017AA8C0 -> b[0]=01, b[1]=7a, b[2]=a8, b[3]=c0)
+					// 实际对应真实网关 192.168.122.1 (b[3].b[2].b[1].b[0])
 					b, err := hex.DecodeString(gwHex)
 					if err == nil && len(b) == 4 {
-						ipInt := binary.LittleEndian.Uint32(b)
-						ip := net.IPv4(byte(ipInt), byte(ipInt>>8), byte(ipInt>>16), byte(ipInt>>24))
+						ip := net.IPv4(b[3], b[2], b[1], b[0])
 						return ip.String()
 					}
 				}
