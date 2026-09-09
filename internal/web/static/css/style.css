@@ -264,6 +264,12 @@ body {
   font-size: 12px;
 }
 
+.btn-xs {
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+}
+
 /* 仪表盘统计卡片 */
 .stats-grid {
   display: grid;
@@ -566,6 +572,36 @@ tr:hover td {
   background: rgba(56, 189, 248, 0.15);
   color: var(--primary);
   font-weight: 500;
+}
+
+.file-tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.btn-tree-download {
+  opacity: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 12px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.file-tree-item:hover .btn-tree-download {
+  opacity: 0.85;
+}
+
+.btn-tree-download:hover {
+  opacity: 1 !important;
+  color: var(--primary);
+  background: rgba(56, 189, 248, 0.2);
 }
 
 .file-viewer {

@@ -52,6 +52,8 @@ func (a *Agent) Start(ctx context.Context) error {
 	// 新增：定向存储与日志查看专用接口
 	mux.HandleFunc("/api/worker/storage/upload", a.handleStorageUpload)
 	mux.HandleFunc("/api/worker/storage/file-content", a.handleStorageFileContent)
+	mux.HandleFunc("/api/worker/storage/download-file", a.handleStorageDownloadFile)
+	mux.HandleFunc("/api/worker/storage/download-archive", a.handleStorageDownloadArchive)
 	mux.HandleFunc("/api/worker/storage/files", a.handleStorageFiles)
 
 	addr := fmt.Sprintf("%s:%d", a.cfg.ListenHost, a.cfg.Port)
@@ -235,6 +237,77 @@ func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request)
 		"line_count": len(lines),
 		"lines":      lines,
 	})
+}
+
+// handleStorageDownloadFile 直接下载业务节点硬盘上解压目录中的指定日志文件
+func (a *Agent) handleStorageDownloadFile(w http.ResponseWriter, r *http.Request) {
+	relPath := r.URL.Query().Get("path")
+	extractPath := r.URL.Query().Get("extract_path")
+	if relPath == "" || extractPath == "" {
+		http.Error(w, "缺少必要参数 path 或 extract_path", http.StatusBadRequest)
+		return
+	}
+
+	cleanExtract := filepath.Clean(extractPath)
+	fullPath := filepath.Join(cleanExtract, relPath)
+	if !strings.HasPrefix(filepath.Clean(fullPath), cleanExtract) {
+		http.Error(w, "非法访问路径", http.StatusForbidden)
+		return
+	}
+
+	f, err := os.Open(fullPath)
+	if err != nil {
+		http.Error(w, "无法读取指定文件: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.Error(w, "目标不是有效的文件", http.StatusBadRequest)
+		return
+	}
+
+	fileName := filepath.Base(fullPath)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	http.ServeContent(w, r, fileName, info.ModTime(), f)
+}
+
+// handleStorageDownloadArchive 下载业务节点硬盘上暂存的原日志归档压缩包
+func (a *Agent) handleStorageDownloadArchive(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("username")
+	filename := r.URL.Query().Get("filename")
+	if username == "" || filename == "" {
+		http.Error(w, "缺少必要参数 username 或 filename", http.StatusBadRequest)
+		return
+	}
+
+	archiveDir := filepath.Join(a.cfg.DataDir, "users", username, "archives")
+	fullPath := filepath.Join(archiveDir, filename)
+	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(archiveDir)) {
+		http.Error(w, "非法访问路径", http.StatusForbidden)
+		return
+	}
+
+	f, err := os.Open(fullPath)
+	if err != nil {
+		http.Error(w, "原始归档文件不存在: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.Error(w, "目标不是有效的文件", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	http.ServeContent(w, r, filename, info.ModTime(), f)
 }
 
 // handleStorageFiles 读取指定解压目录的文件树

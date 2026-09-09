@@ -12,6 +12,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -159,6 +160,9 @@ func (s *Server) authenticate(r *http.Request) (*model.User, error) {
 		if cookie, err := r.Cookie("session_token"); err == nil {
 			token = cookie.Value
 		}
+	}
+	if token == "" {
+		token = r.URL.Query().Get("token")
 	}
 	if token == "" {
 		return nil, fmt.Errorf("未登录或 Token 缺失")
@@ -950,6 +954,118 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			"line_count": len(lines),
 			"lines":      lines,
 		})
+		return
+	}
+
+	// 下载指定的日志文件
+	if len(parts) == 2 && (parts[1] == "download-file" || parts[1] == "file-download") {
+		relPath := r.URL.Query().Get("path")
+		if relPath == "" {
+			http.Error(w, "缺少文件相对路径参数 path", http.StatusBadRequest)
+			return
+		}
+
+		// 若日志存放在远程业务节点，代理从该业务节点下载
+		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
+			remoteURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-file?path=%s&extract_path=%s",
+				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(relPath), url.QueryEscape(archive.ExtractPath))
+			resp, err := http.Get(remoteURL)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				fileName := filepath.Base(relPath)
+				if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+					w.Header().Set("Content-Disposition", cd)
+				} else {
+					w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+				}
+				if ct := resp.Header.Get("Content-Type"); ct != "" {
+					w.Header().Set("Content-Type", ct)
+				} else {
+					w.Header().Set("Content-Type", "application/octet-stream")
+				}
+				if cl := resp.Header.Get("Content-Length"); cl != "" {
+					w.Header().Set("Content-Length", cl)
+				}
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
+		}
+
+		// 本地读取解压目录下的指定日志文件
+		cleanExtract := filepath.Clean(archive.ExtractPath)
+		fullPath := filepath.Join(cleanExtract, relPath)
+		if !strings.HasPrefix(filepath.Clean(fullPath), cleanExtract) {
+			http.Error(w, "非法文件路径", http.StatusForbidden)
+			return
+		}
+
+		f, err := os.Open(fullPath)
+		if err != nil {
+			http.Error(w, "无法读取文件: "+err.Error(), http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+
+		info, err := f.Stat()
+		if err != nil || info.IsDir() {
+			http.Error(w, "目标不是有效文件", http.StatusBadRequest)
+			return
+		}
+
+		fileName := filepath.Base(fullPath)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+		http.ServeContent(w, r, fileName, info.ModTime(), f)
+		return
+	}
+
+	// 下载原始日志归档压缩包
+	if len(parts) == 2 && (parts[1] == "download" || parts[1] == "download-archive") {
+		// 若日志存放在远程业务节点，代理从该业务节点下载
+		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
+			remoteURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-archive?username=%s&filename=%s",
+				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(archive.Username), url.QueryEscape(archive.Filename))
+			resp, err := http.Get(remoteURL)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+					w.Header().Set("Content-Disposition", cd)
+				} else {
+					w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, archive.Filename))
+				}
+				if ct := resp.Header.Get("Content-Type"); ct != "" {
+					w.Header().Set("Content-Type", ct)
+				} else {
+					w.Header().Set("Content-Type", "application/octet-stream")
+				}
+				if cl := resp.Header.Get("Content-Length"); cl != "" {
+					w.Header().Set("Content-Length", cl)
+				}
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
+		}
+
+		archiveDir := s.store.GetUserArchiveDir(archive.Username)
+		fullPath := filepath.Join(archiveDir, archive.Filename)
+		f, err := os.Open(fullPath)
+		if err != nil {
+			http.Error(w, "归档压缩包不存在或无法打开: "+err.Error(), http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+
+		info, err := f.Stat()
+		if err != nil || info.IsDir() {
+			http.Error(w, "无法读取归档文件", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, archive.Filename))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+		http.ServeContent(w, r, archive.Filename, info.ModTime(), f)
 		return
 	}
 

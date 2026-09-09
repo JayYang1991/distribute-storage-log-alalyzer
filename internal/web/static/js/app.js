@@ -856,6 +856,7 @@ const app = {
               ${isReady ? `
                 <button class="btn btn-secondary btn-sm" onclick="app.viewFiles('${a.id}')">浏览</button>
                 <button class="btn btn-primary btn-sm" onclick="app.viewDiagnosis('${a.id}')">诊断报告</button>
+                <button class="btn btn-secondary btn-sm" title="下载原日志压缩包" onclick="app.downloadArchive('${a.id}')">📥 下载</button>
               ` : '-'}
             </td>
           `;
@@ -873,6 +874,7 @@ const app = {
               ${isReady ? `
                 <button class="btn btn-secondary btn-sm" onclick="app.viewFiles('${a.id}')">📁 浏览</button>
                 <button class="btn btn-primary btn-sm" onclick="app.viewDiagnosis('${a.id}')">🛡️ 报告</button>
+                <button class="btn btn-secondary btn-sm" title="下载原日志压缩包" onclick="app.downloadArchive('${a.id}')">📥 下载</button>
               ` : ''}
               <button class="btn btn-danger btn-sm" onclick="app.deleteArchive('${a.id}')">删除</button>
             </td>
@@ -948,9 +950,13 @@ const app = {
 
   async viewFiles(archiveID) {
     this.currentViewingArchiveID = archiveID;
+    this.currentViewingFile = null;
     document.getElementById("viewer-filepath").innerText = "请从左侧选择文件...";
     document.getElementById("viewer-content").innerText = "";
     document.getElementById("viewer-meta").innerText = "";
+
+    const dlBtn = document.getElementById("btn-download-current-file");
+    if (dlBtn) dlBtn.style.display = "none";
 
     try {
       const res = await this.api(`/api/archives/${archiveID}/files`);
@@ -973,7 +979,14 @@ const app = {
     files.forEach(f => {
       const div = document.createElement("div");
       div.className = "file-tree-item";
-      div.innerHTML = `<span>${f.is_directory ? "📁" : "📄"}</span> <span>${this.escape(f.relative_path)}</span>`;
+
+      const icon = f.is_directory ? "📁" : "📄";
+      const escapedPath = this.escape(f.relative_path);
+      const downloadBtn = !f.is_directory
+        ? `<button class="btn-tree-download" title="下载此文件 (${(f.size/1024).toFixed(1)} KB)" onclick="event.stopPropagation(); app.downloadFile('${archiveID}', '${this.escape(f.relative_path)}')">📥</button>`
+        : '';
+
+      div.innerHTML = `<span>${icon}</span> <span class="file-tree-name" title="${escapedPath}">${escapedPath}</span> ${downloadBtn}`;
 
       if (!f.is_directory) {
         div.addEventListener("click", () => {
@@ -993,10 +1006,18 @@ const app = {
   },
 
   async loadFileContent(archiveID, relPath, size) {
+    this.currentViewingFile = { archiveID, relPath, size };
     const viewer = document.getElementById("viewer-content");
     viewer.innerText = "正在读取日志内容...";
     document.getElementById("viewer-filepath").innerText = relPath;
     document.getElementById("viewer-meta").innerText = `大小: ${(size / 1024).toFixed(1)} KB (前 500 行)`;
+
+    const dlBtn = document.getElementById("btn-download-current-file");
+    if (dlBtn) {
+      const fileName = relPath.split("/").pop() || "log.txt";
+      dlBtn.style.display = "inline-flex";
+      dlBtn.innerHTML = `📥 下载此文件 (${this.escape(fileName)})`;
+    }
 
     try {
       const res = await this.api(`/api/archives/${archiveID}/file-content?path=${encodeURIComponent(relPath)}&start_line=1&limit=500`);
@@ -1008,6 +1029,43 @@ const app = {
       viewer.innerText = data.lines.join("\n");
     } catch (e) {
       viewer.innerText = "读取失败: " + e.message;
+    }
+  },
+
+  // 下载指定归档包内的具体日志文件
+  downloadFile(archiveID, relPath) {
+    if (!archiveID || !relPath) return;
+    const tokenParam = this.token ? `&token=${encodeURIComponent(this.token)}` : '';
+    const url = `/api/archives/${archiveID}/download-file?path=${encodeURIComponent(relPath)}${tokenParam}`;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = relPath.split("/").pop() || "log_file";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+
+  // 下载原始日志归档压缩包
+  downloadArchive(archiveID) {
+    if (!archiveID) return;
+    const tokenParam = this.token ? `?token=${encodeURIComponent(this.token)}` : '';
+    const url = `/api/archives/${archiveID}/download${tokenParam}`;
+    const a = document.createElement("a");
+    a.href = url;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  },
+
+  downloadCurrentViewingFile() {
+    if (this.currentViewingFile) {
+      this.downloadFile(this.currentViewingFile.archiveID, this.currentViewingFile.relPath);
+    }
+  },
+
+  downloadCurrentArchive() {
+    if (this.currentViewingArchiveID) {
+      this.downloadArchive(this.currentViewingArchiveID);
     }
   },
 
@@ -1190,12 +1248,14 @@ const app = {
         ctxHtml += `<div class="hit-context">${h.context_after.map(l => this.escape(l)).join("<br>")}</div>`;
       }
 
+      const searchArchID = h.archive_id || document.getElementById("search-archive-select")?.value || "";
       div.innerHTML = `
         <div class="hit-header">
           <span><code>${this.escape(h.file_path)} : 第 ${h.line_number} 行</code></span>
-          <div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            ${searchArchID ? `<button class="btn btn-secondary btn-xs" title="下载此日志文件" onclick="app.downloadFile('${searchArchID}', '${this.escape(h.file_path)}')">📥 下载日志</button>` : ''}
             <span class="badge ${h.level === "ERROR" || h.level === "FATAL" ? "badge-danger" : h.level === "WARN" ? "badge-warning" : "badge-muted"}">${h.level}</span>
-            <span style="color: var(--text-dim); font-size: 11px; margin-left: 8px;">${h.timestamp || ""}</span>
+            <span style="color: var(--text-dim); font-size: 11px; margin-left: 4px;">${h.timestamp || ""}</span>
           </div>
         </div>
         ${ctxHtml}

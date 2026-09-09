@@ -633,7 +633,12 @@
   <div class="modal-overlay" id="modal-file-browser">
     <div class="modal-content" style="max-width: 960px; height: 80vh;">
       <div class="modal-header">
-        <h3 class="modal-title" id="file-browser-title">📁 日志文件解包目录树</h3>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <h3 class="modal-title" id="file-browser-title">📁 日志文件解包目录树</h3>
+          <button id="btn-download-full-archive" class="btn btn-secondary btn-sm" style="display: inline-flex; align-items: center; gap: 4px;" onclick="app.downloadCurrentArchive()" title="下载上传的完整日志压缩包">
+            📦 下载原压缩包
+          </button>
+        </div>
         <button class="modal-close" onclick="app.closeModal('modal-file-browser')">&times;</button>
       </div>
       <div class="modal-body" style="padding: 0;">
@@ -641,8 +646,13 @@
           <div class="file-tree" id="file-tree-container"></div>
           <div class="file-viewer">
             <div class="file-viewer-header">
-              <span id="viewer-filepath" style="color: var(--primary);">请选择左侧文件查看</span>
-              <span id="viewer-meta" style="color: var(--text-dim);"></span>
+              <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px;">
+                <span id="viewer-filepath" style="color: var(--primary); font-weight: 500;">请选择左侧文件查看</span>
+                <span id="viewer-meta" style="color: var(--text-dim); margin-left: 8px;"></span>
+              </div>
+              <button id="btn-download-current-file" class="btn btn-primary btn-sm" style="display: none; flex-shrink: 0; align-items: center; gap: 4px;" onclick="app.downloadCurrentViewingFile()">
+                📥 下载此日志文件
+              </button>
             </div>
             <div class="file-viewer-content" id="viewer-content"></div>
           </div>
