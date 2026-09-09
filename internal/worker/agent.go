@@ -182,6 +182,13 @@ func (a *Agent) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var contentBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 1024*1024)
+		return &b
+	},
+}
+
 // handleStorageFileContent 读取保存在本节点硬盘上的文件内容
 func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request) {
 	relPath := r.URL.Query().Get("path")
@@ -216,10 +223,11 @@ func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request)
 		startLine = 1
 	}
 
-	var lines []string
+	lines := make([]string, 0, limit)
 	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	bufPtr := contentBufPool.Get().(*[]byte)
+	defer contentBufPool.Put(bufPtr)
+	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	current := 0
 	for scanner.Scan() {

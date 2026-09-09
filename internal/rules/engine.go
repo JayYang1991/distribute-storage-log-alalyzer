@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"dist-log-analyzer/internal/model"
@@ -19,8 +22,16 @@ type Engine struct {
 }
 
 type compiledRule struct {
-	rule  *model.Rule
-	regex *regexp.Regexp
+	rule         *model.Rule
+	regex        *regexp.Regexp
+	patternLower string
+}
+
+var scanBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 256*1024)
+		return &buf
+	},
 }
 
 // NewEngine 构造诊断引擎并预编译所有启用的规则
@@ -30,7 +41,10 @@ func NewEngine(rules []*model.Rule) *Engine {
 		if !r.Enabled {
 			continue
 		}
-		cr := &compiledRule{rule: r}
+		cr := &compiledRule{
+			rule:         r,
+			patternLower: strings.ToLower(r.Pattern),
+		}
 		if r.IsRegex {
 			if reg, err := regexp.Compile(r.Pattern); err == nil {
 				cr.regex = reg
@@ -44,7 +58,12 @@ func NewEngine(rules []*model.Rule) *Engine {
 	return &Engine{compiledRules: compiled}
 }
 
-// DiagnoseDirectory 遍历指定目录并诊断所有日志文件
+type fileTask struct {
+	relPath  string
+	fullPath string
+}
+
+// DiagnoseDirectory 遍历指定目录并高并发诊断所有日志文件
 func (e *Engine) DiagnoseDirectory(archiveID, userID, archiveName, rootDir string) (*model.DiagnosisReport, error) {
 	report := &model.DiagnosisReport{
 		ArchiveID:       archiveID,
@@ -60,23 +79,20 @@ func (e *Engine) DiagnoseDirectory(archiveID, userID, archiveName, rootDir strin
 	// 限制最多记录 500 条事件以避免极端大日志爆内存
 	maxEvents := 500
 
+	// 1. 快速遍历收集所有待分析的目标日志文件
+	var tasks []fileTask
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		// 只检查文本或日志文件
 		if !isLogFile(d.Name()) {
 			return nil
 		}
-
 		relPath, _ := filepath.Rel(rootDir, path)
-		events, err := e.DiagnoseFile(archiveID, relPath, path, maxEvents-len(report.Events))
-		if err == nil && len(events) > 0 {
-			report.Events = append(report.Events, events...)
-		}
-		if len(report.Events) >= maxEvents {
-			return filepath.SkipAll
-		}
+		tasks = append(tasks, fileTask{
+			relPath:  relPath,
+			fullPath: path,
+		})
 		return nil
 	})
 
@@ -85,6 +101,73 @@ func (e *Engine) DiagnoseDirectory(archiveID, userID, archiveName, rootDir strin
 		return report, err
 	}
 
+	if len(tasks) == 0 {
+		report.Status = "completed"
+		report.SummaryText = "归档包中未包含可供分析的文本日志文件。"
+		report.HealthScore = 100
+		return report, nil
+	}
+
+	// 2. 依据 CPU 核数启动 Worker Pool 并行分析
+	workerCount := runtime.NumCPU()
+	if workerCount > len(tasks) {
+		workerCount = len(tasks)
+	}
+	if workerCount > 16 {
+		workerCount = 16
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	taskChan := make(chan fileTask, len(tasks))
+	for _, t := range tasks {
+		taskChan <- t
+	}
+	close(taskChan)
+
+	var (
+		mu          sync.Mutex
+		allEvents   []model.DiagnosisEvent
+		totalEvents int64
+		wg          sync.WaitGroup
+	)
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskChan {
+				// 如果已达到上限，快速跳过后续任务
+				currentCount := atomic.LoadInt64(&totalEvents)
+				if currentCount >= int64(maxEvents) {
+					break
+				}
+
+				remain := maxEvents - int(currentCount)
+				if remain <= 0 {
+					break
+				}
+
+				events, err := e.DiagnoseFile(archiveID, task.relPath, task.fullPath, remain)
+				if err == nil && len(events) > 0 {
+					mu.Lock()
+					if len(allEvents) < maxEvents {
+						avail := maxEvents - len(allEvents)
+						if len(events) > avail {
+							events = events[:avail]
+						}
+						allEvents = append(allEvents, events...)
+						atomic.StoreInt64(&totalEvents, int64(len(allEvents)))
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	report.Events = allEvents
 	report.TotalEvents = len(report.Events)
 	report.Status = "completed"
 
@@ -122,7 +205,7 @@ func (e *Engine) DiagnoseDirectory(archiveID, userID, archiveName, rootDir strin
 	return report, nil
 }
 
-// DiagnoseFile 诊断单个文件
+// DiagnoseFile 诊断单个文件 (利用 sync.Pool 缓冲复用与单行一次性小写优化)
 func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([]model.DiagnosisEvent, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -132,8 +215,11 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 
 	var events []model.DiagnosisEvent
 	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+
+	// 从缓冲池复用 256KB 初始切片，规避高频堆内存申请
+	bufPtr := scanBufPool.Get().(*[]byte)
+	defer scanBufPool.Put(bufPtr)
+	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	var lineNum int64 = 0
 	for scanner.Scan() {
@@ -144,12 +230,20 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 			continue
 		}
 
+		var lineLower string
+		var lineLowerInit bool
+
 		for _, cr := range e.compiledRules {
 			matched := false
 			if cr.regex != nil {
 				matched = cr.regex.MatchString(line)
 			} else {
-				matched = strings.Contains(strings.ToLower(line), strings.ToLower(cr.rule.Pattern))
+				// 优化：单行在命中非正则规则时仅做 1 次 strings.ToLower，使用预先小写的 patternLower 进行比对
+				if !lineLowerInit {
+					lineLower = strings.ToLower(line)
+					lineLowerInit = true
+				}
+				matched = strings.Contains(lineLower, cr.patternLower)
 			}
 
 			if matched {

@@ -15,6 +15,20 @@ import (
 	"dist-log-analyzer/internal/model"
 )
 
+// lineCountingWriter 包装 io.Writer，在数据写入磁盘的同时统计换行符数量，实现零二次磁盘 I/O
+type lineCountingWriter struct {
+	w     io.Writer
+	lines int64
+}
+
+func (lw *lineCountingWriter) Write(p []byte) (n int, err error) {
+	n, err = lw.w.Write(p)
+	if n > 0 {
+		lw.lines += int64(bytes.Count(p[:n], []byte{'\n'}))
+	}
+	return n, err
+}
+
 // ExtractArchive 根据压缩包后缀自动选择解压格式并解压至 targetDir
 func ExtractArchive(archivePath, targetDir string) ([]*model.LogFileItem, int64, error) {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
@@ -23,30 +37,31 @@ func ExtractArchive(archivePath, targetDir string) ([]*model.LogFileItem, int64,
 
 	lower := strings.ToLower(archivePath)
 	var err error
+	lineMap := make(map[string]int64)
 
 	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
-		err = extractTarGz(archivePath, targetDir)
+		err = extractTarGz(archivePath, targetDir, lineMap)
 	} else if strings.HasSuffix(lower, ".zip") {
-		err = extractZip(archivePath, targetDir)
+		err = extractZip(archivePath, targetDir, lineMap)
 	} else if strings.HasSuffix(lower, ".tar.bz2") || strings.HasSuffix(lower, ".tbz2") {
-		err = extractTarBz2(archivePath, targetDir)
+		err = extractTarBz2(archivePath, targetDir, lineMap)
 	} else if strings.HasSuffix(lower, ".tar") {
-		err = extractTar(archivePath, targetDir)
+		err = extractTar(archivePath, targetDir, lineMap)
 	} else if strings.HasSuffix(lower, ".gz") {
-		err = extractSingleGz(archivePath, targetDir)
+		err = extractSingleGz(archivePath, targetDir, lineMap)
 	} else if strings.HasSuffix(lower, ".bz2") {
-		err = extractSingleBz2(archivePath, targetDir)
+		err = extractSingleBz2(archivePath, targetDir, lineMap)
 	} else {
 		// 单个纯文本日志文件或未压缩包，直接拷贝
 		dest := filepath.Join(targetDir, filepath.Base(archivePath))
-		err = copyFile(archivePath, dest)
+		err = copyFile(archivePath, dest, lineMap)
 	}
 
 	if err != nil {
 		return nil, 0, fmt.Errorf("解压缩失败: %w", err)
 	}
 
-	// 遍历解压目录生成文件树列表及统计总行数
+	// 遍历解压目录生成文件树列表及统计总行数（直接从 lineMap 中获取行数，无需再次全量读盘）
 	var fileList []*model.LogFileItem
 	var totalLines int64
 
@@ -67,7 +82,11 @@ func ExtractArchive(archivePath, targetDir string) ([]*model.LogFileItem, int64,
 		}
 
 		if !info.IsDir() {
-			lines := countFileLines(path)
+			lines, ok := lineMap[path]
+			if !ok {
+				// 容错降级：若有漏统文件则单独计算
+				lines = countFileLines(path)
+			}
 			item.LineCount = lines
 			totalLines += lines
 		}
@@ -79,7 +98,7 @@ func ExtractArchive(archivePath, targetDir string) ([]*model.LogFileItem, int64,
 	return fileList, totalLines, nil
 }
 
-func extractTarGz(src, dest string) error {
+func extractTarGz(src, dest string, lineMap map[string]int64) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -92,10 +111,10 @@ func extractTarGz(src, dest string) error {
 	}
 	defer gzr.Close()
 
-	return untar(gzr, dest)
+	return untar(gzr, dest, lineMap)
 }
 
-func extractTarBz2(src, dest string) error {
+func extractTarBz2(src, dest string, lineMap map[string]int64) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -103,20 +122,20 @@ func extractTarBz2(src, dest string) error {
 	defer f.Close()
 
 	bzr := bzip2.NewReader(f)
-	return untar(bzr, dest)
+	return untar(bzr, dest, lineMap)
 }
 
-func extractTar(src, dest string) error {
+func extractTar(src, dest string, lineMap map[string]int64) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	return untar(f, dest)
+	return untar(f, dest, lineMap)
 }
 
-func untar(r io.Reader, dest string) error {
+func untar(r io.Reader, dest string, lineMap map[string]int64) error {
 	tr := tar.NewReader(r)
 	for {
 		header, err := tr.Next()
@@ -142,14 +161,18 @@ func untar(r io.Reader, dest string) error {
 			if err != nil {
 				continue
 			}
-			_, _ = io.Copy(outFile, tr)
+			cw := &lineCountingWriter{w: outFile}
+			_, _ = io.Copy(cw, tr)
 			outFile.Close()
+			if lineMap != nil {
+				lineMap[target] = cw.lines
+			}
 		}
 	}
 	return nil
 }
 
-func extractZip(src, dest string) error {
+func extractZip(src, dest string, lineMap map[string]int64) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -176,14 +199,18 @@ func extractZip(src, dest string) error {
 			outFile.Close()
 			continue
 		}
-		_, _ = io.Copy(outFile, rc)
+		cw := &lineCountingWriter{w: outFile}
+		_, _ = io.Copy(cw, rc)
 		outFile.Close()
 		rc.Close()
+		if lineMap != nil {
+			lineMap[target] = cw.lines
+		}
 	}
 	return nil
 }
 
-func extractSingleGz(src, dest string) error {
+func extractSingleGz(src, dest string, lineMap map[string]int64) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -204,11 +231,15 @@ func extractSingleGz(src, dest string) error {
 	}
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, gzr)
+	cw := &lineCountingWriter{w: outFile}
+	_, err = io.Copy(cw, gzr)
+	if lineMap != nil {
+		lineMap[target] = cw.lines
+	}
 	return err
 }
 
-func extractSingleBz2(src, dest string) error {
+func extractSingleBz2(src, dest string, lineMap map[string]int64) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -224,11 +255,15 @@ func extractSingleBz2(src, dest string) error {
 	}
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, bzr)
+	cw := &lineCountingWriter{w: outFile}
+	_, err = io.Copy(cw, bzr)
+	if lineMap != nil {
+		lineMap[target] = cw.lines
+	}
 	return err
 }
 
-func copyFile(src, dest string) error {
+func copyFile(src, dest string, lineMap map[string]int64) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -241,7 +276,11 @@ func copyFile(src, dest string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, in)
+	cw := &lineCountingWriter{w: out}
+	_, err = io.Copy(cw, in)
+	if lineMap != nil {
+		lineMap[dest] = cw.lines
+	}
 	return err
 }
 
