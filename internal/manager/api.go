@@ -1927,6 +1927,8 @@ func detectArchiveFormat(name string) string {
 		return "tgz"
 	case strings.HasSuffix(lower, ".zip"):
 		return "zip"
+	case strings.HasSuffix(lower, ".7z"):
+		return "7z"
 	case strings.HasSuffix(lower, ".tar.bz2"):
 		return "tar.bz2"
 	case strings.HasSuffix(lower, ".tar"):
