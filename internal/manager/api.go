@@ -395,29 +395,93 @@ func (s *Server) handleUserItem(w http.ResponseWriter, r *http.Request) {
 // ================= 集群与节点管理接口 =================
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
-	_, err := s.authenticate(r)
+	currentUser, err := s.authenticate(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	nodes, err := s.store.ListNodes()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// 检查心跳超时（15秒）
-	now := time.Now()
-	for _, n := range nodes {
-		if n.Role == "worker" && n.Status == "online" && now.Sub(n.LastHeartbeat) > 15*time.Second {
-			n.Status = "offline"
-			_ = s.store.SaveNode(n)
+	switch r.Method {
+	case http.MethodGet:
+		nodes, err := s.store.ListNodes()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(nodes)
+		// 检查心跳超时（15秒）
+		now := time.Now()
+		for _, n := range nodes {
+			if n.Role == "worker" && n.Status == "online" && now.Sub(n.LastHeartbeat) > 15*time.Second {
+				n.Status = "offline"
+				_ = s.store.SaveNode(n)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(nodes)
+
+	case http.MethodPost:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "只有管理员可添加业务组件节点", http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			Name       string `json:"name"`
+			IP         string `json:"ip"`
+			Port       int    `json:"port"`
+			MountPoint string `json:"mount_point"`
+			DiskDevice string `json:"disk_device"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		req.IP = strings.TrimSpace(req.IP)
+		if req.IP == "" || req.Port <= 0 {
+			http.Error(w, "业务组件节点 IP 地址与端口不能为空且端口必须大于0", http.StatusBadRequest)
+			return
+		}
+
+		// 核心唯一性防呆校验：以 IP 和端口作为唯一标识，禁止重复添加！
+		if existing, err := s.store.GetNodeByAddr(req.IP, req.Port); err == nil && existing != nil {
+			if existing.Status != "failed" {
+				http.Error(w, fmt.Sprintf("分布式业务组件节点添加失败：节点 [%s:%d] 已存在于集群中 (名称: %s, 状态: %s)，禁止重复添加！", req.IP, req.Port, existing.Name, existing.Status), http.StatusBadRequest)
+				return
+			}
+		}
+
+		if req.Name == "" {
+			req.Name = fmt.Sprintf("worker-%s-%d", strings.ReplaceAll(req.IP, ".", "-"), req.Port)
+		}
+		nodeID := fmt.Sprintf("worker_%s_%d", strings.ReplaceAll(req.IP, ".", "_"), req.Port)
+		_ = s.store.ClearDecommissionedNode(nodeID)
+
+		newNode := &model.Node{
+			ID:            nodeID,
+			Name:          req.Name,
+			IP:            req.IP,
+			Port:          req.Port,
+			Role:          "worker",
+			Status:        "online",
+			MountPoint:    req.MountPoint,
+			DiskDevice:    req.DiskDevice,
+			JoinedAt:      time.Now(),
+			LastHeartbeat: time.Now(),
+		}
+		if err := s.store.SaveNode(newNode); err != nil {
+			http.Error(w, fmt.Sprintf("保存业务组件节点失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(newNode)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 type RemoveNodeRequest struct {
@@ -690,10 +754,26 @@ func (s *Server) handleDeployWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	opts.Host = strings.TrimSpace(opts.Host)
+	if opts.WorkerPort <= 0 {
+		opts.WorkerPort = 8081
+	}
+
 	disks := opts.GetDiskList()
 	if len(disks) == 0 {
 		http.Error(w, "安全策略限制：严禁使用系统盘存放日志！请至少选择一块独立的物理存储盘", http.StatusBadRequest)
 		return
+	}
+
+	// 核心唯一性防呆校验：以 IP 和端口作为唯一标识，检查所有待部署实例的端口是否重复，禁止重复添加！
+	for idx := range disks {
+		targetPort := opts.WorkerPort + idx
+		if existing, err := s.store.GetNodeByAddr(opts.Host, targetPort); err == nil && existing != nil {
+			if existing.Status != "failed" {
+				http.Error(w, fmt.Sprintf("分布式业务组件节点添加失败：节点 [%s:%d] 已存在于集群中 (名称: %s, 状态: %s)，禁止重复添加！", opts.Host, targetPort, existing.Name, existing.Status), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	// 自动补充 Manager 接入地址与集群凭据
@@ -771,16 +851,47 @@ func (s *Server) handleClusterHeartbeat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 核心安全防线：如果该节点已被管理员移除/注销 (Decommissioned)，拒绝心跳并返回 410 Gone，命令 Worker 退出停止
-	if s.store.IsNodeDecommissioned(node.ID) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusGone) // 410 Gone
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "decommissioned",
-			"action":  "shutdown",
-			"message": "该节点已从集群移除注销，拒绝心跳",
-		})
-		return
+	node.IP = strings.TrimSpace(node.IP)
+
+	// 核心唯一性保障：以 IP 和端口作为唯一标识，统一管理节点记录
+	existing, err := s.store.GetNodeByAddr(node.IP, node.Port)
+	if err == nil && existing != nil {
+		if s.store.IsNodeDecommissioned(existing.ID) || s.store.IsNodeDecommissioned(node.ID) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone) // 410 Gone
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "decommissioned",
+				"action":  "shutdown",
+				"message": "该节点已从集群移除注销，拒绝心跳",
+			})
+			return
+		}
+		// 继承并统一节点 ID 与元数据，杜绝同一 IP:Port 在集群中出现重复节点
+		node.ID = existing.ID
+		if node.Name == "" {
+			node.Name = existing.Name
+		}
+		if node.DiskDevice == "" {
+			node.DiskDevice = existing.DiskDevice
+		}
+		if node.JoinedAt.IsZero() {
+			node.JoinedAt = existing.JoinedAt
+		}
+	} else {
+		if s.store.IsNodeDecommissioned(node.ID) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone) // 410 Gone
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "decommissioned",
+				"action":  "shutdown",
+				"message": "该节点已从集群移除注销，拒绝心跳",
+			})
+			return
+		}
+		if node.ID == "" {
+			node.ID = fmt.Sprintf("worker_%s_%d", strings.ReplaceAll(node.IP, ".", "_"), node.Port)
+		}
+		node.JoinedAt = time.Now()
 	}
 
 	node.LastHeartbeat = time.Now()

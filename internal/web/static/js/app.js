@@ -603,6 +603,8 @@ const app = {
   openDeployModal() {
     document.getElementById("deploy-terminal-box").style.display = "none";
     document.getElementById("btn-deploy-submit").disabled = false;
+    const workerPortInput = document.getElementById("deploy-worker-port");
+    if (workerPortInput) workerPortInput.value = 8081;
     document.getElementById("deploy-disk-input").value = "";
     document.getElementById("deploy-disk-select").innerHTML = '<option value="">-- 请点击“探测目标磁盘”或手动在下方输入设备路径 --</option>';
     const listBox = document.getElementById("deploy-disk-list-box");
@@ -746,6 +748,8 @@ const app = {
   async submitDeploy() {
     const host = document.getElementById("deploy-host").value.trim();
     const port = parseInt(document.getElementById("deploy-port").value, 10);
+    const workerPortInput = document.getElementById("deploy-worker-port");
+    const workerPort = parseInt(workerPortInput ? workerPortInput.value : "8081", 10) || 8081;
     const username = document.getElementById("deploy-user").value.trim();
     const password = document.getElementById("deploy-pass").value;
     const nodeName = document.getElementById("deploy-name").value.trim();
@@ -757,6 +761,19 @@ const app = {
     if (selectedDisks.length === 0) {
       alert("【安全架构限制】严禁使用系统盘存放日志！\n增加 Worker 节点时必须至少指定一块独立的物理存储盘。\n请点击“探测目标磁盘”并勾选物理裸盘，或手动输入设备路径（如 /dev/sdb）。");
       return;
+    }
+
+    // 核心唯一性防呆校验：以 IP 和端口作为唯一标识，禁止重复添加！
+    if (this.nodes && this.nodes.length > 0) {
+      const diskCount = Math.max(1, selectedDisks.length);
+      for (let i = 0; i < diskCount; i++) {
+        const checkPort = workerPort + i;
+        const exists = this.nodes.find(n => n.role === "worker" && n.ip === host && n.port === checkPort && n.status !== "failed");
+        if (exists) {
+          alert(`【禁止重复添加】业务组件节点 [${host}:${checkPort}] 已存在于集群中 (名称: ${exists.name}, 状态: ${exists.status})，禁止重复添加！`);
+          return;
+        }
+      }
     }
 
     const fsType = document.getElementById("deploy-fstype").value;
@@ -779,9 +796,11 @@ const app = {
     const btn = document.getElementById("btn-deploy-submit");
 
     termBox.style.display = "block";
-    term.innerText = `[1/4] 准备向目标 ${host}:${port} 发起 SSH 远程一键部署...\n` +
+    const endPort = workerPort + selectedDisks.length - 1;
+    const portRangeStr = selectedDisks.length > 1 ? `${workerPort}~${endPort}` : `${workerPort}`;
+    term.innerText = `[1/4] 准备向目标 ${host}:${port} 发起 SSH 远程一键部署 (业务服务端口: ${portRangeStr})...\n` +
       `[多盘配置] 共选定 ${selectedDisks.length} 块物理硬盘: ${selectedDisks.join(', ')}\n` +
-      `[架构机制] 将为各盘分别拉起独立 Worker 进程实例 (服务端口: 8081~${8080 + selectedDisks.length}) 实现 I/O 隔离\n` +
+      `[架构机制] 将为各盘分别拉起独立 Worker 进程实例 (服务端口: ${portRangeStr}) 实现 I/O 隔离\n` +
       `[2/4] 正在传输安装包并执行磁盘格式化与挂载，请稍候...\n`;
     btn.disabled = true;
 
@@ -789,6 +808,7 @@ const app = {
       const res = await this.api("/api/nodes/deploy", "POST", {
         host,
         port,
+        worker_port: workerPort,
         username,
         password,
         node_name: nodeName,

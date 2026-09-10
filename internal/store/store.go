@@ -352,6 +352,37 @@ func (s *Store) GetNode(id string) (*model.Node, error) {
 	return n, err
 }
 
+// GetNodeByAddr 根据 IP 和 Port 查询业务组件节点 (以 IP+端口 作为唯一标识)
+func (s *Store) GetNodeByAddr(ip string, port int) (*model.Node, error) {
+	var matched *model.Node
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketNodes)
+		if b == nil {
+			return errors.New("bucket not found")
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var n model.Node
+			if err := json.Unmarshal(v, &n); err == nil {
+				if n.Role == "worker" && n.IP == ip && n.Port == port {
+					matched = &n
+					return errors.New("found")
+				}
+			}
+			return nil
+		})
+	})
+	if matched != nil {
+		if usage, err := s.CalculateNodeStorageUsage(matched.ID); err == nil {
+			matched.StorageUsedBytes = usage
+		}
+		return matched, nil
+	}
+	if err != nil && err.Error() != "found" {
+		return nil, err
+	}
+	return nil, errors.New("node not found")
+}
+
 // CalculateNodeStorageUsage 统计指定业务节点上保存的日志归档总字节数
 func (s *Store) CalculateNodeStorageUsage(nodeID string) (int64, error) {
 	var totalBytes int64
