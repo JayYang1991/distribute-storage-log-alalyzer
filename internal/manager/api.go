@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -100,11 +99,13 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/nodes/deploy", s.handleDeployWorker)
 	mux.HandleFunc("/api/nodes/detect-disks", s.handleDetectDisks)
 	mux.HandleFunc("/api/cluster/heartbeat", s.handleClusterHeartbeat)
+	mux.HandleFunc("/api/cluster/archive-callback", s.handleClusterArchiveCallback)
 	mux.HandleFunc("/api/cluster/binary", s.handleDownloadBinary)
 	mux.HandleFunc("/api/agent/install.sh", s.handleAgentInstallScript)
 
 	// 日志归档管理
 	mux.HandleFunc("/api/archives", s.handleArchives)
+	mux.HandleFunc("/api/archives/check-tag", s.handleCheckArchiveTag)
 	mux.HandleFunc("/api/archives/upload", s.handleUploadArchive)
 	mux.HandleFunc("/api/archives/", s.handleArchiveItem)
 
@@ -986,6 +987,74 @@ func parseTags(tagsStr string) []string {
 	return res
 }
 
+// findDuplicateTag 检查给定的标签列表中是否有任何一个与现有归档冲突（不区分大小写，可排除指定的归档自身）
+func (s *Server) findDuplicateTag(tags []string, excludeArchiveID string) (duplicateTag string, matchedArchive *model.LogArchive) {
+	if len(tags) == 0 {
+		return "", nil
+	}
+	existingArchives, err := s.store.ListArchives("", true)
+	if err != nil {
+		return "", nil
+	}
+	for _, candidate := range tags {
+		cLower := strings.ToLower(strings.TrimSpace(candidate))
+		if cLower == "" {
+			continue
+		}
+		for _, a := range existingArchives {
+			if excludeArchiveID != "" && a.ID == excludeArchiveID {
+				continue
+			}
+			for _, existTag := range a.Tags {
+				if strings.ToLower(strings.TrimSpace(existTag)) == cLower {
+					return candidate, a
+				}
+			}
+		}
+	}
+	return "", nil
+}
+
+func (s *Server) handleCheckArchiveTag(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	excludeID := strings.TrimSpace(r.URL.Query().Get("exclude_id"))
+
+	w.Header().Set("Content-Type", "application/json")
+	if tag == "" {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"exists": false,
+			"tag":    "",
+		})
+		return
+	}
+
+	tags := parseTags(tag)
+	if len(tags) == 0 {
+		tags = []string{tag}
+	}
+
+	dupTag, matchedArc := s.findDuplicateTag(tags, excludeID)
+	if dupTag != "" && matchedArc != nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"exists":             true,
+			"tag":                dupTag,
+			"matched_archive_id": matchedArc.ID,
+			"matched_filename":   matchedArc.Filename,
+		})
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"exists": false,
+		"tag":    tag,
+	})
+}
+
+
 func (s *Server) handleArchives(w http.ResponseWriter, r *http.Request) {
 	currentUser, err := s.authenticate(r)
 	if err != nil {
@@ -1049,10 +1118,12 @@ func (s *Server) handleArchives(w http.ResponseWriter, r *http.Request) {
 }
 
 type workerUploadResult struct {
-	Files       []*model.LogFileItem   `json:"files"`
-	TotalLines  int64                  `json:"total_lines"`
+	Status      string                 `json:"status"`
+	ArchiveID   string                 `json:"archive_id"`
+	Files       []*model.LogFileItem   `json:"files,omitempty"`
+	TotalLines  int64                  `json:"total_lines,omitempty"`
 	ExtractPath string                 `json:"extract_path"`
-	Report      *model.DiagnosisReport `json:"report"`
+	Report      *model.DiagnosisReport `json:"report,omitempty"`
 }
 
 func (s *Server) forwardUploadToWorker(node *model.Node, file io.Reader, filename string, archiveID, username, userID string, rulesList []*model.Rule) (*workerUploadResult, error) {
@@ -1100,6 +1171,56 @@ func (s *Server) forwardUploadToWorker(node *model.Node, file io.Reader, filenam
 	return &res, nil
 }
 
+func (s *Server) handleClusterArchiveCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := r.Header.Get("X-Cluster-Token")
+	if token != s.cfg.ClusterToken {
+		http.Error(w, "集群通信 Token 验证失败", http.StatusUnauthorized)
+		return
+	}
+
+	var req model.ArchiveCallbackReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	archive, err := s.store.GetArchive(req.ArchiveID)
+	if err != nil || archive == nil {
+		http.Error(w, "归档包记录未找到", http.StatusNotFound)
+		return
+	}
+
+	archive.Status = req.Status
+	archive.ErrorMsg = req.ErrorMsg
+	if req.Status == "ready" {
+		archive.FileCount = req.FileCount
+		archive.TotalLines = req.TotalLines
+		archive.FinishTime = time.Now()
+		if req.ExtractPath != "" {
+			archive.ExtractPath = req.ExtractPath
+		}
+	}
+
+	if err := s.store.SaveArchive(archive); err != nil {
+		http.Error(w, fmt.Sprintf("保存归档状态失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if req.Report != nil {
+		_ = s.store.SaveReport(req.Report)
+	}
+
+	log.Printf("[Manager Callback] 归档包 %s 状态已成功更新为 %s (总行数: %d, 文件数: %d)",
+		archive.ID, archive.Status, archive.TotalLines, archive.FileCount)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+}
+
 func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 	currentUser, err := s.authenticate(r)
 	if err != nil {
@@ -1135,6 +1256,19 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 	tagsStr := r.FormValue("tags")
 	remark := r.FormValue("remark")
 	tags := parseTags(tagsStr)
+
+	// 1. 标签必填且不可为空 (标签为唯一标识)
+	if len(tags) == 0 {
+		http.Error(w, "必须输入日志归档标签，标签为归档唯一标识", http.StatusBadRequest)
+		return
+	}
+
+	// 2. 标签唯一性检查：不可与系统中任何已有归档标签重复
+	if dupTag, matchedArc := s.findDuplicateTag(tags, ""); dupTag != "" {
+		http.Error(w, fmt.Sprintf("标签 “%s” 已被归档包 [%s] 占用，归档标签必须保持全系统唯一", dupTag, matchedArc.Filename), http.StatusBadRequest)
+		return
+	}
+
 	archiveID := fmt.Sprintf("arc_%d", time.Now().UnixNano())
 
 	// 检查目标存储节点：日志只能保存在业务存储上，严禁写入管理节点系统盘
@@ -1177,6 +1311,11 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	status := "ready"
+	if wRes.Status != "" {
+		status = wRes.Status
+	}
+
 	archive := &model.LogArchive{
 		ID:              archiveID,
 		UserID:          currentUser.ID,
@@ -1184,7 +1323,7 @@ func (s *Server) handleUploadArchive(w http.ResponseWriter, r *http.Request) {
 		Filename:        header.Filename,
 		Size:            header.Size,
 		Format:          detectArchiveFormat(header.Filename),
-		Status:          "ready",
+		Status:          status,
 		FileCount:       len(wRes.Files),
 		TotalLines:      wRes.TotalLines,
 		ExtractPath:     wRes.ExtractPath,
@@ -1245,9 +1384,18 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			resp, err := http.Get(url)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.Copy(w, resp.Body)
-				return
+				var remoteFiles []*model.LogFileItem
+				if err := json.NewDecoder(resp.Body).Decode(&remoteFiles); err == nil {
+					filtered := make([]*model.LogFileItem, 0, len(remoteFiles))
+					for _, f := range remoteFiles {
+						if !model.IsInternalIndexFile(f.RelativePath) {
+							filtered = append(filtered, f)
+						}
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(filtered)
+					return
+				}
 			}
 		}
 
@@ -1258,7 +1406,7 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 				return nil
 			}
 			rel, _ := filepath.Rel(archive.ExtractPath, p)
-			if rel == "." {
+			if rel == "." || model.IsInternalIndexFile(rel) {
 				return nil
 			}
 			files = append(files, &model.LogFileItem{
@@ -1282,6 +1430,10 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "缺少文件相对路径参数 path", http.StatusBadRequest)
 			return
 		}
+		if model.IsInternalIndexFile(relPath) {
+			http.Error(w, "系统内部索引文件禁止直接浏览", http.StatusForbidden)
+			return
+		}
 
 		// 若日志存放在远程业务节点，代理从该节点获取
 		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
@@ -1303,55 +1455,28 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		f, err := os.Open(fullPath)
-		if err != nil {
-			http.Error(w, "无法读取文件", http.StatusNotFound)
-			return
-		}
-		defer f.Close()
-
 		startLine, _ := strconv.Atoi(r.URL.Query().Get("start_line"))
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		if limit <= 0 {
-			limit = 500
-		}
-		if limit > 5000 {
-			limit = 5000
-		}
-		if startLine <= 0 {
-			startLine = 1
+
+		lines, hasMore, totalLines, err := worker.ReadFileLinesWithIndex(fullPath, startLine, limit)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("无法读取文件: %v", err), http.StatusInternalServerError)
+			return
 		}
 
-		var lines []string
-		scanner := bufio.NewScanner(f)
-		buf := make([]byte, 1024*1024)
-		scanner.Buffer(buf, 10*1024*1024)
-
-		current := 0
-		for scanner.Scan() {
-			current++
-			if current < startLine {
-				continue
-			}
-			lines = append(lines, scanner.Text())
-			if len(lines) >= limit {
-				break
-			}
-		}
-
-		hasMore := false
-		if len(lines) >= limit && scanner.Scan() {
-			hasMore = true
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		respMap := map[string]interface{}{
 			"file_path":  relPath,
 			"start_line": startLine,
 			"line_count": len(lines),
 			"lines":      lines,
 			"has_more":   hasMore,
-		})
+		}
+		if totalLines > 0 {
+			respMap["total_lines"] = totalLines
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(respMap)
 		return
 	}
 
@@ -1360,6 +1485,10 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		relPath := r.URL.Query().Get("path")
 		if relPath == "" {
 			http.Error(w, "缺少文件相对路径参数 path", http.StatusBadRequest)
+			return
+		}
+		if model.IsInternalIndexFile(relPath) {
+			http.Error(w, "系统内部索引文件禁止下载", http.StatusForbidden)
 			return
 		}
 
@@ -1490,6 +1619,16 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(rawList)
 			archive.Tags = parseTags(string(data))
 		}
+
+		if len(archive.Tags) == 0 {
+			http.Error(w, "日志归档标签不能为空，标签为归档唯一标识", http.StatusBadRequest)
+			return
+		}
+		if dupTag, matchedArc := s.findDuplicateTag(archive.Tags, archive.ID); dupTag != "" {
+			http.Error(w, fmt.Sprintf("标签 “%s” 已被归档包 [%s] 占用，归档标签必须保持全系统唯一", dupTag, matchedArc.Filename), http.StatusBadRequest)
+			return
+		}
+
 		archive.Remark = strings.TrimSpace(req.Remark)
 		if err := s.store.SaveArchive(archive); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1517,11 +1656,54 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 
 	// 删除归档包
 	if r.Method == http.MethodDelete {
+		if !isAdmin && archive.Username != currentUser.Username {
+			http.Error(w, "无权删除该日志归档包", http.StatusForbidden)
+			return
+		}
+
+		// 1. 若日志存放在业务存储节点上，通知该 Worker 节点彻底清理磁盘文件与解压目录
+		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
+			cleanURL := fmt.Sprintf("http://%s:%d/api/worker/storage/clean-archive?username=%s&archive_id=%s&filename=%s&extract_path=%s",
+				archive.StorageNodeIP, archive.StorageNodePort,
+				url.QueryEscape(archive.Username),
+				url.QueryEscape(archive.ID),
+				url.QueryEscape(archive.Filename),
+				url.QueryEscape(archive.ExtractPath),
+			)
+			client := &http.Client{Timeout: 15 * time.Second}
+			req, reqErr := http.NewRequest(http.MethodDelete, cleanURL, nil)
+			if reqErr == nil {
+				resp, respErr := client.Do(req)
+				if respErr == nil {
+					_ = resp.Body.Close()
+					log.Printf("[Manager Storage] 已成功通知业务节点 %s (%s:%d) 清理日志包 %s 的磁盘空间",
+						archive.StorageNodeName, archive.StorageNodeIP, archive.StorageNodePort, archive.Filename)
+				} else {
+					log.Printf("[Manager Storage] 通知业务节点清理日志包失败: %v，将尝试本地清理", respErr)
+				}
+			}
+		}
+
+		// 2. 本地直接清理兜底 (针对本地挂载、管理节点存储或同机部署场景)
+		if archive.ExtractPath != "" {
+			_ = os.RemoveAll(archive.ExtractPath)
+			workerArchiveFile := filepath.Join(filepath.Dir(filepath.Dir(archive.ExtractPath)), "archives", archive.Filename)
+			if _, statErr := os.Stat(workerArchiveFile); statErr == nil {
+				_ = os.Remove(workerArchiveFile)
+			}
+		}
+
+		// 3. 数据库元数据与诊断报告清理
 		if err := s.store.DeleteArchive(archiveID, currentUser.Username, isAdmin); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": "日志包及占用磁盘空间已彻底清理",
+		})
 		return
 	}
 
@@ -1578,18 +1760,25 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			"query":       q,
 		}
 		data, _ := json.Marshal(taskReq)
-		resp, err := http.Post(url, "application/json", bytes.NewReader(data))
-		if err == nil && resp.StatusCode == http.StatusOK {
-			defer resp.Body.Close()
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.Copy(w, resp.Body)
-			return
+		req, reqErr := http.NewRequestWithContext(r.Context(), "POST", url, bytes.NewReader(data))
+		if reqErr == nil {
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
 		}
 	}
 
 	// 本地执行检索
-	resp, err := worker.SearchLogs(archive.ExtractPath, &q)
+	resp, err := worker.SearchLogsContext(r.Context(), archive.ExtractPath, &q)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		http.Error(w, fmt.Sprintf("检索失败: %v", err), http.StatusInternalServerError)
 		return
 	}

@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // User 角色定义
 const (
@@ -158,6 +161,18 @@ type DiagnosisReport struct {
 	AnalyzedAt      time.Time        `json:"analyzed_at"`
 }
 
+// ArchiveCallbackReq Worker 异步解包与诊断完成后向 Manager 回调上报的数据包
+type ArchiveCallbackReq struct {
+	ArchiveID   string           `json:"archive_id"`
+	Status      string           `json:"status"` // ready, failed
+	ErrorMsg    string           `json:"error_msg,omitempty"`
+	Files       []*LogFileItem   `json:"files,omitempty"`
+	FileCount   int              `json:"file_count"`
+	TotalLines  int64            `json:"total_lines"`
+	ExtractPath string           `json:"extract_path"`
+	Report      *DiagnosisReport `json:"report,omitempty"`
+}
+
 // SearchQuery 日志检索请求
 type SearchQuery struct {
 	ArchiveID    string `json:"archive_id"`
@@ -184,13 +199,21 @@ type SearchHit struct {
 	ContextAfter  []string `json:"context_after"`
 }
 
+// SearchFileSummary 单个文件的检索匹配汇总
+type SearchFileSummary struct {
+	FilePath  string `json:"file_path"`
+	TotalHits int64  `json:"total_hits"`
+	MaxLevel  string `json:"max_level,omitempty"`
+}
+
 // SearchResponse 检索响应
 type SearchResponse struct {
-	TotalHits int64       `json:"total_hits"`
-	Page      int         `json:"page"`
-	PageSize  int         `json:"page_size"`
-	Hits      []SearchHit `json:"hits"`
-	CostMS    int64       `json:"cost_ms"`
+	TotalHits     int64               `json:"total_hits"`
+	Page          int                 `json:"page"`
+	PageSize      int                 `json:"page_size"`
+	Hits          []SearchHit         `json:"hits"`
+	FileSummaries []SearchFileSummary `json:"file_summaries,omitempty"`
+	CostMS        int64               `json:"cost_ms"`
 }
 
 // HAStatus 高可用主备状态
@@ -272,4 +295,14 @@ type AlarmSummary struct {
 	CriticalCount int `json:"critical_count"`
 	WarningCount  int `json:"warning_count"`
 	InfoCount     int `json:"info_count"`
+}
+
+// IsInternalIndexFile 判断文件相对路径或名称是否属于系统生成的稀疏矩阵索引、布隆过滤器等内部辅助文件
+func IsInternalIndexFile(p string) bool {
+	if p == "" {
+		return false
+	}
+	name := strings.ToLower(p)
+	return strings.HasSuffix(name, ".lidx") || strings.HasSuffix(name, ".bidx") ||
+		strings.HasSuffix(name, ".lidx.tmp") || strings.HasSuffix(name, ".bidx.tmp")
 }

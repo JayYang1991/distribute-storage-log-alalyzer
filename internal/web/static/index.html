@@ -264,19 +264,9 @@
                   </select>
                 </div>
                 <div>
-                  <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: #38bdf8;">🏷️ 自定义标签 (逗号分隔):</label>
-                  <input type="text" class="form-control" id="upload-tags" placeholder="例如: Ceph, 生产故障, OSD" list="default-tags-datalist">
-                  <datalist id="default-tags-datalist">
-                    <option value="Ceph">
-                    <option value="HDFS">
-                    <option value="MinIO">
-                    <option value="GlusterFS">
-                    <option value="生产环境">
-                    <option value="测试环境">
-                    <option value="核心故障">
-                    <option value="慢请求">
-                    <option value="网络超时">
-                  </datalist>
+                  <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: #38bdf8;">🏷️ 归档唯一标签 <span style="color: #ef4444; font-size: 11px;">* (必填且唯一)</span>:</label>
+                  <input type="text" class="form-control" id="upload-tags" placeholder="例如: Ceph-Cluster-01 (唯一标识)" autocomplete="off">
+                  <div id="upload-tag-tip" style="font-size: 11px; margin-top: 4px; min-height: 16px; display: none;"></div>
                 </div>
                 <div>
                   <label class="form-label" style="margin-bottom: 4px; font-weight: 600; color: #c084fc;">📝 备注说明:</label>
@@ -732,7 +722,13 @@
                   </label>
                 </div>
               </div>
-              <div id="archive-search-summary" style="padding: 6px 12px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border-color); display: none;"></div>
+              <div id="archive-search-summary" style="padding: 6px 12px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border-color); display: none; align-items: center; justify-content: space-between;">
+                <span id="archive-search-summary-text"></span>
+                <div id="archive-search-summary-actions" style="display: flex; gap: 6px;">
+                  <button class="btn btn-secondary btn-sm" onclick="app.toggleAllArchiveFileGroups(true)" style="padding: 2px 6px; font-size: 10px;">全部展开</button>
+                  <button class="btn btn-secondary btn-sm" onclick="app.toggleAllArchiveFileGroups(false)" style="padding: 2px 6px; font-size: 10px;">全部折叠</button>
+                </div>
+              </div>
               <div id="archive-search-results" class="archive-search-hits">
                 <div style="text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 12px;">
                   输入关键词并在当前日志压缩包内执行全局搜索
@@ -761,7 +757,7 @@
             <div class="file-viewer-search-bar" id="viewer-search-bar">
               <div style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;">
                 <span style="font-size: 13px;">🔍</span>
-                <input type="text" id="viewer-search-kw" class="form-control form-control-sm" style="flex: 1; max-width: 320px;" placeholder="在当前文件内搜索 (Enter 下一个, Shift+Enter 上一个)..." oninput="app.onViewerSearchInput()" onkeydown="app.onViewerSearchKeydown(event)">
+                <input type="text" id="viewer-search-kw" class="form-control form-control-sm" style="flex: 1; max-width: 300px;" placeholder="全文件搜索 (Enter 下一个, Shift+Enter 上一个)..." oninput="app.onViewerSearchInput()" onkeydown="app.onViewerSearchKeydown(event)">
                 <span id="viewer-search-counter" class="badge badge-muted" style="font-size: 11px;">0 / 0</span>
                 <button class="btn btn-secondary btn-xs" title="上一个匹配 (Shift+Enter)" onclick="app.viewerSearchPrev()">⬆️</button>
                 <button class="btn btn-secondary btn-xs" title="下一个匹配 (Enter)" onclick="app.viewerSearchNext()">⬇️</button>
@@ -770,6 +766,9 @@
                 </label>
                 <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer;">
                   <input type="checkbox" id="viewer-search-regex" onchange="app.onViewerSearchInput()"> 正则
+                </label>
+                <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer; color: var(--primary); font-weight: 600; margin-left: 8px;" title="勾选时仅显示包含关键字的日志行，隐藏不相关的常规日志">
+                  <input type="checkbox" id="viewer-search-filter-mode" onchange="app.onViewerFilterModeChange()"> 过滤模式
                 </label>
               </div>
               <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 11px;">
@@ -1070,9 +1069,9 @@
             <input type="text" class="form-control" id="archive-meta-filename" disabled style="opacity: 0.7; cursor: not-allowed;">
           </div>
           <div class="form-group">
-            <label class="form-label">自定义标签 (支持多个，逗号分隔)</label>
-            <input type="text" class="form-control" id="archive-meta-tags" placeholder="例如: Ceph, 生产故障, OSD" list="default-tags-datalist">
-            <small style="color: var(--text-dim); font-size: 11px; margin-top: 4px; display: block;">打上标签后可在搜索栏直接输入或点击标签徽章快速过滤定位该日志包</small>
+            <label class="form-label">归档唯一标签 <span style="color: #ef4444; font-size: 11px;">* (必填且唯一)</span></label>
+            <input type="text" class="form-control" id="archive-meta-tags" placeholder="例如: Ceph-Cluster-01 (唯一标识)" autocomplete="off">
+            <div id="archive-meta-tag-tip" style="font-size: 11px; margin-top: 4px; min-height: 16px; display: none;"></div>
           </div>
           <div class="form-group">
             <label class="form-label">备注说明信息</label>

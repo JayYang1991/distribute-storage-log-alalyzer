@@ -543,14 +543,20 @@ func (s *Store) DeleteArchive(id, username string, isAdmin bool) error {
 	if !isAdmin && a.Username != username {
 		return errors.New("permission denied")
 	}
-	// 删除物理文件及解包目录
+	// 1. 删除物理文件及解包目录
 	if a.ExtractPath != "" {
 		_ = os.RemoveAll(a.ExtractPath)
+		if a.Filename != "" {
+			workerArchive := filepath.Join(filepath.Dir(filepath.Dir(a.ExtractPath)), "archives", a.Filename)
+			_ = os.Remove(workerArchive)
+		}
 	}
-	archiveFile := filepath.Join(s.GetUserArchiveDir(a.Username), a.Filename)
-	_ = os.Remove(archiveFile)
+	if a.Filename != "" {
+		archiveFile := filepath.Join(s.GetUserArchiveDir(a.Username), a.Filename)
+		_ = os.Remove(archiveFile)
+	}
 
-	// 删除关联的诊断报告
+	// 2. 删除关联的诊断报告
 	_ = s.DeleteReport(id)
 
 	return s.db.Update(func(tx *bolt.Tx) error {

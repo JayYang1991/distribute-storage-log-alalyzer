@@ -290,6 +290,9 @@ func TestDeployWorkerBlockSystemDiskLive(t *testing.T) {
 }
 
 func TestDeployWorkerMultiDiskSuccessLive(t *testing.T) {
+	if os.Getenv("TEST_LIVE_SSH") != "1" {
+		t.Skip("跳过虚拟机真实 SSH 破坏性多盘覆盖部署测试 (设置 TEST_LIVE_SSH=1 时才运行，避免终止线上环境运行的 Worker 守护服务)")
+	}
 	key := getTestSSHPrivateKey()
 	if key == "" {
 		t.Skip("跳过虚拟机真实 SSH 测试 (未提供 SSH 私钥)")
@@ -353,12 +356,18 @@ func TestDeployWorkerMultiDiskSuccessLive(t *testing.T) {
 		_ = runRemoteCmd(client, fmt.Sprintf("sudo -n kill -9 %s", oldPID), nil)
 	}
 
-	// 3. 等待 Systemd 触发 RestartSec (3s) 自动拉起
-	time.Sleep(4500 * time.Millisecond)
+	// 3. 等待 Systemd 触发 RestartSec (3s) 自动拉起 (最多等待 8 秒)
+	var cmdErr error
+	for i := 0; i < 16; i++ {
+		time.Sleep(500 * time.Millisecond)
+		activeBuf.Reset()
+		cmdErr = runRemoteCmd(client, "sudo -n systemctl is-active dist-log-worker-vdb.service 2>/dev/null || true", &activeBuf)
+		if strings.TrimSpace(activeBuf.String()) == "active" {
+			break
+		}
+	}
 
 	// 4. 再次验证 Systemd 自动拉起后的健康状态与新 PID
-	activeBuf.Reset()
-	cmdErr := runRemoteCmd(client, "sudo -n systemctl is-active dist-log-worker-vdb.service 2>/dev/null || true", &activeBuf)
 	t.Logf("二次检查 activeBuf: %q, cmdErr: %v", activeBuf.String(), cmdErr)
 	if strings.TrimSpace(activeBuf.String()) != "active" {
 		t.Fatalf("故障后未成功自动拉起，当前状态: %q (err: %v)", activeBuf.String(), cmdErr)

@@ -304,6 +304,9 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 }
 
 func isLogFile(name string) bool {
+	if model.IsInternalIndexFile(name) {
+		return false
+	}
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".log", ".txt", ".out", ".err", ".trace", ".json", ".csv", "":

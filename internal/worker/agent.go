@@ -151,43 +151,128 @@ func (a *Agent) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("创建本地目标存储文件失败: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer destFile.Close()
 
-	if _, err := io.Copy(destFile, file); err != nil {
-		a.ReportAlarm(model.AlarmTypeDiskReadOnly, model.SeverityCritical, "日志写入磁盘发生 I/O 异常", fmt.Sprintf("节点 %s 写入文件 %s 失败: %v", a.cfg.NodeName, destPath, err))
-		http.Error(w, fmt.Sprintf("写入文件失败: %v", err), http.StatusInternalServerError)
+	bw := bufio.NewWriterSize(destFile, 2*1024*1024)
+	bufPtr := extractBufPool.Get().(*[]byte)
+	_, copyErr := io.CopyBuffer(bw, file, *bufPtr)
+	extractBufPool.Put(bufPtr)
+	_ = bw.Flush()
+	destFile.Close()
+
+	if copyErr != nil {
+		a.ReportAlarm(model.AlarmTypeDiskReadOnly, model.SeverityCritical, "日志写入磁盘发生 I/O 异常", fmt.Sprintf("节点 %s 写入文件 %s 失败: %v", a.cfg.NodeName, destPath, copyErr))
+		http.Error(w, fmt.Sprintf("写入文件失败: %v", copyErr), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[Worker Storage] 日志包已持久化存放在本节点硬盘: %s", destPath)
+	log.Printf("[Worker Storage] 日志包已持久化存放在本节点硬盘: %s，立即响应管理节点并后台启动异步解包与诊断", destPath)
 
-	// 2. 本地解包与文件树提取
+	// 2. 后台异步执行大文件解包、行数统计与规则诊断
+	go a.asyncProcessArchive(archiveID, userID, header.Filename, destPath, extractDir, ruleList)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "extracting",
+		"archive_id":   archiveID,
+		"extract_path": extractDir,
+	})
+}
+
+// asyncProcessArchive 业务节点后台异步解包与规则匹配诊断
+func (a *Agent) asyncProcessArchive(archiveID, userID, filename, destPath, extractDir string, ruleList []*model.Rule) {
+	a.mu.Lock()
+	a.activeTask++
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.activeTask--
+		a.mu.Unlock()
+	}()
+
+	log.Printf("[Worker Storage] 后台开始异步解包: %s -> %s", filename, extractDir)
 	files, totalLines, err := ExtractArchive(destPath, extractDir)
 	if err != nil {
 		errMsg := err.Error()
 		if strings.Contains(strings.ToLower(errMsg), "no space left on device") {
 			errMsg = fmt.Sprintf("存储磁盘空间不足 (no space left on device): %v", err)
 		}
-		a.ReportAlarm(model.AlarmTypeTaskFailed, model.SeverityWarning, "日志归档解压缩失败", fmt.Sprintf("节点 %s 解压缩文件 %s 发生异常: %v", a.cfg.NodeName, header.Filename, errMsg))
-		http.Error(w, fmt.Sprintf("解包失败: %v", errMsg), http.StatusInternalServerError)
+		a.ReportAlarm(model.AlarmTypeTaskFailed, model.SeverityWarning, "日志归档解压缩失败", fmt.Sprintf("节点 %s 解压缩文件 %s 发生异常: %v", a.cfg.NodeName, filename, errMsg))
+		a.reportArchiveCallback(&model.ArchiveCallbackReq{
+			ArchiveID:   archiveID,
+			Status:      "failed",
+			ErrorMsg:    fmt.Sprintf("解包失败: %v", errMsg),
+			ExtractPath: extractDir,
+		})
 		return
 	}
 
-	// 3. 执行规则匹配诊断
+	log.Printf("[Worker Storage] 异步解包完成: %s (总行数: %d, 文件数: %d)，开始规则匹配诊断...", filename, totalLines, len(files))
+
+	// 异步预热构建稀疏行号索引与分块布隆索引，彻底消除后续全文件随机跨行翻页与初次搜索时的索引等待
+	go func(targetFiles []*model.LogFileItem, baseDir string) {
+		for _, f := range targetFiles {
+			if f.IsDirectory {
+				continue
+			}
+			fullPath := filepath.Join(baseDir, f.RelativePath)
+			_, _ = GetOrBuildLineIndex(fullPath)
+			_, _ = GetOrBuildBloomIndex(fullPath)
+		}
+	}(files, extractDir)
 	engine := rules.NewEngine(ruleList)
-	report, err := engine.DiagnoseDirectory(archiveID, userID, header.Filename, extractDir)
+	report, err := engine.DiagnoseDirectory(archiveID, userID, filename, extractDir)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("诊断失败: %v", err), http.StatusInternalServerError)
+		log.Printf("[Worker Storage] 规则诊断发生异常: %v", err)
+	}
+
+	a.reportArchiveCallback(&model.ArchiveCallbackReq{
+		ArchiveID:   archiveID,
+		Status:      "ready",
+		Files:       files,
+		FileCount:   len(files),
+		TotalLines:  totalLines,
+		ExtractPath: extractDir,
+		Report:      report,
+	})
+	log.Printf("[Worker Storage] 日志包 %s 异步解包与诊断全部完成并已上报 Manager", filename)
+}
+
+// reportArchiveCallback 向管理节点上报异步解包与诊断完成状态
+func (a *Agent) reportArchiveCallback(reqPayload *model.ArchiveCallbackReq) {
+	data, err := json.Marshal(reqPayload)
+	if err != nil {
+		log.Printf("[Worker Callback] 序列化回调数据失败: %v", err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"files":        files,
-		"total_lines":  totalLines,
-		"extract_path": extractDir,
-		"report":       report,
-	})
+	mgrURLs := strings.Split(a.cfg.ManagerURL, ",")
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	for _, rawURL := range mgrURLs {
+		cleanURL := strings.TrimSpace(rawURL)
+		if cleanURL == "" {
+			continue
+		}
+		targetURL := fmt.Sprintf("%s/api/cluster/archive-callback", strings.TrimRight(cleanURL, "/"))
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cluster-Token", a.cfg.ClusterToken)
+
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				log.Printf("[Worker Callback] 成功向管理节点 (%s) 上报归档包 %s 状态: %s", cleanURL, reqPayload.ArchiveID, reqPayload.Status)
+				return
+			}
+		}
+	}
+	log.Printf("[Worker Callback] 警告: 未能向任何 Manager 成功上报归档包 %s 状态", reqPayload.ArchiveID)
 }
 
 var contentBufPool = sync.Pool{
@@ -205,6 +290,10 @@ func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "缺少必要参数 path 或 extract_path", http.StatusBadRequest)
 		return
 	}
+	if model.IsInternalIndexFile(relPath) {
+		http.Error(w, "系统内部索引文件禁止直接浏览", http.StatusForbidden)
+		return
+	}
 
 	fullPath := filepath.Join(extractPath, relPath)
 	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(extractPath)) {
@@ -212,56 +301,28 @@ func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	f, err := os.Open(fullPath)
-	if err != nil {
-		http.Error(w, "无法读取文件", http.StatusNotFound)
-		return
-	}
-	defer f.Close()
-
 	startLine, _ := strconv.Atoi(r.URL.Query().Get("start_line"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 {
-		limit = 500
-	}
-	if limit > 5000 {
-		limit = 5000
-	}
-	if startLine <= 0 {
-		startLine = 1
+
+	lines, hasMore, totalLines, err := ReadFileLinesWithIndex(fullPath, startLine, limit)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("无法读取文件: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	lines := make([]string, 0, limit)
-	scanner := bufio.NewScanner(f)
-	bufPtr := contentBufPool.Get().(*[]byte)
-	defer contentBufPool.Put(bufPtr)
-	scanner.Buffer(*bufPtr, 10*1024*1024)
-
-	current := 0
-	for scanner.Scan() {
-		current++
-		if current < startLine {
-			continue
-		}
-		lines = append(lines, scanner.Text())
-		if len(lines) >= limit {
-			break
-		}
-	}
-
-	hasMore := false
-	if len(lines) >= limit && scanner.Scan() {
-		hasMore = true
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	respMap := map[string]interface{}{
 		"file_path":  relPath,
 		"start_line": startLine,
 		"line_count": len(lines),
 		"lines":      lines,
 		"has_more":   hasMore,
-	})
+	}
+	if totalLines > 0 {
+		respMap["total_lines"] = totalLines
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(respMap)
 }
 
 // handleStorageDownloadFile 直接下载业务节点硬盘上解压目录中的指定日志文件
@@ -270,6 +331,10 @@ func (a *Agent) handleStorageDownloadFile(w http.ResponseWriter, r *http.Request
 	extractPath := r.URL.Query().Get("extract_path")
 	if relPath == "" || extractPath == "" {
 		http.Error(w, "缺少必要参数 path 或 extract_path", http.StatusBadRequest)
+		return
+	}
+	if model.IsInternalIndexFile(relPath) {
+		http.Error(w, "系统内部索引文件禁止下载", http.StatusForbidden)
 		return
 	}
 
@@ -367,8 +432,24 @@ func (a *Agent) handleStorageCleanArchive(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// 支持直接指定 extract_path 清理
+	extractPath := r.URL.Query().Get("extract_path")
+	if extractPath != "" {
+		cleanExtract := filepath.Clean(extractPath)
+		_ = os.RemoveAll(cleanExtract)
+		if filename != "" {
+			siblingArchive := filepath.Join(filepath.Dir(filepath.Dir(cleanExtract)), "archives", filename)
+			_ = os.Remove(siblingArchive)
+		}
+	}
+
+	log.Printf("[Worker Storage] 磁盘清理执行完毕: archive_id=%s, filename=%s, username=%s", archiveID, filename, username)
+
+	// 异步立即触发一次心跳上报，更新 Manager 侧该节点的最新磁盘用量统计
+	go a.sendHeartbeat()
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "message": "磁盘空间已释放"})
 }
 
 // handleStorageFiles 读取指定解压目录的文件树
@@ -386,7 +467,7 @@ func (a *Agent) handleStorageFiles(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		rel, _ := filepath.Rel(extractPath, p)
-		if rel == "." {
+		if rel == "." || model.IsInternalIndexFile(rel) {
 			return nil
 		}
 		files = append(files, &model.LogFileItem{
@@ -440,6 +521,18 @@ func (a *Agent) handleAnalyzeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 异步预热构建稀疏行号索引与分块布隆索引
+	go func(targetFiles []*model.LogFileItem, baseDir string) {
+		for _, f := range targetFiles {
+			if f.IsDirectory {
+				continue
+			}
+			fullPath := filepath.Join(baseDir, f.RelativePath)
+			_, _ = GetOrBuildLineIndex(fullPath)
+			_, _ = GetOrBuildBloomIndex(fullPath)
+		}
+	}(files, req.ExtractDir)
+
 	// 规则诊断
 	engine := rules.NewEngine(req.Rules)
 	report, err := engine.DiagnoseDirectory(req.ArchiveID, req.UserID, req.ArchivePath, req.ExtractDir)
@@ -470,8 +563,11 @@ func (a *Agent) handleSearchTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := SearchLogs(req.ExtractDir, &req.Query)
+	resp, err := SearchLogsContext(r.Context(), req.ExtractDir, &req.Query)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

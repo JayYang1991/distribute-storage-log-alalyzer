@@ -82,6 +82,18 @@ func (sc *Scheduler) runLocalAnalyze(archive *model.LogArchive, archivePath, ext
 	archive.ExtractPath = extractDir
 	_ = sc.store.SaveArchive(archive)
 
+	// 异步预热构建稀疏行号索引与分块布隆索引，消除后续跳转与搜索首次构建等待
+	go func(targetFiles []*model.LogFileItem, baseDir string) {
+		for _, f := range targetFiles {
+			if f.IsDirectory {
+				continue
+			}
+			fullPath := filepath.Join(baseDir, f.RelativePath)
+			_, _ = worker.GetOrBuildLineIndex(fullPath)
+			_, _ = worker.GetOrBuildBloomIndex(fullPath)
+		}
+	}(files, extractDir)
+
 	// 执行规则匹配诊断
 	engine := rules.NewEngine(ruleList)
 	report, err := engine.DiagnoseDirectory(archive.ID, archive.UserID, archive.Filename, extractDir)

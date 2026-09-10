@@ -447,6 +447,30 @@ tr:hover td {
   box-shadow: 0 0 8px var(--primary-glow);
 }
 
+.form-control.input-error {
+  border-color: #ef4444 !important;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.4) !important;
+}
+
+.form-control.input-valid {
+  border-color: #10b981 !important;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.3) !important;
+}
+
+.tag-tip-error {
+  color: #ef4444;
+  display: flex !important;
+  align-items: center;
+  gap: 4px;
+}
+
+.tag-tip-valid {
+  color: #10b981;
+  display: flex !important;
+  align-items: center;
+  gap: 4px;
+}
+
 /* 上传拖拽区域 */
 .dropzone {
   border: 2px dashed var(--border-color);
@@ -484,12 +508,14 @@ tr:hover td {
   z-index: 1000;
   opacity: 0;
   visibility: hidden;
+  pointer-events: none;
   transition: var(--transition);
 }
 
 .modal-overlay.active {
   opacity: 1;
   visibility: visible;
+  pointer-events: auto;
 }
 
 .modal-content {
@@ -817,6 +843,91 @@ tr:hover td {
   white-space: nowrap;
 }
 
+/* 压缩包内搜索结果 - 按文件分组手风琴样式 */
+.archive-file-group {
+  margin: 6px 8px 10px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.archive-file-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: rgba(30, 41, 59, 0.8);
+  border-bottom: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+  font-size: 12px;
+}
+
+.archive-file-group-header:hover {
+  background: rgba(51, 65, 85, 0.9);
+  color: var(--primary);
+}
+
+.archive-file-group.expanded .archive-file-group-header {
+  border-bottom-color: var(--border-color);
+  background: rgba(30, 41, 59, 0.95);
+}
+
+.archive-file-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.archive-file-group-toggle {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--text-dim);
+  transition: transform 0.2s ease;
+  width: 12px;
+}
+
+.archive-file-group.expanded .archive-file-group-toggle {
+  transform: rotate(90deg);
+}
+
+.archive-file-group-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.archive-file-group-body {
+  display: none;
+}
+
+.archive-file-group.expanded .archive-file-group-body {
+  display: block;
+}
+
+.archive-file-group-loadmore {
+  padding: 8px 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--primary);
+  background: rgba(15, 23, 42, 0.6);
+  border-top: 1px dashed var(--border-color);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.archive-file-group-loadmore:hover {
+  background: rgba(56, 189, 248, 0.15);
+}
+
 .file-viewer {
   flex: 1;
   background: #0b0f19;
@@ -911,6 +1022,46 @@ mark.v-match.v-match-active {
   color: #000;
   font-weight: bold;
   box-shadow: 0 0 0 2px #fbbf24;
+}
+
+.v-filter-ctx-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--primary);
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 4px;
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: var(--transition);
+  opacity: 0.6;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.v-line:hover .v-filter-ctx-btn {
+  opacity: 1;
+}
+
+.v-filter-ctx-btn:hover {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.v-filter-header {
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border-color);
+  padding: 8px 14px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 /* 日志检索命中条目 */
