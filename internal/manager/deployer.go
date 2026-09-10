@@ -491,9 +491,14 @@ func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
 		}
 	}
 
-	// 4. 停止所有旧的 worker 进程与已注册的 systemd 服务 (防止自动拉起竞争)
-	stopCmd := fmt.Sprintf("%ssystemctl stop 'dist-log-worker-*.service' 2>/dev/null || true; %spkill -9 -f '%s/bin/dist-log-analyzer worker' 2>/dev/null || true; %schown -R %s %s 2>/dev/null || true; chmod +x %s/bin/dist-log-analyzer 2>/dev/null || true",
-		sudoPrefix, sudoPrefix, opts.InstallDir, sudoPrefix, opts.Username, opts.InstallDir, opts.InstallDir)
+	// 4. 仅停止本次待部署磁盘对应的旧 worker 服务与进程，保留目标主机上其他磁盘 Worker 正常运行
+	var stopSvcs []string
+	for _, d := range disks {
+		dName := filepath.Base(d)
+		stopSvcs = append(stopSvcs, fmt.Sprintf("%ssystemctl stop dist-log-worker-%s.service 2>/dev/null || true", sudoPrefix, dName))
+	}
+	stopCmd := fmt.Sprintf("%s; %schown -R %s %s 2>/dev/null || true; chmod +x %s/bin/dist-log-analyzer 2>/dev/null || true",
+		strings.Join(stopSvcs, "; "), sudoPrefix, opts.Username, opts.InstallDir, opts.InstallDir)
 	_ = runRemoteCmd(client, stopCmd, logWriter)
 
 	// 检测目标机器是否支持 Systemd 守护进程
