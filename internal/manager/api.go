@@ -1197,8 +1197,12 @@ func (s *Server) handleClusterArchiveCallback(w http.ResponseWriter, r *http.Req
 	archive.Status = req.Status
 	archive.ErrorMsg = req.ErrorMsg
 	if req.Status == "ready" {
-		archive.FileCount = req.FileCount
-		archive.TotalLines = req.TotalLines
+		if req.FileCount > 0 {
+			archive.FileCount = req.FileCount
+		}
+		if req.TotalLines > 0 {
+			archive.TotalLines = req.TotalLines
+		}
 		archive.FinishTime = time.Now()
 		if req.ExtractPath != "" {
 			archive.ExtractPath = req.ExtractPath

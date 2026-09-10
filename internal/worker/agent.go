@@ -207,25 +207,10 @@ func (a *Agent) asyncProcessArchive(archiveID, userID, filename, destPath, extra
 		return
 	}
 
-	log.Printf("[Worker Storage] 异步解包完成: %s (总行数: %d, 文件数: %d)，开始规则匹配诊断...", filename, totalLines, len(files))
+	log.Printf("[Worker Storage] 异步解包完成: %s (总行数: %d, 文件数: %d)，立即上报 Manager 就绪状态，启动后台异步诊断与索引预热...", filename, totalLines, len(files))
 
-	// 异步预热构建稀疏行号索引与分块布隆索引，彻底消除后续全文件随机跨行翻页与初次搜索时的索引等待
-	go func(targetFiles []*model.LogFileItem, baseDir string) {
-		for _, f := range targetFiles {
-			if f.IsDirectory {
-				continue
-			}
-			fullPath := filepath.Join(baseDir, f.RelativePath)
-			_, _ = GetOrBuildLineIndex(fullPath)
-			_, _ = GetOrBuildBloomIndex(fullPath)
-		}
-	}(files, extractDir)
-	engine := rules.NewEngine(ruleList)
-	report, err := engine.DiagnoseDirectory(archiveID, userID, filename, extractDir)
-	if err != nil {
-		log.Printf("[Worker Storage] 规则诊断发生异常: %v", err)
-	}
-
+	// 第一阶段：解包完成，立刻向 Manager 回调就绪状态 (ready)，
+	// 彻底消除“一直卡在解包诊断中”的现象，让用户即刻查看文件树、浏览日志和执行全文检索！
 	a.reportArchiveCallback(&model.ArchiveCallbackReq{
 		ArchiveID:   archiveID,
 		Status:      "ready",
@@ -233,9 +218,39 @@ func (a *Agent) asyncProcessArchive(archiveID, userID, filename, destPath, extra
 		FileCount:   len(files),
 		TotalLines:  totalLines,
 		ExtractPath: extractDir,
-		Report:      report,
 	})
-	log.Printf("[Worker Storage] 日志包 %s 异步解包与诊断全部完成并已上报 Manager", filename)
+
+	// 第二阶段：后台异步进行索引预热与规则匹配诊断，不阻塞用户日志浏览
+	go func() {
+		// 预热构建稀疏行号索引与分块布隆索引
+		for _, f := range files {
+			if f.IsDirectory {
+				continue
+			}
+			fullPath := filepath.Join(extractDir, f.RelativePath)
+			_, _ = GetOrBuildLineIndex(fullPath)
+			_, _ = GetOrBuildBloomIndex(fullPath)
+		}
+
+		engine := rules.NewEngine(ruleList)
+		report, err := engine.DiagnoseDirectory(archiveID, userID, filename, extractDir)
+		if err != nil {
+			log.Printf("[Worker Storage] 规则诊断发生异常: %v", err)
+			return
+		}
+
+		// 诊断完成，将诊断报告更新上报给 Manager
+		a.reportArchiveCallback(&model.ArchiveCallbackReq{
+			ArchiveID:   archiveID,
+			Status:      "ready",
+			Files:       files,
+			FileCount:   len(files),
+			TotalLines:  totalLines,
+			ExtractPath: extractDir,
+			Report:      report,
+		})
+		log.Printf("[Worker Storage] 日志包 %s 后台规则诊断全部完成并已更新诊断报告至 Manager", filename)
+	}()
 }
 
 // reportArchiveCallback 向管理节点上报异步解包与诊断完成状态

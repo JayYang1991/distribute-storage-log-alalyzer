@@ -2,6 +2,7 @@ package rules
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io/fs"
 	"os"
@@ -23,10 +24,12 @@ type Engine struct {
 }
 
 type compiledRule struct {
-	rule         *model.Rule
-	regex        *regexp.Regexp
-	patternLower string
-	orKeywords   []string
+	rule            *model.Rule
+	regex           *regexp.Regexp
+	patternLower    string
+	patternLowerB   []byte
+	orKeywords      []string
+	orKeywordsBytes [][]byte
 }
 
 var scanBufPool = sync.Pool{
@@ -57,6 +60,10 @@ func NewEngine(rules []*model.Rule) *Engine {
 			cr.orKeywords = extractCandidateKeywords(r.Pattern)
 		} else {
 			cr.orKeywords = []string{strings.ToLower(r.Pattern)}
+		}
+		cr.patternLowerB = []byte(cr.patternLower)
+		for _, kw := range cr.orKeywords {
+			cr.orKeywordsBytes = append(cr.orKeywordsBytes, []byte(strings.ToLower(kw)))
 		}
 		compiled = append(compiled, cr)
 	}
@@ -240,25 +247,25 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 	var lineNum int64 = 0
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
+		raw := scanner.Bytes()
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 {
 			continue
 		}
 
-		var lineLower string
+		var lineLower []byte
 		var lineLowerInit bool
 
 		for _, cr := range activeRules {
 			// 性能优化：快速短路筛选。若规则提取出了候选关键字，且当前行小写文本未包含任何候选词，直接跳过此规则
-			if len(cr.orKeywords) > 0 {
+			if len(cr.orKeywordsBytes) > 0 {
 				if !lineLowerInit {
-					lineLower = strings.ToLower(line)
+					lineLower = bytes.ToLower(trimmed)
 					lineLowerInit = true
 				}
 				hasCandidate := false
-				for _, kw := range cr.orKeywords {
-					if strings.Contains(lineLower, kw) {
+				for _, kw := range cr.orKeywordsBytes {
+					if bytes.Contains(lineLower, kw) {
 						hasCandidate = true
 						break
 					}
@@ -270,16 +277,17 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 
 			matched := false
 			if cr.regex != nil {
-				matched = cr.regex.MatchString(line)
+				matched = cr.regex.Match(trimmed)
 			} else {
 				if !lineLowerInit {
-					lineLower = strings.ToLower(line)
+					lineLower = bytes.ToLower(trimmed)
 					lineLowerInit = true
 				}
-				matched = strings.Contains(lineLower, cr.patternLower)
+				matched = bytes.Contains(lineLower, cr.patternLowerB)
 			}
 
 			if matched {
+				lineStr := string(trimmed)
 				events = append(events, model.DiagnosisEvent{
 					ID:             fmt.Sprintf("evt_%s_%d_%s", archiveID, lineNum, cr.rule.ID),
 					ArchiveID:      archiveID,
@@ -289,9 +297,9 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 					StorageType:    cr.rule.StorageType,
 					FilePath:       relPath,
 					LineNumber:     lineNum,
-					MatchedContent: truncateString(line, 500),
+					MatchedContent: truncateString(lineStr, 500),
 					Suggestion:     cr.rule.Suggestion,
-					Timestamp:      extractTimestamp(line),
+					Timestamp:      extractTimestamp(lineStr),
 				})
 				if len(events) >= limit {
 					return events, nil
@@ -403,11 +411,15 @@ func MatchFilePath(pattern string, relPath string) bool {
 // extractCandidateKeywords 从正则表达式中提取所有顶级分支的字面量候选词（长度>=2），用于极速过滤跳过绝大多数非目标行
 func extractCandidateKeywords(pattern string) []string {
 	p := strings.TrimSpace(pattern)
-	if strings.HasPrefix(strings.ToLower(p), "(?i)") {
-		p = p[4:]
+	for {
+		lower := strings.ToLower(p)
+		if strings.HasPrefix(lower, "(?i)") || strings.HasPrefix(lower, "(?-i)") || strings.HasPrefix(lower, "(?m)") {
+			p = strings.TrimSpace(p[4:])
+		} else {
+			break
+		}
 	}
-	p = strings.TrimSpace(p)
-	if strings.HasPrefix(p, "(") && strings.HasSuffix(p, ")") {
+	for strings.HasPrefix(p, "(") && strings.HasSuffix(p, ")") {
 		depth := 0
 		matched := true
 		for i, c := range p {
@@ -422,7 +434,9 @@ func extractCandidateKeywords(pattern string) []string {
 			}
 		}
 		if matched && depth == 0 {
-			p = p[1 : len(p)-1]
+			p = strings.TrimSpace(p[1 : len(p)-1])
+		} else {
+			break
 		}
 	}
 
