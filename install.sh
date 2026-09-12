@@ -275,13 +275,38 @@ if [ -f "$SCRIPT_DIR/scripts/uninstall.sh" ]; then
     cp -f "$SCRIPT_DIR/scripts/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
     cp -f "$SCRIPT_DIR/scripts/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
     chmod +x "$INSTALL_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
-elif [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
     cp -f "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
-    cp -f "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
-    chmod +x "$INSTALL_DIR/uninstall.sh" "$INSTALL_DIR/scripts/uninstall.sh"
 fi
 
-# 5. 获取本机 IP
+for script_name in backup.sh restore.sh upgrade.sh rollback.sh; do
+    if [ -f "$SCRIPT_DIR/scripts/$script_name" ]; then
+        cp -f "$SCRIPT_DIR/scripts/$script_name" "$INSTALL_DIR/scripts/$script_name"
+        chmod +x "$INSTALL_DIR/scripts/$script_name"
+    elif [ -f "$SCRIPT_DIR/$script_name" ]; then
+        cp -f "$SCRIPT_DIR/$script_name" "$INSTALL_DIR/scripts/$script_name"
+        chmod +x "$INSTALL_DIR/scripts/$script_name"
+    fi
+done
+
+# 5. 配置系统日志自动轮转与压缩 (Logrotate)
+if [ "$IS_ROOT" = true ] && [ -d "/etc/logrotate.d" ]; then
+    cat > "/etc/logrotate.d/dist-log-analyzer" <<EOF
+$INSTALL_DIR/logs/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    size 100M
+}
+EOF
+    chmod 644 "/etc/logrotate.d/dist-log-analyzer" 2>/dev/null || true
+    echo "  ✔ [日志治理] 已注册系统级日志轮转策略 (/etc/logrotate.d/dist-log-analyzer: 每日/超100MB轮转, 保留14份并压缩)"
+fi
+
+# 6. 获取本机 IP
 LOCAL_IP="127.0.0.1"
 if command -v hostname >/dev/null 2>&1; then
     IP_CANDIDATE=$(hostname -I 2>/dev/null | awk '{print $1}')

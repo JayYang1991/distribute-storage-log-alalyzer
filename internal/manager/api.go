@@ -29,14 +29,16 @@ import (
 )
 
 type Server struct {
-	cfg        *config.Config
-	store      *store.Store
-	scheduler  *Scheduler
-	ha         *HAManager
-	sessions   sync.Map // token -> username
-	server     *http.Server
-	staticFS   http.FileSystem
-	httpClient *http.Client
+	cfg                  *config.Config
+	store                *store.Store
+	scheduler            *Scheduler
+	ha                   *HAManager
+	sessions             sync.Map // token -> username
+	server               *http.Server
+	staticFS             http.FileSystem
+	httpClient           *http.Client
+	searchRequestsTotal  uint64
+	searchLatencySumMs   uint64
 }
 
 func NewServer(cfg *config.Config, s *store.Store, staticFS http.FileSystem) *Server {
@@ -114,6 +116,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// 集群与节点管理
 	mux.HandleFunc("/api/nodes", s.handleNodes)
+	mux.HandleFunc("/api/nodes/maintenance", s.handleNodeMaintenance)
 	mux.HandleFunc("/api/nodes/", s.handleNodeItem)
 	mux.HandleFunc("/api/nodes/deploy", s.handleDeployWorker)
 	mux.HandleFunc("/api/nodes/detect-disks", s.handleDetectDisks)
@@ -121,12 +124,15 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/cluster/archive-callback", s.handleClusterArchiveCallback)
 	mux.HandleFunc("/api/cluster/binary", s.handleDownloadBinary)
 	mux.HandleFunc("/api/agent/install.sh", s.handleAgentInstallScript)
+	mux.HandleFunc("/api/system/backup", s.handleSystemBackup)
 
 	// 日志归档管理
 	mux.HandleFunc("/api/archives", s.handleArchives)
 	mux.HandleFunc("/api/archives/check-tag", s.handleCheckArchiveTag)
 	mux.HandleFunc("/api/archives/upload", s.handleUploadArchive)
+	mux.HandleFunc("/api/archives/pin", s.handleArchivePin)
 	mux.HandleFunc("/api/archives/", s.handleArchiveItem)
+	mux.HandleFunc("/api/settings/retention", s.handleRetentionSettings)
 
 	// 检索
 	mux.HandleFunc("/api/search", s.handleSearch)
@@ -134,8 +140,12 @@ func (s *Server) Start(ctx context.Context) error {
 	// 规则与诊断报告
 	mux.HandleFunc("/api/rules", s.handleRules)
 	mux.HandleFunc("/api/rules/", s.handleRuleItem)
-	mux.HandleFunc("/api/rules/reset-defaults", s.handleResetDefaultRules)
 	mux.HandleFunc("/api/reports/", s.handleReports)
+
+	// 运维监控度量与微服务标准探针
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.ListenHost, s.cfg.Port)
 	s.server = &http.Server{
@@ -144,6 +154,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	log.Printf("[Manager] 管理组件控制台已启动: http://%s (广播地址: %s)", addr, s.cfg.AdvertiseIP)
+
+	// 启动后台日志生命周期与磁盘容量自愈巡检协程
+	go s.StartRetentionLoop(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -915,7 +928,11 @@ func (s *Server) handleClusterHeartbeat(w http.ResponseWriter, r *http.Request) 
 	}
 
 	node.LastHeartbeat = time.Now()
-	node.Status = "online"
+	if existing != nil && existing.Status == "maintenance" {
+		node.Status = "maintenance"
+	} else {
+		node.Status = "online"
+	}
 	_ = s.store.SaveNode(&node)
 
 	// 自动消警：节点重新上报心跳，自动解除此前的离线失联告警
@@ -1742,42 +1759,13 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "无权删除该日志归档包", http.StatusForbidden)
 			return
 		}
-
-		// 1. 若日志存放在业务存储节点上，通知该 Worker 节点彻底清理磁盘文件与解压目录
-		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
-			cleanURL := fmt.Sprintf("http://%s:%d/api/worker/storage/clean-archive?username=%s&archive_id=%s&filename=%s&extract_path=%s",
-				archive.StorageNodeIP, archive.StorageNodePort,
-				url.QueryEscape(archive.Username),
-				url.QueryEscape(archive.ID),
-				url.QueryEscape(archive.Filename),
-				url.QueryEscape(archive.ExtractPath),
-			)
-			client := &http.Client{Timeout: 15 * time.Second}
-			req, reqErr := http.NewRequest(http.MethodDelete, cleanURL, nil)
-			if reqErr == nil {
-				resp, respErr := client.Do(req)
-				if respErr == nil {
-					_ = resp.Body.Close()
-					log.Printf("[Manager Storage] 已成功通知业务节点 %s (%s:%d) 清理日志包 %s 的磁盘空间",
-						archive.StorageNodeName, archive.StorageNodeIP, archive.StorageNodePort, archive.Filename)
-				} else {
-					log.Printf("[Manager Storage] 通知业务节点清理日志包失败: %v，将尝试本地清理", respErr)
-				}
-			}
+		if archive.Pinned {
+			http.Error(w, "该日志包处于保护锁定状态，请先解除锁定后再执行删除", http.StatusBadRequest)
+			return
 		}
 
-		// 2. 本地直接清理兜底 (针对本地挂载、管理节点存储或同机部署场景)
-		if archive.ExtractPath != "" {
-			_ = os.RemoveAll(archive.ExtractPath)
-			workerArchiveFile := filepath.Join(filepath.Dir(filepath.Dir(archive.ExtractPath)), "archives", archive.Filename)
-			if _, statErr := os.Stat(workerArchiveFile); statErr == nil {
-				_ = os.Remove(workerArchiveFile)
-			}
-		}
-
-		// 3. 数据库元数据与诊断报告清理
-		if err := s.store.DeleteArchive(archiveID, currentUser.Username, isAdmin); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := s.DeleteArchiveStorageAndMeta(archive); err != nil {
+			http.Error(w, fmt.Sprintf("清理失败: %v", err), http.StatusInternalServerError)
 			return
 		}
 
@@ -1797,6 +1785,11 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 // ================= 日志检索中心 =================
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	defer func() {
+		s.RecordSearchMetrics(time.Since(startTime))
+	}()
+
 	currentUser, err := s.authenticate(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -2405,5 +2398,189 @@ func (s *Server) handleAlarmItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleArchivePin 切换日志包锁定保护状态 (锁定后禁止自动生命周期清理和防误删)
+func (s *Server) handleArchivePin(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ArchiveID string `json:"archive_id"`
+		Pinned    bool   `json:"pinned"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	archive, err := s.store.GetArchive(req.ArchiveID)
+	if err != nil {
+		http.Error(w, "归档包不存在", http.StatusNotFound)
+		return
+	}
+	if currentUser.Role != model.RoleAdmin && archive.Username != currentUser.Username {
+		http.Error(w, "无权修改该日志包的保护状态", http.StatusForbidden)
+		return
+	}
+
+	updated, err := s.store.SetArchivePinned(req.ArchiveID, req.Pinned)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(updated)
+}
+
+// handleRetentionSettings 读取与保存日志生命周期与磁盘高水位自愈配置
+func (s *Server) handleRetentionSettings(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		cfg, err := s.store.GetRetentionConfig()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfg)
+		return
+	}
+
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可修改容量与生命周期配置", http.StatusForbidden)
+			return
+		}
+		var newCfg model.RetentionConfig
+		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if newCfg.RetentionDays < 0 {
+			newCfg.RetentionDays = 0
+		}
+		if newCfg.HighWatermarkPercent <= 0 || newCfg.HighWatermarkPercent > 100 {
+			newCfg.HighWatermarkPercent = 85
+		}
+		if newCfg.EmergencyWatermarkPercent <= 0 || newCfg.EmergencyWatermarkPercent > 100 {
+			newCfg.EmergencyWatermarkPercent = 92
+		}
+		if newCfg.TargetWatermarkPercent <= 0 || newCfg.TargetWatermarkPercent >= newCfg.EmergencyWatermarkPercent {
+			newCfg.TargetWatermarkPercent = 75
+		}
+
+		var cleanTags []string
+		tagSeen := make(map[string]bool)
+		for _, t := range newCfg.ExemptTags {
+			t = strings.TrimSpace(t)
+			if t != "" && !tagSeen[t] {
+				tagSeen[t] = true
+				cleanTags = append(cleanTags, t)
+			}
+		}
+		newCfg.ExemptTags = cleanTags
+
+		if err := s.store.SaveRetentionConfig(&newCfg); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(newCfg)
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleSystemBackup 在线无锁热快照导出备份
+func (s *Server) handleSystemBackup(w http.ResponseWriter, r *http.Request) {
+	// 支持从 Authorization Header 或 URL query ?token=... 鉴权
+	token := r.URL.Query().Get("token")
+	var currentUser *model.User
+	var err error
+	if token != "" {
+		if u, ok := s.sessions.Load(token); ok {
+			currentUser, err = s.store.GetUserByUsername(u.(string))
+		}
+	}
+	if currentUser == nil {
+		currentUser, err = s.authenticate(r)
+	}
+	if err != nil || currentUser == nil || currentUser.Role != model.RoleAdmin {
+		http.Error(w, "仅系统管理员可执行数据库热备份导出", http.StatusUnauthorized)
+		return
+	}
+
+	filename := fmt.Sprintf("analyzer-backup-%s.db", time.Now().Format("20060102-150405"))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+
+	if err := s.store.BackupSnapshot(w); err != nil {
+		log.Printf("[Backup] 导出数据库热快照异常: %v", err)
+		http.Error(w, fmt.Sprintf("备份失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
+// handleNodeMaintenance 设置节点维护模式 (Drain / Maintenance Mode)
+func (s *Server) handleNodeMaintenance(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil || currentUser.Role != model.RoleAdmin {
+		http.Error(w, "仅管理员可调整节点维护状态", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		NodeID      string `json:"node_id"`
+		Maintenance bool   `json:"maintenance"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	node, err := s.store.GetNode(req.NodeID)
+	if err != nil || node == nil {
+		http.Error(w, "目标节点不存在", http.StatusNotFound)
+		return
+	}
+
+	if req.Maintenance {
+		node.Status = "maintenance"
+		log.Printf("[Maintenance] 管理员 %s 将节点 %s (%s:%d) 置为维护模式 (Drain: 暂停新日志调度分配)",
+			currentUser.Username, node.Name, node.IP, node.Port)
+	} else {
+		node.Status = "online"
+		log.Printf("[Maintenance] 管理员 %s 将节点 %s (%s:%d) 恢复上线 (恢复新日志调度分配)",
+			currentUser.Username, node.Name, node.IP, node.Port)
+	}
+
+	if err := s.store.SaveNode(node); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(node)
 }
 

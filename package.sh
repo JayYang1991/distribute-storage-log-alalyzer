@@ -55,8 +55,11 @@ chmod +x "$STAGE_DIR/bin/dist-log-analyzer"
 cp -f "$PROJECT_ROOT/scripts/install.sh" "$STAGE_DIR/install.sh"
 cp -f "$PROJECT_ROOT/scripts/install.sh" "$STAGE_DIR/scripts/install.sh"
 cp -f "$PROJECT_ROOT/scripts/uninstall.sh" "$STAGE_DIR/uninstall.sh"
-cp -f "$PROJECT_ROOT/scripts/uninstall.sh" "$STAGE_DIR/scripts/uninstall.sh"
 cp -f "$PROJECT_ROOT/scripts/service.sh" "$STAGE_DIR/scripts/service.sh"
+cp -f "$PROJECT_ROOT/scripts/backup.sh" "$STAGE_DIR/scripts/backup.sh"
+cp -f "$PROJECT_ROOT/scripts/restore.sh" "$STAGE_DIR/scripts/restore.sh"
+cp -f "$PROJECT_ROOT/scripts/upgrade.sh" "$STAGE_DIR/scripts/upgrade.sh"
+cp -f "$PROJECT_ROOT/scripts/rollback.sh" "$STAGE_DIR/scripts/rollback.sh"
 chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/scripts/"*.sh
 
 # 生成默认配置文件模版

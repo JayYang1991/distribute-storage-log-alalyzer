@@ -63,7 +63,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 	})
 	if err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to init buckets: %w", err)
 	}
 
 	// 初始化管理员账号
@@ -75,6 +75,19 @@ func NewStore(cfg *config.Config) (*Store, error) {
 	_ = s.initDefaultUser("user", "user123")
 
 	return s, nil
+}
+
+// BackupSnapshot 将 bbolt 数据库以只读事务流式导出到 writer (零阻塞一致性热快照)
+func (s *Store) BackupSnapshot(w io.Writer) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return errors.New("database is closed")
+	}
+	return s.db.View(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(w)
+		return err
+	})
 }
 
 func (s *Store) Close() error {
@@ -742,6 +755,7 @@ func (s *Store) DeleteReport(archiveID string) error {
 // ================= 系统设置与高可用网络配置 =================
 
 var keyHAConfig = []byte("ha_config")
+var keyRetentionConfig = []byte("retention_config")
 
 // SaveHAConfig 持久化保存高可用与网络配置
 func (s *Store) SaveHAConfig(cfg *config.HAConfig) error {
@@ -767,6 +781,61 @@ func (s *Store) GetHAConfig() (*config.HAConfig, error) {
 		return json.Unmarshal(data, &cfg)
 	})
 	return cfg, err
+}
+
+// SaveRetentionConfig 保存日志生命周期与磁盘水位配置
+func (s *Store) SaveRetentionConfig(cfg *model.RetentionConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyRetentionConfig, data)
+	})
+}
+
+// GetRetentionConfig 读取生命周期与磁盘水位配置 (带合理默认值: 默认 180 天 / 6 个月)
+func (s *Store) GetRetentionConfig() (*model.RetentionConfig, error) {
+	cfg := &model.RetentionConfig{
+		RetentionDays:             180, // 默认保留 6 个月 (180 天)
+		HighWatermarkPercent:      85,
+		EmergencyWatermarkPercent: 92,
+		TargetWatermarkPercent:    75,
+		AutoCleanEnabled:          true,
+		ExemptTags:                []string{"永久保留", "重要故障"},
+	}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyRetentionConfig)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, cfg)
+	})
+	return cfg, err
+}
+
+// SetArchivePinned 设置归档包锁定保护状态
+func (s *Store) SetArchivePinned(archiveID string, pinned bool) (*model.LogArchive, error) {
+	var arc *model.LogArchive
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketArchives)
+		data := b.Get([]byte(archiveID))
+		if data == nil {
+			return fmt.Errorf("archive not found: %s", archiveID)
+		}
+		if err := json.Unmarshal(data, &arc); err != nil {
+			return err
+		}
+		arc.Pinned = pinned
+		newData, err := json.Marshal(arc)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(archiveID), newData)
+	})
+	return arc, err
 }
 
 // ================= 告警数据存取与生命周期管理 =================

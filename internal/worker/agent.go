@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,15 +27,17 @@ import (
 
 // Agent Worker 计算节点守护服务
 type Agent struct {
-	cfg              *config.Config
-	server           *http.Server
-	nodeID           string
-	activeTask       int
-	mu               sync.Mutex
-	alarmCooldown    map[string]time.Time
-	alarmMu          sync.Mutex
-	isDecommissioned bool
-	lastDiskCheck    time.Time
+	cfg                  *config.Config
+	server               *http.Server
+	nodeID               string
+	activeTask           int
+	mu                   sync.Mutex
+	alarmCooldown        map[string]time.Time
+	alarmMu              sync.Mutex
+	isDecommissioned     bool
+	lastDiskCheck        time.Time
+	searchTasksTotal     uint64
+	searchLatencySumMs   uint64
 }
 
 func NewAgent(cfg *config.Config) *Agent {
@@ -49,6 +52,9 @@ func NewAgent(cfg *config.Config) *Agent {
 func (a *Agent) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/worker/health", a.handleHealth)
+	mux.HandleFunc("/healthz", a.handleHealthz)
+	mux.HandleFunc("/readyz", a.handleReadyz)
+	mux.HandleFunc("/metrics", a.handleMetrics)
 	mux.HandleFunc("/api/worker/tasks/analyze", a.handleAnalyzeTask)
 	mux.HandleFunc("/api/worker/tasks/search", a.handleSearchTask)
 
@@ -94,6 +100,134 @@ func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"data_dir": a.cfg.DataDir,
 		"time":     time.Now(),
 	})
+}
+
+// RecordSearchMetrics 记录检索指标
+func (a *Agent) RecordSearchMetrics(duration time.Duration) {
+	atomic.AddUint64(&a.searchTasksTotal, 1)
+	atomic.AddUint64(&a.searchLatencySumMs, uint64(duration.Milliseconds()))
+}
+
+// handleHealthz 存活探针 (Liveness Probe)
+func (a *Agent) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":  "ok",
+		"role":    "worker",
+		"node_id": a.nodeID,
+		"time":    time.Now().Format(time.RFC3339),
+	})
+}
+
+// handleReadyz 就绪探针 (Readiness Probe)
+func (a *Agent) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	// 检查存储目录是否存在且可写
+	testFile := filepath.Join(a.cfg.DataDir, ".probe_readyz")
+	if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "not_ready",
+			"error":  fmt.Sprintf("data_dir write check failed: %v", err),
+		})
+		return
+	}
+	_ = os.Remove(testFile)
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":  "ready",
+		"role":    "worker",
+		"node_id": a.nodeID,
+		"storage": "ok",
+	})
+}
+
+func (a *Agent) getDiskCapacity() (totalBytes, usedBytes, freeBytes int64) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(a.cfg.DataDir, &stat); err == nil {
+		totalBytes = int64(stat.Blocks * uint64(stat.Bsize))
+		freeBytes = int64(stat.Bavail * uint64(stat.Bsize))
+		usedBytes = totalBytes - freeBytes
+		if usedBytes < 0 {
+			usedBytes = 0
+		}
+	}
+	return
+}
+
+// handleMetrics 导出 Worker 的标准 Prometheus Text 0.0.4 格式指标
+func (a *Agent) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	capTotal, capUsed, capFree := a.getDiskCapacity()
+	var usageRatio float64
+	if capTotal > 0 {
+		usageRatio = float64(capUsed) / float64(capTotal)
+	}
+
+	// 统计本机归档数量
+	entries, _ := os.ReadDir(a.cfg.DataDir)
+	var archiveCount int
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			archiveCount++
+		}
+	}
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	reqTotal := atomic.LoadUint64(&a.searchTasksTotal)
+	latencyMs := atomic.LoadUint64(&a.searchLatencySumMs)
+	latencySec := float64(latencyMs) / 1000.0
+
+	fmt.Fprintf(w, "# HELP dist_log_info Build and version info\n")
+	fmt.Fprintf(w, "# TYPE dist_log_info gauge\n")
+	fmt.Fprintf(w, "dist_log_info{role=\"worker\",node_id=\"%s\"} 1\n", a.nodeID)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_disk_total_bytes Worker node storage total capacity in bytes\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_disk_total_bytes gauge\n")
+	fmt.Fprintf(w, "dist_log_worker_disk_total_bytes %d\n", capTotal)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_disk_used_bytes Worker node storage used capacity in bytes\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_disk_used_bytes gauge\n")
+	fmt.Fprintf(w, "dist_log_worker_disk_used_bytes %d\n", capUsed)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_disk_free_bytes Worker node storage available capacity in bytes\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_disk_free_bytes gauge\n")
+	fmt.Fprintf(w, "dist_log_worker_disk_free_bytes %d\n", capFree)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_disk_usage_ratio Worker node storage usage ratio\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_disk_usage_ratio gauge\n")
+	fmt.Fprintf(w, "dist_log_worker_disk_usage_ratio %.4f\n", usageRatio)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_archives_count Worker node local log archives count\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_archives_count gauge\n")
+	fmt.Fprintf(w, "dist_log_worker_archives_count %d\n", archiveCount)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_search_tasks_total Total log search tasks processed by worker\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_search_tasks_total counter\n")
+	fmt.Fprintf(w, "dist_log_worker_search_tasks_total %d\n", reqTotal)
+
+	fmt.Fprintf(w, "# HELP dist_log_worker_search_duration_seconds_total Total log search tasks duration in seconds\n")
+	fmt.Fprintf(w, "# TYPE dist_log_worker_search_duration_seconds_total counter\n")
+	fmt.Fprintf(w, "dist_log_worker_search_duration_seconds_total %.4f\n", latencySec)
+
+	// Runtime 指标
+	fmt.Fprintf(w, "# HELP go_goroutines Number of goroutines that currently exist\n")
+	fmt.Fprintf(w, "# TYPE go_goroutines gauge\n")
+	fmt.Fprintf(w, "go_goroutines %d\n", runtime.NumGoroutine())
+
+	fmt.Fprintf(w, "# HELP go_memstats_alloc_bytes Number of bytes allocated and still in use\n")
+	fmt.Fprintf(w, "# TYPE go_memstats_alloc_bytes gauge\n")
+	fmt.Fprintf(w, "go_memstats_alloc_bytes %d\n", m.Alloc)
+
+	fmt.Fprintf(w, "# HELP go_memstats_sys_bytes Number of bytes obtained from system\n")
+	fmt.Fprintf(w, "# TYPE go_memstats_sys_bytes gauge\n")
+	fmt.Fprintf(w, "go_memstats_sys_bytes %d\n", m.Sys)
 }
 
 // handleStorageUpload 接收定向上传的日志压缩包并在本机硬盘上落地、解包并完成故障匹配
@@ -566,6 +700,11 @@ func (a *Agent) handleAnalyzeTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) handleSearchTask(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	defer func() {
+		a.RecordSearchMetrics(time.Since(startTime))
+	}()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return

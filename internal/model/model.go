@@ -93,8 +93,19 @@ type LogArchive struct {
 	AssignedWorker  string    `json:"assigned_worker,omitempty"`
 	Tags            []string  `json:"tags,omitempty"`              // 自定义标签列表，如 ["Ceph", "OSD故障", "生产环境"]
 	Remark          string    `json:"remark,omitempty"`            // 备注说明信息
+	Pinned          bool      `json:"pinned"`                      // 保护锁定标记（锁定后禁止自动生命周期清理）
 	UploadTime      time.Time `json:"upload_time"`
 	FinishTime      time.Time `json:"finish_time"`
+}
+
+// RetentionConfig 日志生命周期保留与磁盘高水位自愈配置
+type RetentionConfig struct {
+	RetentionDays             int      `json:"retention_days"`              // 保留天数 (默认 180 天，即 6 个月；0 为不限)
+	HighWatermarkPercent      int      `json:"high_watermark_percent"`       // 高水位阈值 (默认 85%)
+	EmergencyWatermarkPercent int      `json:"emergency_watermark_percent"`  // 紧急自愈清理水位 (默认 92%)
+	TargetWatermarkPercent    int      `json:"target_watermark_percent"`     // 自愈清理回落目标 (默认 75%)
+	AutoCleanEnabled          bool     `json:"auto_clean_enabled"`           // 是否启用自愈清理
+	ExemptTags                []string `json:"exempt_tags,omitempty"`         // 管理员设置指导的免清理保护标签白名单 (如 ["永久保留", "重要故障"])
 }
 
 // LogFileItem 日志解压后的单文件结构

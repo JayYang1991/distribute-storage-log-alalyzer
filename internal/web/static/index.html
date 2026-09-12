@@ -192,6 +192,7 @@
             <div class="card-header">
               <span class="card-title">🖥️ 分布式业务组件节点列表</span>
               <div style="display: flex; gap: 10px;">
+                <button class="btn btn-secondary btn-sm" onclick="app.downloadDatabaseBackup();" title="在线无锁流式导出当前元数据库 (bbolt) 一致性热快照">📥 导出元数据快照</button>
                 <button class="btn btn-secondary btn-sm" onclick="app.openAgentScriptModal();">📋 离线接入命令</button>
                 <button class="btn btn-primary btn-sm" onclick="app.openDeployModal();">➕ 一键安装业务组件 (SSH)</button>
               </div>
@@ -294,9 +295,11 @@
           </div>
 
           <!-- 归档列表 -->
-          <div class="card">
             <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-              <span class="card-title">📦 日志包管理列表</span>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <span class="card-title">📦 日志包管理列表</span>
+                <button class="btn btn-secondary btn-sm" onclick="app.openRetentionModal()" style="font-size: 11px; padding: 4px 8px;">⚙️ 存储生命周期与水位配置</button>
+              </div>
               <div style="display: flex; align-items: center; gap: 8px;">
                 <input type="text" class="form-control form-control-sm" id="archive-filter-input" placeholder="🔍 搜标签、文件名或备注..." style="width: 250px;" oninput="app.filterArchives(this.value)">
                 <button class="btn btn-secondary btn-sm" id="btn-clear-archive-filter" onclick="app.clearArchiveFilter()" style="display: none; padding: 4px 8px; font-size: 11px;">清空筛选</button>
@@ -1130,6 +1133,66 @@
           <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-archive-error')">关闭</button>
           <button type="button" class="btn btn-warning" id="btn-archive-error-retry" onclick="app.retryArchiveFromModal()">🔄 重新调度分析</button>
         </div>
+      </div>
+    </div>
+  <!-- 模态框 8: 日志生命周期与磁盘高水位自愈配置 -->
+  <div class="modal-overlay" id="modal-retention-settings">
+    <div class="modal-content" style="max-width: 520px;">
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ 存储生命周期保留与磁盘高水位自愈配置</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-retention-settings')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-retention-settings" onsubmit="app.saveRetentionSettings(event)">
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 14px; font-size: 12px; color: var(--text-muted); line-height: 1.5;">
+            💡 <strong>生命周期与自愈保护规范说明:</strong><br>
+            • <strong>默认保留期 (TTL):</strong> 系统默认保留 <strong>6 个月 (180 天)</strong>。过期未受保护的日志包由后台自愈协程定期清理。<br>
+            • <strong>管理员指定免清理:</strong> 支持单包点击“🔒 保护”锁定，或在下方配置<strong>免清理指导标签</strong>（命中标签绝不自动清理）。<br>
+            • <strong>水位自愈:</strong> 存储节点磁盘达到紧急水位时，按由旧到新清理未受保护的日志，直至回落至目标水位。
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">自动自愈清理开关</label>
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" id="retention-auto-clean" checked> 启用后台生命周期与高水位自动清理自愈
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">日志生命周期保留期 (天)</label>
+            <input type="number" class="form-control" id="retention-days" min="0" max="3650" value="180" placeholder="默认 180 天 (6 个月)，输入 0 代表不按天数过期">
+            <small style="color: var(--text-dim); font-size: 11px;">默认 180 天 (6 个月)。设为 0 代表不限制天数，仅在磁盘紧急高水位时清理未保护日志。</small>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">🛡️ 免清理指导保护标签白名单 (逗号分隔)</label>
+            <input type="text" class="form-control" id="retention-exempt-tags" placeholder="例如: 永久保留, 重要故障, 基准性能">
+            <small style="color: var(--text-dim); font-size: 11px;">管理员设置指导：凡打上任一白名单标签的日志包，无论 TTL 到期还是满盘紧急自愈均绝不自动清理。</small>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">磁盘容量水位配置 (%)</label>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
+              <div>
+                <label style="font-size: 11px; color: #fbbf24;">⚠️ 预警水位 (%)</label>
+                <input type="number" class="form-control form-control-sm" id="retention-high-watermark" min="50" max="95" value="85">
+              </div>
+              <div>
+                <label style="font-size: 11px; color: #f87171;">🚨 紧急清理水位 (%)</label>
+                <input type="number" class="form-control form-control-sm" id="retention-emergency-watermark" min="60" max="99" value="92">
+              </div>
+              <div>
+                <label style="font-size: 11px; color: #34d399;">🎯 清理回落目标 (%)</label>
+                <input type="number" class="form-control form-control-sm" id="retention-target-watermark" min="30" max="90" value="75">
+              </div>
+            </div>
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0; margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-retention-settings')">取消</button>
+            <button type="submit" class="btn btn-primary">保存配置</button>
+          </div>
+        </form>
       </div>
     </div>
   </div>

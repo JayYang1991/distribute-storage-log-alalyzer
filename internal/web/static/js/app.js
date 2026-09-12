@@ -564,8 +564,11 @@ const app = {
     this.nodes.forEach(n => {
       const tr = document.createElement("tr");
       const isOnline = n.status === "online";
+      const isMaintenance = n.status === "maintenance";
       const statusBadge = isOnline
         ? '<span class="badge badge-success">在线</span>'
+        : isMaintenance
+        ? '<span class="badge badge-warning" title="维护模式 (Drain)：暂停新日志分配，存量查询正常">🛠️ 维护中</span>'
         : n.status === "installing"
         ? '<span class="badge badge-warning">正在安装</span>'
         : '<span class="badge badge-danger">离线</span>';
@@ -596,12 +599,34 @@ const app = {
         <td>${lastHb}</td>
         <td>
           ${n.role !== "manager" && this.currentUser?.role === "admin" ? `
+            <button class="btn btn-sm ${isMaintenance ? 'btn-success' : 'btn-warning'}" onclick="app.toggleNodeMaintenance('${n.id}', ${!isMaintenance})" title="${isMaintenance ? '点击恢复正常上线' : '点击进入维护模式 (暂停新日志调度分配)'}">${isMaintenance ? '✅ 上线' : '🛠️ 维护'}</button>
             <button class="btn btn-danger btn-sm" onclick="app.openRemoveNodeModal('${n.id}')">移除</button>
           ` : '<span style="color: var(--text-dim); font-size: 11px;">核心管理节点</span>'}
         </td>
       `;
       tbody.appendChild(tr);
     });
+  },
+
+  async toggleNodeMaintenance(nodeID, maintenance) {
+    const actionName = maintenance ? "进入维护模式 (暂停分配新日志包)" : "恢复正常上线";
+    if (!confirm(`确定要将该节点设为【${actionName}】吗？`)) return;
+    try {
+      const res = await this.api("/api/nodes/maintenance", "POST", { node_id: nodeID, maintenance });
+      if (!res.ok) {
+        alert("操作失败: " + (await res.text()));
+        return;
+      }
+      this.loadNodes();
+    } catch (e) {
+      alert("网络异常: " + e.message);
+    }
+  },
+
+  downloadDatabaseBackup() {
+    if (!confirm("确定要导出当前元数据库 (bbolt) 实时一致性热快照吗？")) return;
+    const token = localStorage.getItem("token") || "";
+    window.open(`/api/system/backup?token=${encodeURIComponent(token)}`, "_blank");
   },
 
   openDeployModal() {
@@ -1169,8 +1194,17 @@ const app = {
             remarkHtml = `<div class="archive-remark" title="${this.escape(a.remark)}">📝 ${this.escape(a.remark)}</div>`;
           }
 
+          const pinBadge = a.pinned
+            ? `<span class="badge badge-warning" style="cursor: pointer;" onclick="app.toggleArchivePin('${a.id}', false)" title="已锁定保护：免除生命周期超期和磁盘高水位自愈清理。点击可解除锁定">🔒 已保护</span>`
+            : `<span class="badge badge-muted" style="cursor: pointer;" onclick="app.toggleArchivePin('${a.id}', true)" title="未锁定：受保留天数与紧急水位自愈清理管理。点击可开启保护锁定">未保护</span>`;
+
           tr.innerHTML = `
-            <td><strong>${this.escape(a.filename)}</strong></td>
+            <td>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                ${pinBadge}
+                <strong>${this.escape(a.filename)}</strong>
+              </div>
+            </td>
             <td>${tagsHtml}${remarkHtml}</td>
             <td><code>.${a.format}</code></td>
             <td>${sizeMB} MB</td>
@@ -1189,6 +1223,7 @@ const app = {
                 <button class="btn btn-danger btn-sm" title="查看详细失败原因与解决方案" onclick="app.showArchiveError('${a.id}')">❓ 原因</button>
                 <button class="btn btn-warning btn-sm" title="重新尝试解包与分析" onclick="app.retryArchive('${a.id}')">🔄 重试</button>
               ` : ''}
+              <button class="btn btn-sm ${a.pinned ? 'btn-warning' : 'btn-secondary'}" title="${a.pinned ? '点击解除保护锁定' : '点击开启保护锁定 (免除自动清理)'}" onclick="app.toggleArchivePin('${a.id}', ${!a.pinned})">${a.pinned ? '🔓 解锁' : '🔒 保护'}</button>
               <button class="btn btn-secondary btn-sm" title="修改标签与备注" onclick="app.openEditArchiveMetaModal('${a.id}')">🏷️ 标记</button>
               <button class="btn btn-danger btn-sm" onclick="app.deleteArchive('${a.id}')">删除</button>
             </td>
@@ -1600,6 +1635,10 @@ const app = {
 
   async deleteArchive(id) {
     const a = (this.archives || []).find(item => item.id === id);
+    if (a && a.pinned) {
+      alert(`⚠️ 无法直接删除：日志归档包 [${a.filename}] 当前处于“保护锁定”状态！\n\n如需彻底清理删除，请先在操作列点击【🔓 解锁】解除保护后再执行删除。`);
+      return;
+    }
     const name = a ? a.filename : "该日志包";
     if (!confirm(`确定要彻底删除日志归档包 [${name}] 吗？\n\n注意：此操作将永久清理该归档包及其解压缩产生的所有日志文件、索引文件并释放占用的磁盘空间。`)) return;
 
@@ -1617,6 +1656,63 @@ const app = {
       }, 1000);
     } catch (e) {
       alert("删除异常: " + e.message);
+    }
+  },
+
+  async toggleArchivePin(id, pinned) {
+    try {
+      const res = await this.api("/api/archives/pin", "POST", { archive_id: id, pinned });
+      if (!res.ok) {
+        alert("切换保护状态失败: " + (await res.text()));
+        return;
+      }
+      this.loadArchives();
+    } catch (e) {
+      alert("网络异常: " + e.message);
+    }
+  },
+
+  async openRetentionModal() {
+    try {
+      const res = await this.api("/api/settings/retention", "GET");
+      if (res.ok) {
+        const cfg = await res.json();
+        document.getElementById("retention-auto-clean").checked = !!cfg.auto_clean_enabled;
+        document.getElementById("retention-days").value = (cfg.retention_days !== undefined && cfg.retention_days !== null) ? cfg.retention_days : 180;
+        document.getElementById("retention-high-watermark").value = cfg.high_watermark_percent || 85;
+        document.getElementById("retention-emergency-watermark").value = cfg.emergency_watermark_percent || 92;
+        document.getElementById("retention-target-watermark").value = cfg.target_watermark_percent || 75;
+        document.getElementById("retention-exempt-tags").value = (cfg.exempt_tags && Array.isArray(cfg.exempt_tags)) ? cfg.exempt_tags.join(", ") : "";
+      }
+      this.openModal("modal-retention-settings");
+    } catch (e) {
+      alert("获取配置失败: " + e.message);
+    }
+  },
+
+  async saveRetentionSettings(e) {
+    e.preventDefault();
+    const rawTags = (document.getElementById("retention-exempt-tags").value || "").split(/[,，\n]+/);
+    const exemptTags = Array.from(new Set(rawTags.map(t => t.trim()).filter(t => t.length > 0)));
+
+    const payload = {
+      auto_clean_enabled: document.getElementById("retention-auto-clean").checked,
+      retention_days: parseInt(document.getElementById("retention-days").value, 10) || 0,
+      high_watermark_percent: parseInt(document.getElementById("retention-high-watermark").value, 10) || 85,
+      emergency_watermark_percent: parseInt(document.getElementById("retention-emergency-watermark").value, 10) || 92,
+      target_watermark_percent: parseInt(document.getElementById("retention-target-watermark").value, 10) || 75,
+      exempt_tags: exemptTags,
+    };
+    try {
+      const res = await this.api("/api/settings/retention", "PUT", payload);
+      if (!res.ok) {
+        alert("保存失败: " + (await res.text()));
+        return;
+      }
+      alert("✔ 存储生命周期与磁盘水位自愈配置保存成功！");
+      this.closeModal("modal-retention-settings");
+    } catch (err) {
+      alert("保存异常: " + err.message);
     }
   },
 
