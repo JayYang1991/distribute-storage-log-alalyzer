@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"dist-log-analyzer/internal/config"
+	"dist-log-analyzer/internal/indexer"
 	"dist-log-analyzer/internal/model"
 	"dist-log-analyzer/internal/rules"
 	"dist-log-analyzer/internal/store"
@@ -58,10 +60,9 @@ func NewServer(cfg *config.Config, s *store.Store, staticFS http.FileSystem) *Se
 			Timeout:   30 * time.Minute,
 		},
 	}
-	// 初始化内置规则（如果数据库规则为空）
-	ruleList, _ := s.ListRules()
-	if len(ruleList) == 0 {
-		for _, r := range rules.DefaultPresets() {
+	// 初始化或增量补充内置通用分布式系统预设规则
+	for _, r := range rules.DefaultPresets() {
+		if existing, _ := s.GetRule(r.ID); existing == nil {
 			_ = s.SaveRule(r)
 		}
 	}
@@ -125,6 +126,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/cluster/binary", s.handleDownloadBinary)
 	mux.HandleFunc("/api/agent/install.sh", s.handleAgentInstallScript)
 	mux.HandleFunc("/api/system/backup", s.handleSystemBackup)
+	mux.HandleFunc("/api/system/upgrade", s.handleSystemUpgrade)
 
 	// 日志归档管理
 	mux.HandleFunc("/api/archives", s.handleArchives)
@@ -139,8 +141,13 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// 规则与诊断报告
 	mux.HandleFunc("/api/rules", s.handleRules)
+	mux.HandleFunc("/api/rules/reset", s.handleResetDefaultRules)
 	mux.HandleFunc("/api/rules/", s.handleRuleItem)
 	mux.HandleFunc("/api/reports/", s.handleReports)
+
+	// 通用分布式日志分析增强：基准差分对比与模板聚类
+	mux.HandleFunc("/api/analysis/diff", s.handleAnalysisDiff)
+	mux.HandleFunc("/api/analysis/templates", s.handleAnalysisTemplates)
 
 	// 运维监控度量与微服务标准探针
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -2582,5 +2589,235 @@ func (s *Server) handleNodeMaintenance(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(node)
+}
+
+// handleAnalysisDiff 触发双日志包横向基准差分对比
+func (s *Server) handleAnalysisDiff(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.authenticate(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ArchiveIDA string `json:"archive_id_a"`
+		ArchiveIDB string `json:"archive_id_b"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ArchiveIDA == "" || req.ArchiveIDB == "" {
+		http.Error(w, "archive_id_a 和 archive_id_b 均不能为空", http.StatusBadRequest)
+		return
+	}
+	report, err := s.CompareArchives(req.ArchiveIDA, req.ArchiveIDB)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
+}
+
+// handleAnalysisTemplates 提取指定归档包的通用 Drain 模式聚类模板
+func (s *Server) handleAnalysisTemplates(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.authenticate(r); err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	archiveID := r.URL.Query().Get("archive_id")
+	if archiveID == "" {
+		http.Error(w, "缺少 archive_id 参数", http.StatusBadRequest)
+		return
+	}
+	arc, err := s.store.GetArchive(archiveID)
+	if err != nil || arc == nil {
+		http.Error(w, "归档包不存在", http.StatusNotFound)
+		return
+	}
+	miner := indexer.NewDrainMiner(0.55, 4)
+	mineArchiveSamples(arc.ExtractPath, miner, 2000)
+	templates := miner.GetTemplates()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(templates)
+}
+
+// handleSystemUpgrade 管理员上传新版安装包执行一键平滑升级
+func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil || currentUser == nil || currentUser.Role != model.RoleAdmin {
+		http.Error(w, "仅系统管理员可执行在线平滑升级", http.StatusForbidden)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseMultipartForm(300 << 20); err != nil {
+		http.Error(w, "解析上传表单失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("package")
+	if err != nil {
+		file, header, err = r.FormFile("file")
+	}
+	if err != nil {
+		http.Error(w, "请提供要升级的安装包文件 (package)", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	tempDir, err := os.MkdirTemp("", "upgrade_pkg_*")
+	if err != nil {
+		http.Error(w, "创建升级临时环境失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	targetBin, err := extractUpgradeBinary(tempDir, header.Filename, file)
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		http.Error(w, "升级包校验失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	currentBin := getSystemInstallBinPath()
+	binBak := currentBin + ".bak"
+	binDir := filepath.Dir(currentBin)
+	_ = os.MkdirAll(binDir, 0755)
+	tmpBin := filepath.Join(binDir, fmt.Sprintf(".dist-log-analyzer.upgrade.%d", time.Now().UnixNano()))
+
+	// 先将目标二进制写入同目录临时文件
+	if err := copyFile(targetBin, tmpBin); err != nil {
+		_ = os.Remove(tmpBin)
+		_ = os.RemoveAll(tempDir)
+		http.Error(w, "写入目标程序目录失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = os.Chmod(tmpBin, 0755)
+
+	// 备份当前旧版本至 .bak (通过 rename 或 copy)
+	if _, err := os.Stat(currentBin); err == nil {
+		_ = os.Rename(currentBin, binBak)
+	}
+
+	// 原子覆盖为新版本 (同文件系统 rename 彻底避免 Linux text file busy 问题)
+	if err := os.Rename(tmpBin, currentBin); err != nil {
+		if _, statErr := os.Stat(binBak); statErr == nil {
+			_ = os.Rename(binBak, currentBin)
+		}
+		_ = os.Remove(tmpBin)
+		_ = os.RemoveAll(tempDir)
+		http.Error(w, "原子替换目标程序文件失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = os.Chmod(currentBin, 0755)
+
+	log.Printf("[System Upgrade] 管理员 %s 成功上传并更新了程序版本 (来源: %s, 目标: %s)，准备重启服务生效",
+		currentUser.Username, header.Filename, currentBin)
+
+	// 立即向浏览器客户端返回成功状态，告知客户端已进入升级与重连等待流程
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "upgrading",
+		"message":     "新版本安装包校验与替换完成，系统正在平滑重启生效...",
+		"package":     header.Filename,
+		"backup_file": binBak,
+	})
+
+	// 延迟 800ms 触发滚动重启，确保当前 HTTP 响应已完整交付客户端网络栈
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		_ = os.RemoveAll(tempDir)
+		if _, err := exec.LookPath("systemctl"); err == nil {
+			cmd := exec.Command("systemctl", "restart", "dist-log-manager")
+			_ = cmd.Run()
+		}
+	}()
+}
+
+func extractUpgradeBinary(tempDir, filename string, reader io.Reader) (string, error) {
+	pkgPath := filepath.Join(tempDir, filename)
+	outFile, err := os.OpenFile(pkgPath, os.O_CREATE|os.O_WRONLY, 0755)
+	if err != nil {
+		return "", fmt.Errorf("创建升级临时文件失败: %v", err)
+	}
+	if _, err := io.Copy(outFile, reader); err != nil {
+		_ = outFile.Close()
+		return "", fmt.Errorf("写入升级包失败: %v", err)
+	}
+	_ = outFile.Close()
+
+	var targetBin string
+	if strings.HasSuffix(filename, ".tar.gz") || strings.HasSuffix(filename, ".tgz") {
+		cmd := exec.Command("tar", "-zxvf", pkgPath, "-C", tempDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("解包安装包失败: %v, 输出: %s", err, string(out))
+		}
+		// 递归遍历解压目录，定位 dist-log-analyzer 二进制程序
+		_ = filepath.WalkDir(tempDir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr == nil && !d.IsDir() && d.Name() == "dist-log-analyzer" {
+				targetBin = path
+			}
+			return nil
+		})
+	} else {
+		targetBin = pkgPath
+	}
+
+	if targetBin == "" {
+		return "", fmt.Errorf("升级包内未找到有效的主程序 (dist-log-analyzer)")
+	}
+
+	_ = os.Chmod(targetBin, 0755)
+
+	// 执行架构兼容性与执行探针自检
+	testCmd := exec.Command(targetBin, "--help")
+	if out, err := testCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("新版本程序架构兼容性校验失败: %v, 输出: %s", err, string(out))
+	}
+
+	return targetBin, nil
+}
+
+func getSystemInstallBinPath() string {
+	candidates := []string{
+		"/opt/dist-log-analyzer/bin/dist-log-analyzer",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".dist-log-analyzer", "bin", "dist-log-analyzer"))
+	}
+	if currentExec, err := os.Executable(); err == nil {
+		candidates = append([]string{currentExec}, candidates...)
+	}
+
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/opt/dist-log-analyzer/bin/dist-log-analyzer"
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	_ = os.MkdirAll(filepath.Dir(dst), 0755)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }
 

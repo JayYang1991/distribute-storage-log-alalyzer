@@ -218,14 +218,59 @@ type SearchFileSummary struct {
 	MaxLevel  string `json:"max_level,omitempty"`
 }
 
+// TimeHistogramBucket 单个时序分桶中的日志频次统计
+type TimeHistogramBucket struct {
+	Timestamp  string `json:"timestamp"`   // 桶时间刻度标签，如 "2026-09-12 14:00:00"
+	TotalCount int64  `json:"total_count"`  // 该时段总日志数
+	InfoCount  int64  `json:"info_count"`   // INFO 级别日志数
+	WarnCount  int64  `json:"warn_count"`   // WARN 级别日志数
+	ErrorCount int64  `json:"error_count"`  // ERROR 级别日志数
+	FatalCount int64  `json:"fatal_count"`  // FATAL 级别日志数
+}
+
+// LogTemplate 通用 Drain 日志模式提取聚类模板
+type LogTemplate struct {
+	ID        string   `json:"id"`                   // 模板唯一 ID
+	Pattern   string   `json:"pattern"`              // 提取的通配模式 (例如: Failed to connect to <*>:<*>)
+	Sample    string   `json:"sample"`               // 代表性原始日志样例
+	Count     int64    `json:"count"`                // 匹配该模板的日志频次
+	Level     string   `json:"level,omitempty"`      // 聚合最高级别 (INFO/WARN/ERROR/FATAL)
+	FirstSeen string   `json:"first_seen,omitempty"` // 首次出现时间
+	LastSeen  string   `json:"last_seen,omitempty"`  // 最后出现时间
+	Files     []string `json:"files,omitempty"`      // 关联文件列表
+}
+
+// DiffReport 双日志包横向基准差分对比报告
+type DiffReport struct {
+	ArchiveIDA     string           `json:"archive_id_a"`
+	ArchiveNameA   string           `json:"archive_name_a"`
+	ArchiveIDB     string           `json:"archive_id_b"`
+	ArchiveNameB   string           `json:"archive_name_b"`
+	TotalFilesA    int              `json:"total_files_a"`
+	TotalFilesB    int              `json:"total_files_b"`
+	AddedFiles     []string         `json:"added_files,omitempty"`
+	RemovedFiles   []string         `json:"removed_files,omitempty"`
+	TotalEventsA   int              `json:"total_events_a"`
+	TotalEventsB   int              `json:"total_events_b"`
+	SeverityA      map[string]int   `json:"severity_a"`
+	SeverityB      map[string]int   `json:"severity_b"`
+	NewFatalEvents []DiagnosisEvent `json:"new_fatal_events,omitempty"`
+	NewTemplates   []LogTemplate    `json:"new_templates,omitempty"` // 仅在对比包 B 中出现的新增异常模式
+	SummaryText    string           `json:"summary_text"`
+	AnalyzedAt     time.Time        `json:"analyzed_at"`
+}
+
 // SearchResponse 检索响应
 type SearchResponse struct {
-	TotalHits     int64               `json:"total_hits"`
-	Page          int                 `json:"page"`
-	PageSize      int                 `json:"page_size"`
-	Hits          []SearchHit         `json:"hits"`
-	FileSummaries []SearchFileSummary `json:"file_summaries,omitempty"`
-	CostMS        int64               `json:"cost_ms"`
+	TotalHits       int64                       `json:"total_hits"`
+	Page            int                         `json:"page"`
+	PageSize        int                         `json:"page_size"`
+	Hits            []SearchHit                 `json:"hits"`
+	FileSummaries   []SearchFileSummary         `json:"file_summaries,omitempty"`
+	Histogram       []TimeHistogramBucket       `json:"histogram,omitempty"`        // 检索命中事件的时序分布直方图
+	ExtractedTraces []string                    `json:"extracted_traces,omitempty"` // 从检索结果中提取到的 TraceID / RequestID
+	Facets          map[string]map[string]int64 `json:"facets,omitempty"`           // 多维分面统计 (如 level, file)
+	CostMS          int64                       `json:"cost_ms"`
 }
 
 // HAStatus 高可用主备状态

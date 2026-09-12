@@ -436,4 +436,52 @@ line 6: no matching word here
 	}
 }
 
+func TestSearchHistogramAndTraceExtraction(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "hist_trace_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	content := "2026-09-12 10:00:00 [INFO] trace_id=trace-001 Gateway received request\n" +
+		"2026-09-12 10:05:00 [WARN] trace_id=trace-001 slow response from upstream 850ms\n" +
+		"2026-09-12 10:10:00 [ERROR] trace_id=trace-002 connection refused host=10.0.1.2\n" +
+		"2026-09-12 10:15:00 [FATAL] trace_id=trace-002 panic: nil pointer dereference\n"
+
+	filePath := filepath.Join(tempDir, "app.log")
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := SearchLogs(tempDir, &model.SearchQuery{
+		Keyword: "trace_id",
+	})
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+
+	if resp.TotalHits != 4 {
+		t.Fatalf("expected 4 hits, got %d", resp.TotalHits)
+	}
+
+	// 验证 TraceID 提取
+	if len(resp.ExtractedTraces) != 2 {
+		t.Errorf("expected 2 unique traces, got %d: %v", len(resp.ExtractedTraces), resp.ExtractedTraces)
+	}
+
+	// 验证时序直方图
+	if len(resp.Histogram) == 0 {
+		t.Errorf("expected histogram buckets, got empty")
+	}
+
+	// 验证 Facets
+	if resp.Facets == nil || resp.Facets["level"] == nil {
+		t.Fatalf("expected facets level map, got nil")
+	}
+	if resp.Facets["level"]["FATAL"] != 1 || resp.Facets["level"]["ERROR"] != 1 {
+		t.Errorf("facets level count mismatch: %+v", resp.Facets["level"])
+	}
+}
+
+
 

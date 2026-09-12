@@ -27,11 +27,14 @@ func main() {
 
 	subCmd := os.Args[1]
 	switch subCmd {
+	case "-h", "--help", "help":
+		printHelp()
+		return
 	case "manager":
 		runManager(os.Args[2:])
 	case "worker":
 		runWorker(os.Args[2:])
-	case "version":
+	case "version", "-v", "--version":
 		fmt.Printf("分布式存储日志分析系统 (Distributed Storage Log Analyzer)\n")
 		fmt.Printf("版本: %s\n", Version)
 		fmt.Printf("架构特性: 纯静态单一二进制 (CGO_ENABLED=0), 零外部依赖, 原生适配所有通用 RedHat/CentOS 衍生 Linux\n")

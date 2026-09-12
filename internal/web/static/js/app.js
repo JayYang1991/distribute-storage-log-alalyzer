@@ -184,7 +184,7 @@ const app = {
   switchTab(tabName) {
     // 权限守卫：非管理员试图访问管理/配置视图时，强制拦截并保留在日志分析视图
     const isAdmin = this.currentUser ? this.currentUser.role === "admin" : false;
-    const allowedUserTabs = ["archives", "search"];
+    const allowedUserTabs = ["archives", "search", "diff"];
     if (!isAdmin && !allowedUserTabs.includes(tabName)) {
       console.warn(`[Permission Denied] 用户无权访问视图: ${tabName}，自动重定向至日志归档分析视图`);
       tabName = "archives";
@@ -196,12 +196,13 @@ const app = {
     });
 
     const titles = {
-      dashboard: ["概览仪表盘", "实时监控分布式存储计算节点状态与日志分析全局指标"],
+      dashboard: ["概览仪表盘", "实时监控分布式系统与各计算节点状态及日志分析全局指标"],
       nodes: ["集群节点与安装", "管理分布式计算节点与一键 SSH 远程部署业务组件"],
       users: ["用户与存储空间", "多租户权限控制与用户独立存储空间沙箱配额管理"],
       archives: ["日志归档与文件", "常用格式压缩包上传、解包文件树目录与日志在线查看"],
-      search: ["日志全局检索", "毫秒级正则与全文检索引擎，支持行级定位与上下文展开"],
-      rules: ["故障规则与诊断", "配置存储故障模式规则库，自动诊断与自愈排查指导"],
+      search: ["日志全局检索", "毫秒级正则与全文检索引擎，时序直方图与 TraceID 链路下钻穿透"],
+      rules: ["故障规则与诊断", "配置分布式系统故障特征库，自动诊断与自愈排查指导"],
+      diff: ["基准差分对比", "双日志包横向对比，全方位定位文件增减、告警激增及全新异常日志模式 (Zero-Shot Patterns)"],
       alarms: ["实时告警中心", "业务计算节点异常自检、硬件磁盘故障、节点失联与系统告警全生命周期监控"],
     };
 
@@ -217,6 +218,8 @@ const app = {
     // 切换到对应 tab 触发加载
     if (tabName === "search") {
       this.populateSearchArchiveSelect();
+    } else if (tabName === "diff") {
+      this.populateDiffArchiveSelects();
     } else if (tabName === "alarms" && isAdmin) {
       this.fetchAlarms();
     }
@@ -3334,9 +3337,161 @@ const app = {
 
       <hr style="border: none; border-top: 1px solid var(--border-color); margin: 20px 0;">
 
-      <h4 style="font-size: 14px; margin-bottom: 14px;">🔎 命中存储故障时序事件流水 (共 ${rep.total_events} 处):</h4>
+      <h4 style="font-size: 14px; margin-bottom: 14px;">🔎 命中分布式系统故障特征事件 (共 ${rep.total_events} 处):</h4>
       <div>${eventsHtml}</div>
+
+      <hr style="border: none; border-top: 1px solid var(--border-color); margin: 20px 0;">
+      <div id="diag-templates-section">
+        <h4 style="font-size: 14px; margin-bottom: 10px; color: #38bdf8;">🧩 通用日志模式模板挖掘与聚类降噪 (Drain Top Patterns):</h4>
+        <div id="diag-templates-content" style="color: var(--text-dim); font-size: 12px;">正在挖掘分析高频模式...</div>
+      </div>
     `;
+
+    this.loadArchiveTemplates(rep.archive_id);
+  },
+
+  async loadArchiveTemplates(archiveID) {
+    const box = document.getElementById("diag-templates-content");
+    if (!box) return;
+    try {
+      const res = await this.api(`/api/analysis/templates?archive_id=${archiveID}`);
+      if (!res.ok) {
+        box.innerHTML = `<span style="color: var(--text-dim);">模板挖掘暂不可用或无数据。</span>`;
+        return;
+      }
+      const templates = await res.json();
+      if (!templates || templates.length === 0) {
+        box.innerHTML = `<span style="color: var(--text-dim);">未提取到聚合模板。</span>`;
+        return;
+      }
+
+      let html = `
+        <div class="table-responsive">
+          <table class="table" style="font-size: 12px;">
+            <thead>
+              <tr>
+                <th style="width: 80px;">级别</th>
+                <th style="width: 70px;">频次</th>
+                <th>聚类模式 (Pattern)</th>
+                <th>原始采样日志 (Sample)</th>
+              </tr>
+            </thead>
+            <tbody>
+      `;
+      templates.slice(0, 10).forEach(t => {
+        const lvlClass = (t.level || "INFO").toLowerCase();
+        html += `
+          <tr>
+            <td><span class="badge badge-${lvlClass === 'error' || lvlClass === 'fatal' ? 'danger' : lvlClass === 'warn' ? 'warning' : 'muted'}">${t.level || 'INFO'}</span></td>
+            <td><strong>${t.count}</strong> 次</td>
+            <td><code style="color: #38bdf8; font-size: 11px;">${this.escape(t.pattern)}</code></td>
+            <td style="color: var(--text-dim); font-family: monospace; font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${this.escape(t.sample)}">${this.escape(t.sample)}</td>
+          </tr>
+        `;
+      });
+      html += `</tbody></table></div>`;
+      box.innerHTML = html;
+    } catch (e) {
+      box.innerHTML = `<span style="color: var(--danger);">加载模板失败: ${e.message}</span>`;
+    }
+  },
+
+  // ================= 基准差分对比 (Baseline Diff) =================
+
+  populateDiffArchiveSelects() {
+    const selA = document.getElementById("diff-archive-a");
+    const selB = document.getElementById("diff-archive-b");
+    if (!selA || !selB) return;
+
+    let opts = '<option value="">-- 请选择日志包 --</option>';
+    this.archives.forEach(a => {
+      if (a.status === "ready") {
+        const tagText = a.tags && a.tags.length > 0 ? ` [${a.tags.join(", ")}]` : "";
+        opts += `<option value="${a.id}">${this.escape(a.filename)}${this.escape(tagText)} (${(a.size / (1024 * 1024)).toFixed(1)} MB)</option>`;
+      }
+    });
+    selA.innerHTML = opts;
+    selB.innerHTML = opts;
+
+    if (this.archives.length >= 2) {
+      selA.selectedIndex = 1;
+      selB.selectedIndex = 2;
+    }
+  },
+
+  async executeDiffAnalysis() {
+    const idA = document.getElementById("diff-archive-a")?.value;
+    const idB = document.getElementById("diff-archive-b")?.value;
+    if (!idA || !idB) {
+      alert("请同时选择基准日志包 A 与待测日志包 B");
+      return;
+    }
+    if (idA === idB) {
+      alert("请选择两份不同的日志包进行差分对比！");
+      return;
+    }
+
+    const btn = document.getElementById("btn-run-diff");
+    btn.disabled = true;
+    btn.innerText = "正在深度差分计算...";
+
+    const resCard = document.getElementById("diff-result-card");
+    try {
+      const res = await this.api("/api/analysis/diff", "POST", {
+        archive_id_a: idA,
+        archive_id_b: idB,
+      });
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      const data = await res.json();
+      resCard.style.display = "block";
+      document.getElementById("diff-analyzed-at").innerText = `对比时间: ${new Date(data.analyzed_at).toLocaleTimeString()}`;
+      document.getElementById("diff-stat-files").innerText = `${data.total_files_a} vs ${data.total_files_b}`;
+      document.getElementById("diff-stat-events").innerText = `${data.total_events_a} vs ${data.total_events_b}`;
+      document.getElementById("diff-stat-new-patterns").innerText = (data.new_templates ? data.new_templates.length : 0);
+
+      document.getElementById("diff-summary-alert").innerText = data.summary_text;
+
+      // 渲染独有新增异常模式
+      const tbody = document.getElementById("diff-new-templates-tbody");
+      if (data.new_templates && data.new_templates.length > 0) {
+        tbody.innerHTML = data.new_templates.map(t => {
+          const lvl = (t.level || "INFO").toLowerCase();
+          return `
+            <tr>
+              <td><span class="badge badge-${lvl === 'error' || lvl === 'fatal' ? 'danger' : lvl === 'warn' ? 'warning' : 'muted'}">${t.level || 'INFO'}</span></td>
+              <td><strong>${t.count}</strong> 次</td>
+              <td><code style="color: #fbbf24; font-size: 11px;">${this.escape(t.pattern)}</code></td>
+              <td style="color: var(--text-dim); font-family: monospace; font-size: 11px;">${this.escape(t.sample)}</td>
+            </tr>
+          `;
+        }).join("");
+      } else {
+        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--success); padding: 15px;">✔ 待测包未见突发异质日志模式！</td></tr>`;
+      }
+
+      // 渲染文件增减清单
+      const addedList = document.getElementById("diff-added-files-list");
+      const removedList = document.getElementById("diff-removed-files-list");
+      document.getElementById("diff-added-files-count").innerText = data.added_files ? data.added_files.length : 0;
+      document.getElementById("diff-removed-files-count").innerText = data.removed_files ? data.removed_files.length : 0;
+
+      addedList.innerHTML = (data.added_files && data.added_files.length > 0)
+        ? data.added_files.map(f => `<div>+ ${this.escape(f)}</div>`).join("")
+        : '<div style="color: var(--text-dim);">无新增文件</div>';
+
+      removedList.innerHTML = (data.removed_files && data.removed_files.length > 0)
+        ? data.removed_files.map(f => `<div>- ${this.escape(f)}</div>`).join("")
+        : '<div style="color: var(--text-dim);">无缺失文件</div>';
+
+      resCard.scrollIntoView({ behavior: "smooth" });
+    } catch (err) {
+      alert("差分比对失败: " + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.innerText = "🚀 执行深度差分比对";
+    }
   },
 
   // ================= 日志全局检索 =================
@@ -3397,6 +3552,7 @@ const app = {
       document.getElementById("search-cost-badge").innerText = `耗时 ${data.cost_ms} ms`;
       document.getElementById("search-result-title").innerText = `检索结果 (找到 ${data.total_hits} 处匹配)`;
 
+      this.renderSearchHistogram(data.histogram, data.extracted_traces);
       this.renderSearchHits(data.hits, keyword, isRegex, caseSensitive, wholeWord);
     } catch (e) {
       alert("检索失败: " + e.message);
@@ -3404,6 +3560,74 @@ const app = {
       btn.disabled = false;
       btn.innerText = "🔎 执行检索";
     }
+  },
+
+  renderSearchHistogram(histogram, traces) {
+    const histCard = document.getElementById("search-histogram-card");
+    const chart = document.getElementById("search-histogram-chart");
+    const traceChips = document.getElementById("search-trace-chips");
+    const traceList = document.getElementById("search-trace-list");
+    if (!histCard || !chart) return;
+
+    if (!histogram || histogram.length === 0) {
+      histCard.style.display = "none";
+      return;
+    }
+
+    histCard.style.display = "block";
+    let maxCount = 1;
+    histogram.forEach(b => {
+      if (b.total_count > maxCount) maxCount = b.total_count;
+    });
+
+    let barsHtml = `<div style="display: flex; align-items: flex-end; width: 100%; height: 80px; gap: 3px; padding-bottom: 20px; box-sizing: border-box; position: relative;">`;
+
+    histogram.forEach((b, i) => {
+      const heightPercent = Math.max(8, Math.round((b.total_count / maxCount) * 100));
+      const timeShort = b.timestamp.length >= 16 ? b.timestamp.substring(11, 16) : b.timestamp;
+      barsHtml += `
+        <div style="flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; position: relative; cursor: pointer;" 
+             title="时间: ${b.timestamp}\n总计: ${b.total_count} 条\nFATAL: ${b.fatal_count} | ERROR: ${b.error_count} | WARN: ${b.warn_count} | INFO: ${b.info_count}\n点击快速聚焦" 
+             onclick="app.zoomHistogram('${b.timestamp}')">
+          <div style="width: 100%; height: ${heightPercent}%; display: flex; flex-direction: column; border-radius: 2px; overflow: hidden; background: #334155;">
+            ${b.fatal_count > 0 ? `<div style="height: ${(b.fatal_count / b.total_count)*100}%; background: #ef4444;"></div>` : ''}
+            ${b.error_count > 0 ? `<div style="height: ${(b.error_count / b.total_count)*100}%; background: #f59e0b;"></div>` : ''}
+            ${b.warn_count > 0 ? `<div style="height: ${(b.warn_count / b.total_count)*100}%; background: #fbbf24;"></div>` : ''}
+            ${b.info_count > 0 ? `<div style="height: ${(b.info_count / b.total_count)*100}%; background: #38bdf8;"></div>` : ''}
+          </div>
+          ${i % Math.ceil(histogram.length / 6) === 0 ? `<span style="position: absolute; bottom: 0; left: 0; font-size: 10px; color: var(--text-dim); white-space: nowrap;">${timeShort}</span>` : ''}
+        </div>
+      `;
+    });
+    barsHtml += `</div>`;
+    chart.innerHTML = barsHtml;
+
+    // 渲染识别出的 TraceID
+    if (traces && traces.length > 0) {
+      traceChips.style.display = "block";
+      traceList.innerHTML = traces.map(tr => `
+        <button type="button" class="btn btn-secondary btn-xs" style="font-family: monospace; font-size: 11px; padding: 2px 8px; border-radius: 12px; background: rgba(56, 189, 248, 0.15); border-color: #38bdf8; color: #38bdf8;" onclick="app.drillDownTrace('${this.escape(tr)}')">
+          🔗 ${this.escape(tr)}
+        </button>
+      `).join("");
+    } else {
+      traceChips.style.display = "none";
+    }
+  },
+
+  drillDownTrace(traceID) {
+    const kwInput = document.getElementById("search-keyword");
+    if (kwInput) {
+      kwInput.value = traceID;
+      document.getElementById("search-is-regex").checked = false;
+      document.getElementById("search-whole-word").checked = false;
+      this.doSearch(1);
+    }
+  },
+
+  zoomHistogram(timestamp) {
+    if (!timestamp) return;
+    alert(`已聚焦所选故障波峰时间点: ${timestamp}\n可在上方关键词中补充该时刻或缩小检索范围。`);
   },
 
   renderSearchHits(hits, keyword, isRegex = false, caseSensitive = false, wholeWord = false) {
@@ -3418,6 +3642,10 @@ const app = {
     hits.forEach(h => {
       const div = document.createElement("div");
       div.className = "search-hit-item";
+
+      // 自动提取 TraceID
+      const traceMatch = h.content.match(/(?:trace_?id|request_?id|req_?id)[=:]\s*([a-zA-Z0-9_-]+)/i);
+      const traceID = traceMatch ? traceMatch[1] : "";
 
       let highlighted = this.escape(h.content);
       if (keyword) {
@@ -3445,6 +3673,9 @@ const app = {
         <div class="hit-header">
           <span><code>${this.escape(h.file_path)} : 第 ${h.line_number} 行</code></span>
           <div style="display: flex; align-items: center; gap: 6px;">
+            ${traceID ? `
+              <button class="btn btn-xs" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid #38bdf8;" title="点击穿透下钻此 TraceID 调用链" onclick="app.drillDownTrace('${this.escape(traceID)}')">🔗 Trace: ${this.escape(traceID)}</button>
+            ` : ''}
             ${searchArchID ? `
               <button class="btn btn-primary btn-xs" title="在解包查看器中定位此行并阅读上下文" onclick="app.openViewerAndJump('${searchArchID}', '${this.escape(h.file_path)}', ${h.line_number}, '${this.escape(keyword || '')}')">👁️ 定位查看</button>
               <button class="btn btn-secondary btn-xs" title="下载此日志文件" onclick="app.downloadFile('${searchArchID}', '${this.escape(h.file_path)}')">📥 下载日志</button>
@@ -3787,6 +4018,196 @@ const app = {
     } catch (e) {
       alert("清理已恢复告警失败: " + e.message);
     }
+  },
+
+  // ================= 导入新安装包一键平滑升级 =================
+
+  openUpgradeModal() {
+    const fileInput = document.getElementById("upgrade-file-input");
+    if (fileInput) fileInput.value = "";
+    const progressBox = document.getElementById("upgrade-progress-box");
+    if (progressBox) progressBox.style.display = "none";
+    const statusText = document.getElementById("upgrade-status-text");
+    if (statusText) {
+      statusText.innerText = "准备就绪";
+      statusText.style.color = "#38bdf8";
+    }
+    const progressBar = document.getElementById("upgrade-progress-bar");
+    if (progressBar) progressBar.style.width = "0%";
+    const percentageText = document.getElementById("upgrade-percentage-text");
+    if (percentageText) percentageText.innerText = "0%";
+    const detailInfo = document.getElementById("upgrade-detail-info");
+    if (detailInfo) {
+      detailInfo.innerText = "";
+      detailInfo.style.color = "var(--text-dim)";
+    }
+    const submitBtn = document.getElementById("btn-upgrade-submit");
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerText = "🚀 开始上传并自动升级";
+    }
+    const cancelBtn = document.getElementById("btn-upgrade-cancel");
+    if (cancelBtn) cancelBtn.disabled = false;
+
+    this.openModal("modal-upgrade");
+  },
+
+  submitUpgradePackage(event) {
+    if (event) event.preventDefault();
+    const fileInput = document.getElementById("upgrade-file-input");
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+      alert("请先选择升级安装包或独立二进制程序");
+      return;
+    }
+
+    const file = fileInput.files[0];
+    if (!confirm(`确认要将管理节点升级为安装包 [${file.name}] 吗？\n升级过程中将自动备份旧版本并执行平滑热重启。`)) {
+      return;
+    }
+
+    const progressBox = document.getElementById("upgrade-progress-box");
+    const statusText = document.getElementById("upgrade-status-text");
+    const progressBar = document.getElementById("upgrade-progress-bar");
+    const percentageText = document.getElementById("upgrade-percentage-text");
+    const detailInfo = document.getElementById("upgrade-detail-info");
+    const submitBtn = document.getElementById("btn-upgrade-submit");
+    const cancelBtn = document.getElementById("btn-upgrade-cancel");
+
+    if (progressBox) progressBox.style.display = "block";
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.innerText = "⏳ 正在传输升级包...";
+    }
+    if (cancelBtn) cancelBtn.disabled = true;
+
+    const formData = new FormData();
+    formData.append("package", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/system/upgrade", true);
+    if (this.token) {
+      xhr.setRequestHeader("Authorization", `Bearer ${this.token}`);
+    }
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.min(99, Math.round((e.loaded / e.total) * 100));
+        if (progressBar) progressBar.style.width = `${percent}%`;
+        if (percentageText) percentageText.innerText = `${percent}%`;
+        if (statusText) statusText.innerText = `正在上传安装包 (${(e.loaded / 1024 / 1024).toFixed(1)}MB / ${(e.total / 1024 / 1024).toFixed(1)}MB)...`;
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        let resp = {};
+        try {
+          resp = JSON.parse(xhr.responseText);
+        } catch (_) {}
+
+        if (progressBar) progressBar.style.width = "100%";
+        if (percentageText) percentageText.innerText = "100%";
+        if (statusText) {
+          statusText.innerText = "⚡ 安装包解包与架构预检通过，服务重启中...";
+          statusText.style.color = "#fbbf24";
+        }
+        if (detailInfo) {
+          detailInfo.innerText = resp.message || "程序已成功原子替换，管理节点正在执行平滑热重启与服务恢复...";
+          detailInfo.style.color = "#38bdf8";
+        }
+
+        // 进入存活探针轮询
+        this.pollHealthAfterUpgrade();
+      } else {
+        let errMsg = xhr.responseText || "升级失败";
+        try {
+          const errObj = JSON.parse(xhr.responseText);
+          if (errObj.message) errMsg = errObj.message;
+        } catch (_) {}
+
+        if (statusText) {
+          statusText.innerText = "❌ 升级失败";
+          statusText.style.color = "#f87171";
+        }
+        if (detailInfo) {
+          detailInfo.innerText = errMsg;
+          detailInfo.style.color = "#f87171";
+        }
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerText = "重试升级";
+        }
+        if (cancelBtn) cancelBtn.disabled = false;
+        alert("系统升级失败: " + errMsg);
+      }
+    };
+
+    xhr.onerror = () => {
+      if (statusText) {
+        statusText.innerText = "🔄 正在探测服务重启状态...";
+        statusText.style.color = "#fbbf24";
+      }
+      this.pollHealthAfterUpgrade();
+    };
+
+    xhr.send(formData);
+  },
+
+  pollHealthAfterUpgrade() {
+    const statusText = document.getElementById("upgrade-status-text");
+    const detailInfo = document.getElementById("upgrade-detail-info");
+    const progressBar = document.getElementById("upgrade-progress-bar");
+    const percentageText = document.getElementById("upgrade-percentage-text");
+
+    let attempts = 0;
+    const maxAttempts = 35; // 最多探测 35 次，每次 1.2 秒 (~42秒)
+
+    const checkInterval = setInterval(async () => {
+      attempts++;
+      if (statusText) {
+        statusText.innerText = `🔄 等待服务自愈恢复中 (尝试 ${attempts}/${maxAttempts})...`;
+      }
+
+      try {
+        const res = await fetch("/healthz?t=" + Date.now(), { cache: "no-store" });
+        if (res.ok) {
+          clearInterval(checkInterval);
+          if (statusText) {
+            statusText.innerText = "🎉 系统升级成功，新版本已上线！";
+            statusText.style.color = "#34d399";
+          }
+          if (progressBar) {
+            progressBar.style.background = "#34d399";
+            progressBar.style.width = "100%";
+          }
+          if (percentageText) percentageText.innerText = "完成";
+          if (detailInfo) {
+            detailInfo.innerText = "管理服务已成功重启并恢复健康运行，页面即将自动刷新...";
+            detailInfo.style.color = "#34d399";
+          }
+
+          setTimeout(() => {
+            window.location.reload();
+          }, 1500);
+          return;
+        }
+      } catch (_) {
+        // 服务尚在重启中，继续轮询
+      }
+
+      if (attempts >= maxAttempts) {
+        clearInterval(checkInterval);
+        if (statusText) {
+          statusText.innerText = "⚠️ 自动重连超时";
+          statusText.style.color = "#fbbf24";
+        }
+        if (detailInfo) {
+          detailInfo.innerText = "服务可能启动较慢或需要手动检查日志 (systemctl status dist-log-manager)。请稍后手动刷新网页。";
+        }
+        const cancelBtn = document.getElementById("btn-upgrade-cancel");
+        if (cancelBtn) cancelBtn.disabled = false;
+      }
+    }, 1200);
   },
 
   // ================= 辅助工具 =================

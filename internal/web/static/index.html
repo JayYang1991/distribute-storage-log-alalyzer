@@ -43,6 +43,10 @@
           <span class="icon">🛡️</span>
           <span>故障规则与诊断</span>
         </div>
+        <div class="nav-item" data-tab="diff" data-role="all">
+          <span class="icon">⚖️</span>
+          <span>基准差分对比</span>
+        </div>
         <div class="nav-item" data-tab="alarms" id="nav-alarms" data-role="admin">
           <span class="icon">🚨</span>
           <span>实时告警中心</span>
@@ -138,6 +142,9 @@
               <button class="btn btn-secondary" onclick="app.switchTab('rules');">
                 🛠️ 查看存储故障预设特征库
               </button>
+              <button class="btn btn-primary" onclick="app.openUpgradeModal();">
+                ⬆️ 系统在线平滑升级
+              </button>
             </div>
           </div>
 
@@ -151,11 +158,13 @@
                   <thead>
                     <tr>
                       <th>文件名</th>
-                      <th>所属用户</th>
+                      <th>归属用户</th>
                       <th>大小</th>
+                      <th>存放节点</th>
                       <th>文件数</th>
-                      <th>状态</th>
+                      <th>日志行数</th>
                       <th>上传时间</th>
+                      <th>状态</th>
                       <th>操作</th>
                     </tr>
                   </thead>
@@ -192,6 +201,7 @@
             <div class="card-header">
               <span class="card-title">🖥️ 分布式业务组件节点列表</span>
               <div style="display: flex; gap: 10px;">
+                <button class="btn btn-primary btn-sm" onclick="app.openUpgradeModal();" title="导入新版本安装包执行一键平滑升级">⬆️ 导入安装包升级</button>
                 <button class="btn btn-secondary btn-sm" onclick="app.downloadDatabaseBackup();" title="在线无锁流式导出当前元数据库 (bbolt) 一致性热快照">📥 导出元数据快照</button>
                 <button class="btn btn-secondary btn-sm" onclick="app.openAgentScriptModal();">📋 离线接入命令</button>
                 <button class="btn btn-primary btn-sm" onclick="app.openDeployModal();">➕ 一键安装业务组件 (SSH)</button>
@@ -395,6 +405,25 @@
               <span id="search-cost-badge" class="badge badge-info">耗时 0 ms</span>
             </div>
             <div class="card-body">
+              <!-- 检索时序频次直方图卡片 -->
+              <div id="search-histogram-card" style="display: none; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 16px; margin-bottom: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                  <span style="font-size: 13px; font-weight: 600; color: var(--text-color);">📈 检索事件时序分布直方图</span>
+                  <div style="display: flex; gap: 12px; font-size: 11px; align-items: center;">
+                    <span style="display: flex; align-items: center; gap: 4px;"><span style="display:inline-block; width:8px; height:8px; background:#ef4444; border-radius:2px;"></span> FATAL/CRITICAL</span>
+                    <span style="display: flex; align-items: center; gap: 4px;"><span style="display:inline-block; width:8px; height:8px; background:#f59e0b; border-radius:2px;"></span> ERROR</span>
+                    <span style="display: flex; align-items: center; gap: 4px;"><span style="display:inline-block; width:8px; height:8px; background:#fbbf24; border-radius:2px;"></span> WARN</span>
+                    <span style="display: flex; align-items: center; gap: 4px;"><span style="display:inline-block; width:8px; height:8px; background:#38bdf8; border-radius:2px;"></span> INFO</span>
+                    <span style="color: var(--text-dim); margin-left: 8px;">💡 点击柱状条可聚焦缩放该时段</span>
+                  </div>
+                </div>
+                <div id="search-histogram-chart" style="height: 100px; width: 100%; position: relative;"></div>
+                <div id="search-trace-chips" style="display: none; margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,0.1); font-size: 12px;">
+                  <span style="color: var(--text-muted); font-weight: 500;">🔗 自动识别到分布式调用链路 TraceID (点击一键穿透下钻):</span>
+                  <div id="search-trace-list" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;"></div>
+                </div>
+              </div>
+
               <div id="search-hits-container"></div>
               <div id="search-pagination" style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;"></div>
             </div>
@@ -492,6 +521,101 @@
                   </thead>
                   <tbody></tbody>
                 </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 8. 基准差分对比 Tab -->
+        <section class="tab-pane" id="pane-diff" style="display: none;">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">⚖️ 双日志包横向基准差分对比 (Baseline Differential Analysis)</span>
+            </div>
+            <div class="card-body">
+              <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: var(--text-muted); line-height: 1.6;">
+                💡 <strong>分布式运维专家排障法（控制变量差分法）：</strong><br>
+                选择一份“正常/健康基准日志包”与一份“故障/异常现场日志包”（或两台配置相同但吞吐异常的节点日志），系统将自动进行全方位特征差分比对：包括<strong>解压文件增减、告警激增率、以及基于 Drain 算法自动挖掘的全新突发异常模式（Zero-Shot Patterns）</strong>。
+              </div>
+
+              <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 16px; align-items: flex-end;">
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label class="form-label" style="font-weight: 600; color: #34d399;">📗 基准日志包 A (正常状态 / 升级前)</label>
+                  <select class="form-control" id="diff-archive-a"></select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                  <label class="form-label" style="font-weight: 600; color: #f87171;">📕 待测/故障日志包 B (异常现场 / 升级后)</label>
+                  <select class="form-control" id="diff-archive-b"></select>
+                </div>
+                <button class="btn btn-primary" id="btn-run-diff" onclick="app.executeDiffAnalysis();" style="height: 38px;">
+                  🚀 执行深度差分比对
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 差分比对结果呈现区 -->
+          <div class="card" id="diff-result-card" style="display: none; margin-top: 20px;">
+            <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+              <span class="card-title">📊 差分比对诊断报告</span>
+              <span class="badge badge-primary" id="diff-analyzed-at"></span>
+            </div>
+            <div class="card-body">
+              <!-- 概览指标对比栅格 -->
+              <div class="stats-grid" style="margin-bottom: 20px;">
+                <div class="stat-card">
+                  <div class="stat-icon blue">📁</div>
+                  <div>
+                    <div class="stat-label">解压文件总数对比</div>
+                    <div class="stat-val" id="diff-stat-files">0 vs 0</div>
+                  </div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-icon red">💥</div>
+                  <div>
+                    <div class="stat-label">检出异常事件总数</div>
+                    <div class="stat-val" id="diff-stat-events">0 vs 0</div>
+                  </div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-icon purple">🧩</div>
+                  <div>
+                    <div class="stat-label">待测包特有异常模式</div>
+                    <div class="stat-val" id="diff-stat-new-patterns">0</div>
+                  </div>
+                </div>
+              </div>
+
+              <div id="diff-summary-alert" style="background: rgba(30, 41, 59, 0.7); border-left: 4px solid #38bdf8; padding: 12px 16px; border-radius: 4px; font-size: 13px; margin-bottom: 20px; white-space: pre-line;"></div>
+
+              <!-- 新增异常模式卡片 -->
+              <div id="diff-new-templates-section" style="margin-bottom: 20px;">
+                <h4 style="font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #fbbf24;">🔍 待测包独有的新增异常日志模式 (Zero-Shot Patterns)</h4>
+                <div class="table-responsive">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th style="width: 100px;">严重级别</th>
+                        <th style="width: 80px;">频次</th>
+                        <th>通配模式 (Pattern)</th>
+                        <th>代表性原始样本 (Sample)</th>
+                      </tr>
+                    </thead>
+                    <tbody id="diff-new-templates-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 文件增减清单 -->
+              <div id="diff-files-section" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                <div style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px;">
+                  <h5 style="color: #34d399; font-size: 13px; margin-bottom: 8px;">➕ 待测包新增文件 (<span id="diff-added-files-count">0</span>)</h5>
+                  <div id="diff-added-files-list" style="max-height: 160px; overflow-y: auto; font-family: monospace; font-size: 12px; color: var(--text-dim);"></div>
+                </div>
+                <div style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px;">
+                  <h5 style="color: #f87171; font-size: 13px; margin-bottom: 8px;">➖ 待测包缺失文件 (<span id="diff-removed-files-count">0</span>)</h5>
+                  <div id="diff-removed-files-list" style="max-height: 160px; overflow-y: auto; font-family: monospace; font-size: 12px; color: var(--text-dim);"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -1135,6 +1259,8 @@
         </div>
       </div>
     </div>
+  </div>
+
   <!-- 模态框 8: 日志生命周期与磁盘高水位自愈配置 -->
   <div class="modal-overlay" id="modal-retention-settings">
     <div class="modal-content" style="max-width: 520px;">
@@ -1191,6 +1317,49 @@
           <div class="modal-footer" style="padding: 14px 0 0 0; margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px;">
             <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-retention-settings')">取消</button>
             <button type="submit" class="btn btn-primary">保存配置</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 9: 导入新安装包一键平滑升级 -->
+  <div class="modal-overlay" id="modal-upgrade">
+    <div class="modal-content" style="max-width: 580px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🚀 导入新安装包一键平滑升级</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-upgrade')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 16px; font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+          💡 <strong>升级与平滑热重启说明:</strong><br>
+          • <strong>支持文件格式:</strong> 支持上传打包生成的 <code>.tar.gz</code> 完整安装归档（如 <code>dist-log-analyzer-linux-amd64.tar.gz</code>）或编译好的独立可执行二进制程序（<code>dist-log-analyzer</code>）。<br>
+          • <strong>安全架构自检:</strong> 后端自动解包、校验 ELF 格式并执行 <code>--help</code> 预检兼容性，确保新版本可正常启动后才执行原子覆盖。<br>
+          • <strong>无感热重启:</strong> 自动备份旧版本至 <code>.bak</code>，后台异步延迟 800ms 触发 <code>systemctl restart dist-log-manager</code>，前端将自动进入健康检查探针轮询与自动重连刷新。
+        </div>
+
+        <form id="form-upgrade" onsubmit="app.submitUpgradePackage(event)">
+          <div class="form-group">
+            <label class="form-label" style="font-weight: 600;">选择升级安装包或独立二进制程序 *</label>
+            <input type="file" class="form-control" id="upgrade-file-input" accept=".tar.gz,.tgz,application/gzip,application/octet-stream" required>
+            <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">建议上传由发布脚本 package.sh 生成的 .tar.gz 安装归档包</div>
+          </div>
+
+          <!-- 上传与升级状态进度条 -->
+          <div id="upgrade-progress-box" style="display: none; margin-top: 16px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 12px 16px;">
+            <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px;">
+              <span id="upgrade-status-text" style="color: #38bdf8; font-weight: 500;">准备就绪</span>
+              <span id="upgrade-percentage-text" style="color: var(--text-dim); font-family: monospace;">0%</span>
+            </div>
+            <div style="width: 100%; height: 8px; background: rgba(255, 255, 255, 0.1); border-radius: 4px; overflow: hidden;">
+              <div id="upgrade-progress-bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #38bdf8, #818cf8); transition: width 0.2s ease;"></div>
+            </div>
+            <div id="upgrade-detail-info" style="font-size: 11px; color: var(--text-dim); margin-top: 8px; white-space: pre-line;"></div>
+          </div>
+
+          <div class="modal-footer" style="padding: 16px 0 0 0; margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+            <button type="button" class="btn btn-secondary" id="btn-upgrade-cancel" onclick="app.closeModal('modal-upgrade')">取消</button>
+            <button type="submit" class="btn btn-primary" id="btn-upgrade-submit">🚀 开始上传并自动升级</button>
           </div>
         </form>
       </div>

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"dist-log-analyzer/internal/indexer"
 	"dist-log-analyzer/internal/model"
 )
 
@@ -51,9 +52,12 @@ type searchCacheKey struct {
 }
 
 type searchCacheItem struct {
-	allHits       []model.SearchHit
-	fileSummaries []model.SearchFileSummary
-	expiresAt     time.Time
+	allHits         []model.SearchHit
+	fileSummaries   []model.SearchFileSummary
+	histogram       []model.TimeHistogramBucket
+	extractedTraces []string
+	facets          map[string]map[string]int64
+	expiresAt       time.Time
 }
 
 var (
@@ -61,17 +65,17 @@ var (
 	queryCache   = make(map[searchCacheKey]*searchCacheItem)
 )
 
-func getCachedHits(key searchCacheKey) ([]model.SearchHit, []model.SearchFileSummary, bool) {
+func getCachedHits(key searchCacheKey) (*searchCacheItem, bool) {
 	queryCacheMu.RLock()
 	item, found := queryCache[key]
 	queryCacheMu.RUnlock()
 	if found && time.Now().Before(item.expiresAt) {
-		return item.allHits, item.fileSummaries, true
+		return item, true
 	}
-	return nil, nil, false
+	return nil, false
 }
 
-func setCachedHits(key searchCacheKey, hits []model.SearchHit, summaries []model.SearchFileSummary) {
+func setCachedHits(key searchCacheKey, hits []model.SearchHit, summaries []model.SearchFileSummary, hist []model.TimeHistogramBucket, traces []string, facets map[string]map[string]int64) {
 	queryCacheMu.Lock()
 	defer queryCacheMu.Unlock()
 	// 清理过期或限制大小
@@ -90,9 +94,12 @@ func setCachedHits(key searchCacheKey, hits []model.SearchHit, summaries []model
 		}
 	}
 	queryCache[key] = &searchCacheItem{
-		allHits:       hits,
-		fileSummaries: summaries,
-		expiresAt:     now.Add(60 * time.Second),
+		allHits:         hits,
+		fileSummaries:   summaries,
+		histogram:       hist,
+		extractedTraces: traces,
+		facets:          facets,
+		expiresAt:       now.Add(60 * time.Second),
 	}
 }
 
@@ -134,16 +141,19 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 		level:         targetLevel,
 		contextLines:  q.ContextLines,
 	}
-	if cachedHits, cachedSummaries, ok := getCachedHits(cacheKey); ok {
-		resp.TotalHits = int64(len(cachedHits))
-		resp.FileSummaries = cachedSummaries
+	if cachedItem, ok := getCachedHits(cacheKey); ok {
+		resp.TotalHits = int64(len(cachedItem.allHits))
+		resp.FileSummaries = cachedItem.fileSummaries
+		resp.Histogram = cachedItem.histogram
+		resp.ExtractedTraces = cachedItem.extractedTraces
+		resp.Facets = cachedItem.facets
 		offset := (resp.Page - 1) * resp.PageSize
-		if offset < len(cachedHits) {
+		if offset < len(cachedItem.allHits) {
 			end := offset + resp.PageSize
-			if end > len(cachedHits) {
-				end = len(cachedHits)
+			if end > len(cachedItem.allHits) {
+				end = len(cachedItem.allHits)
 			}
-			resp.Hits = cachedHits[offset:end]
+			resp.Hits = cachedItem.allHits[offset:end]
 		}
 		resp.CostMS = time.Since(start).Milliseconds()
 		return resp, nil
@@ -302,11 +312,17 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 		return fileSummaries[i].FilePath < fileSummaries[j].FilePath
 	})
 
+	// 4. 构建时序频次直方图、提取 TraceID 与多维分面
+	hist, traces, facets := buildSearchHistogramAndFacets(allMatchedHits)
+
 	// 写入短期缓存
-	setCachedHits(cacheKey, allMatchedHits, fileSummaries)
+	setCachedHits(cacheKey, allMatchedHits, fileSummaries, hist, traces, facets)
 
 	resp.TotalHits = int64(len(allMatchedHits))
 	resp.FileSummaries = fileSummaries
+	resp.Histogram = hist
+	resp.ExtractedTraces = traces
+	resp.Facets = facets
 
 	// 进行分页切片
 	offset := (resp.Page - 1) * resp.PageSize
@@ -320,6 +336,131 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 
 	resp.CostMS = time.Since(start).Milliseconds()
 	return resp, nil
+}
+
+func parseLogTimeToTime(tsStr string) (time.Time, bool) {
+	if tsStr == "" {
+		return time.Time{}, false
+	}
+	layouts := []string{
+		"2006-01-02 15:04:05.000000",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.000000Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05",
+		"2006/01/02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, tsStr); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func buildSearchHistogramAndFacets(hits []model.SearchHit) ([]model.TimeHistogramBucket, []string, map[string]map[string]int64) {
+	facets := map[string]map[string]int64{
+		"level": make(map[string]int64),
+		"file":  make(map[string]int64),
+	}
+
+	var parsedTimes []time.Time
+	type timeHitPair struct {
+		t time.Time
+		h model.SearchHit
+	}
+	timeToHitMap := make([]timeHitPair, 0, len(hits))
+
+	traceSet := make(map[string]bool)
+	var extractedTraces []string
+
+	for _, h := range hits {
+		lvl := strings.ToUpper(h.Level)
+		if lvl == "" {
+			lvl = "INFO"
+		}
+		facets["level"][lvl]++
+		facets["file"][h.FilePath]++
+
+		if tr := indexer.ExtractTraceID(h.Content); tr != "" && !traceSet[tr] {
+			traceSet[tr] = true
+			if len(extractedTraces) < 20 {
+				extractedTraces = append(extractedTraces, tr)
+			}
+		}
+
+		if t, ok := parseLogTimeToTime(h.Timestamp); ok {
+			parsedTimes = append(parsedTimes, t)
+			timeToHitMap = append(timeToHitMap, timeHitPair{t: t, h: h})
+		}
+	}
+
+	var histogram []model.TimeHistogramBucket
+	if len(parsedTimes) > 0 {
+		minT := parsedTimes[0]
+		maxT := parsedTimes[0]
+		for _, t := range parsedTimes {
+			if t.Before(minT) {
+				minT = t
+			}
+			if t.After(maxT) {
+				maxT = t
+			}
+		}
+
+		bucketCount := 20
+		duration := maxT.Sub(minT)
+		if duration <= time.Second {
+			b := model.TimeHistogramBucket{
+				Timestamp:  minT.Format("2006-01-02 15:04:05"),
+				TotalCount: int64(len(parsedTimes)),
+			}
+			for _, th := range timeToHitMap {
+				accumulateBucketLevel(&b, th.h.Level)
+			}
+			histogram = append(histogram, b)
+		} else {
+			step := duration / time.Duration(bucketCount)
+			if step < time.Second {
+				step = time.Second
+			}
+			buckets := make([]model.TimeHistogramBucket, bucketCount)
+			for i := 0; i < bucketCount; i++ {
+				bt := minT.Add(time.Duration(i) * step)
+				buckets[i] = model.TimeHistogramBucket{
+					Timestamp: bt.Format("2006-01-02 15:04:05"),
+				}
+			}
+
+			for _, th := range timeToHitMap {
+				idx := int(th.t.Sub(minT) / step)
+				if idx < 0 {
+					idx = 0
+				} else if idx >= bucketCount {
+					idx = bucketCount - 1
+				}
+				buckets[idx].TotalCount++
+				accumulateBucketLevel(&buckets[idx], th.h.Level)
+			}
+			histogram = buckets
+		}
+	}
+
+	return histogram, extractedTraces, facets
+}
+
+func accumulateBucketLevel(b *model.TimeHistogramBucket, lvl string) {
+	switch strings.ToUpper(lvl) {
+	case "FATAL", "CRITICAL":
+		b.FatalCount++
+	case "ERROR":
+		b.ErrorCount++
+	case "WARN", "WARNING":
+		b.WarnCount++
+	default:
+		b.InfoCount++
+	}
 }
 
 func findMaxLevel(hits []model.SearchHit) string {
