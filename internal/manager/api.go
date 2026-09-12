@@ -939,6 +939,34 @@ func (s *Server) handleAgentInstallScript(w http.ResponseWriter, r *http.Request
 	mgrURL := fmt.Sprintf("http://%s:%d", s.cfg.AdvertiseIP, s.cfg.Port)
 	script := fmt.Sprintf(`#!/usr/bin/env bash
 set -e
+
+INSTALL_LOG="/tmp/dist-log-worker-install.log"
+mkdir -p "$(dirname "$INSTALL_LOG")" 2>/dev/null || true
+{
+    echo "=========================================="
+    echo "  业务组件一键接入安装日志"
+    echo "  启动时间: $(date '+%%Y-%%m-%%d %%H:%%M:%%S')"
+    echo "  主机名称: $(hostname 2>/dev/null || echo 'unknown')"
+    echo "  执行用户: $(whoami) (UID: $(id -u))"
+    echo "=========================================="
+} >> "$INSTALL_LOG"
+
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
+on_agent_install_error() {
+    local exit_code=$?
+    local line_no=$1
+    local cmd_str=$2
+    echo ""
+    echo "❌ [安装异常终止] 脚本在第 $line_no 行执行失败: $cmd_str (退出码: $exit_code)"
+    echo "  ▶ 诊断日志已保存至: $INSTALL_LOG"
+    if [ -d "/opt/dist-log-worker/logs" ]; then
+        cp -f "$INSTALL_LOG" "/opt/dist-log-worker/logs/install.log" 2>/dev/null || true
+    fi
+    exit "$exit_code"
+}
+trap 'on_agent_install_error ${LINENO} "$BASH_COMMAND"' ERR
+
 echo "=========================================="
 echo "  分布式存储日志分析系统 - 业务组件一键接入"
 echo "=========================================="
@@ -963,8 +991,11 @@ sleep 2
 echo "[3/3] 验证启动状态..."
 if pgrep -f "$INSTALL_DIR/bin/dist-log-analyzer worker" > /dev/null; then
     echo ">>> 业务组件安装成功！已顺利向管理节点注册上线！"
+    cp -f "$INSTALL_LOG" "$INSTALL_DIR/logs/install.log" 2>/dev/null || true
+    echo ">>> 完整安装日志已归档至: $INSTALL_DIR/logs/install.log"
 else
-    echo ">>> 启动可能出现异常，请查看日志: $INSTALL_DIR/logs/worker.log"
+    echo ">>> 启动可能出现异常，请查看日志: $INSTALL_DIR/logs/worker.log 或 $INSTALL_LOG"
+    exit 1
 fi
 `, mgrURL, mgrURL, mgrURL, s.cfg.ClusterToken)
 

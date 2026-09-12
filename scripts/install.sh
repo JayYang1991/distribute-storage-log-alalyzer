@@ -132,6 +132,49 @@ if [ "$IS_ROOT" = false ] && [[ "$INSTALL_DIR" == "/opt"* ]]; then
     echo "[INFO] 当前为非 root 用户，自动调整安装目录至: $INSTALL_DIR"
 fi
 
+# 初始化安装日志记录 (在任何服务及 systemd 启动前即时开启全链路日志记录，避免异常无法定位)
+INSTALL_LOG="/tmp/dist-log-install.log"
+mkdir -p "$(dirname "$INSTALL_LOG")" 2>/dev/null || true
+{
+    echo "=================================================================="
+    echo "  分布式存储日志分析系统 安装部署详细日志"
+    echo "  启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "  执行用户: $(whoami) (UID: $(id -u))"
+    echo "  主机名称: $(hostname 2>/dev/null || echo 'unknown')"
+    echo "  操作系统: $(uname -srm 2>/dev/null || echo 'unknown')"
+    echo "  脚本路径: $0"
+    echo "  执行目录: $CURRENT_DIR"
+    echo "  配置参数: ROLE=$ROLE PORT=$PORT INSTALL_DIR=$INSTALL_DIR DATA_DIR=$DATA_DIR AUTO_START=$AUTO_START"
+    echo "=================================================================="
+} >> "$INSTALL_LOG"
+
+# 备份原生文件描述符，确保退出时安全 flush 管道
+exec 3>&1 4>&2
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
+# 退出捕获机制 (统一处理 set -e 异常退出与显式 exit 1)
+on_install_exit() {
+    local exit_code=$?
+    # 还原文件描述符，断开管道并等待 tee 完全写入落盘
+    exec 1>&3 2>&4 2>/dev/null || true
+    wait 2>/dev/null || true
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo ""
+        echo "❌ [安装终止] 脚本执行未完成即退出 (退出码: $exit_code)！"
+        echo "  ▶ 完整安装诊断日志已保存于: $INSTALL_LOG"
+        if [ -d "$INSTALL_DIR/logs" ]; then
+            cp -f "$INSTALL_LOG" "$INSTALL_DIR/logs/install.log" 2>/dev/null || true
+            echo "  ▶ 诊断日志已同步至: $INSTALL_DIR/logs/install.log"
+        fi
+        echo "  ▶ 退出前最近 25 行执行日志如下:"
+        echo "------------------------------------------------------------------"
+        tail -n 25 "$INSTALL_LOG" 2>/dev/null || true
+        echo "------------------------------------------------------------------"
+    fi
+}
+trap 'on_install_exit' EXIT
+
 echo "=================================================================="
 echo "    分布式存储日志分析系统 (Distributed Storage Log Analyzer)     "
 echo "    一键快速安装部署程序                                          "
@@ -140,6 +183,7 @@ echo "  ▶ 安装组件角色: $ROLE"
 echo "  ▶ 程序安装路径: $INSTALL_DIR"
 echo "  ▶ 数据存储路径: $DATA_DIR"
 echo "  ▶ 服务监听端口: $PORT"
+echo "  ▶ 安装过程日志: $INSTALL_LOG"
 echo "=================================================================="
 
 # 1. 查找二进制程序
@@ -295,10 +339,13 @@ EOF
             sleep 1
             if systemctl is-active --quiet "$SERVICE_NAME"; then
                 echo "  ✔ [健康自检通过] Systemd 服务 $SERVICE_NAME 处于 active 运行状态，故障 3 秒自动拉起 (Restart=always) 已生效！"
-                systemctl status "$SERVICE_NAME" --no-pager | head -n 8
+                systemctl status "$SERVICE_NAME" --no-pager | head -n 12
             else
                 echo "  ❌ [健康自检失败] Systemd 服务 $SERVICE_NAME 未处于 active 运行状态！"
+                echo "  ▶ 诊断信息 (systemctl status):"
                 systemctl status "$SERVICE_NAME" --no-pager || true
+                echo "  ▶ 最近服务日志 (journalctl -u $SERVICE_NAME -n 50 --no-pager):"
+                journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true
                 exit 1
             fi
         fi
@@ -408,7 +455,10 @@ EOF
                     echo "  ✔ [健康自检通过] Systemd 守护服务 $s_file 处于 active 运行状态，故障 3 秒自动拉起 (Restart=always) 已生效！"
                 else
                     echo "  ❌ [健康自检失败] Systemd 守护服务 $s_file 未处于 active 状态！"
+                    echo "  ▶ 诊断信息 (systemctl status):"
                     systemctl status "$s_file" --no-pager || true
+                    echo "  ▶ 最近服务日志 (journalctl -u $s_file -n 50 --no-pager):"
+                    journalctl -u "$s_file" -n 50 --no-pager || true
                     ALL_HEALTHY=false
                 fi
             done
@@ -418,6 +468,11 @@ EOF
             fi
         fi
     fi
+fi
+
+# 安装日志归档保存
+if [ -d "$INSTALL_DIR/logs" ]; then
+    cp -f "$INSTALL_LOG" "$INSTALL_DIR/logs/install.log" 2>/dev/null || true
 fi
 
 echo ""
@@ -454,6 +509,10 @@ else
     fi
 fi
 echo ""
+echo "  ▶ 完整安装部署日志: $INSTALL_LOG"
+if [ -f "$INSTALL_DIR/logs/install.log" ]; then
+    echo "  ▶ 本地归档日志路径: $INSTALL_DIR/logs/install.log"
+fi
 echo "  ▶ 一键卸载命令:"
 echo "     sudo $INSTALL_DIR/uninstall.sh           # 安全卸载 (保留历史数据)"
 echo "     sudo $INSTALL_DIR/uninstall.sh --purge   # 彻底清除 (含数据与日志)"

@@ -45,6 +45,7 @@ type searchCacheKey struct {
 	keyword       string
 	isRegex       bool
 	caseSensitive bool
+	wholeWord     bool
 	level         string
 	contextLines  int
 }
@@ -129,6 +130,7 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 		keyword:       q.Keyword,
 		isRegex:       q.IsRegex,
 		caseSensitive: q.CaseSensitive,
+		wholeWord:     q.WholeWord,
 		level:         targetLevel,
 		contextLines:  q.ContextLines,
 	}
@@ -156,6 +158,9 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 			literalKw = []byte(q.Keyword)
 		} else {
 			pattern := q.Keyword
+			if q.WholeWord {
+				pattern = `\b(?:` + pattern + `)\b`
+			}
 			if !q.CaseSensitive {
 				pattern = "(?i)" + pattern
 			}
@@ -207,12 +212,12 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 		t := tasks[0]
 		fi, statErr := os.Stat(t.fullPath)
 		if statErr == nil && fi.Size() >= largeFileParallelThreshold {
-			allMatchedHits, err = searchInSingleFileParallel(ctx, t.fullPath, t.relPath, fi.Size(), reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, maxCollectedHits)
+			allMatchedHits, err = searchInSingleFileParallel(ctx, t.fullPath, t.relPath, fi.Size(), reg, literalKw, q.CaseSensitive, q.IsRegex, q.WholeWord, targetLevel, q.ContextLines, maxCollectedHits)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			allMatchedHits = searchInSingleFile(ctx, t.fullPath, t.relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, maxCollectedHits)
+			allMatchedHits = searchInSingleFile(ctx, t.fullPath, t.relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, q.WholeWord, targetLevel, q.ContextLines, maxCollectedHits)
 		}
 		if len(allMatchedHits) > 0 {
 			fileSummaryMap[t.relPath] = &model.SearchFileSummary{
@@ -260,9 +265,9 @@ func SearchLogsContext(ctx context.Context, extractDir string, q *model.SearchQu
 					var hits []model.SearchHit
 					fi, statErr := os.Stat(t.fullPath)
 					if statErr == nil && fi.Size() >= largeFileParallelThreshold {
-						hits, _ = searchInSingleFileParallel(ctx, t.fullPath, t.relPath, fi.Size(), reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, maxPerFileHits)
+						hits, _ = searchInSingleFileParallel(ctx, t.fullPath, t.relPath, fi.Size(), reg, literalKw, q.CaseSensitive, q.IsRegex, q.WholeWord, targetLevel, q.ContextLines, maxPerFileHits)
 					} else {
-						hits = searchInSingleFile(ctx, t.fullPath, t.relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, targetLevel, q.ContextLines, maxPerFileHits)
+						hits = searchInSingleFile(ctx, t.fullPath, t.relPath, reg, literalKw, q.CaseSensitive, q.IsRegex, q.WholeWord, targetLevel, q.ContextLines, maxPerFileHits)
 					}
 
 					if len(hits) > 0 {
@@ -421,7 +426,7 @@ func calculateFileChunks(fullPath string, fileSize int64, numChunks int) ([]file
 }
 
 // searchChunk 独立扫描单个分块，记录块内相对行号与块内总行数
-func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex bool, levelFilter string, contextLines int) chunkResult {
+func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex, wholeWord bool, levelFilter string, contextLines int) chunkResult {
 	res := chunkResult{index: chunk.index}
 
 	f, err := os.Open(fullPath)
@@ -482,7 +487,9 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 		if len(literalKw) == 0 && reg == nil {
 			matched = true
 		} else if !isRegex {
-			if caseSensitive {
+			if wholeWord {
+				matched = bytesContainsWholeWord(lineBytes, literalKw, caseSensitive)
+			} else if caseSensitive {
 				matched = bytes.Contains(lineBytes, literalKw)
 			} else {
 				matched = bytesContainsFoldASCII(lineBytes, literalKw)
@@ -490,7 +497,9 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 		} else {
 			if len(literalKw) > 0 {
 				hasCandidate := false
-				if caseSensitive {
+				if wholeWord {
+					hasCandidate = bytesContainsWholeWord(lineBytes, literalKw, caseSensitive)
+				} else if caseSensitive {
 					hasCandidate = bytes.Contains(lineBytes, literalKw)
 				} else {
 					hasCandidate = bytesContainsFoldASCII(lineBytes, literalKw)
@@ -544,7 +553,7 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 }
 
 // searchInSingleFileParallel 对大文件利用多核进行分块并行检索
-func searchInSingleFileParallel(ctx context.Context, fullPath, relPath string, fileSize int64, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex bool, levelFilter string, contextLines int, maxHits int) ([]model.SearchHit, error) {
+func searchInSingleFileParallel(ctx context.Context, fullPath, relPath string, fileSize int64, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex, wholeWord bool, levelFilter string, contextLines int, maxHits int) ([]model.SearchHit, error) {
 	workerCount := runtime.NumCPU()
 	if workerCount < 2 {
 		workerCount = 2
@@ -625,7 +634,7 @@ func searchInSingleFileParallel(ctx context.Context, fullPath, relPath string, f
 					errOnce.Do(func() { firstErr = ctx.Err() })
 					return
 				}
-				res := searchChunk(ctx, fullPath, relPath, item.c, reg, literalKw, caseSensitive, isRegex, levelFilter, contextLines)
+				res := searchChunk(ctx, fullPath, relPath, item.c, reg, literalKw, caseSensitive, isRegex, wholeWord, levelFilter, contextLines)
 				if res.err != nil && res.err != context.Canceled {
 					errOnce.Do(func() { firstErr = res.err })
 				}
@@ -669,7 +678,7 @@ func searchInSingleFileParallel(ctx context.Context, fullPath, relPath string, f
 }
 
 // searchInSingleFile 单协程流式搜索单个文件（支持级联取消与系统预读）
-func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex bool, levelFilter string, contextLines int, maxHits int) []model.SearchHit {
+func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *regexp.Regexp, literalKw []byte, caseSensitive, isRegex, wholeWord bool, levelFilter string, contextLines int, maxHits int) []model.SearchHit {
 	f, err := os.Open(fullPath)
 	if err != nil {
 		return nil
@@ -734,7 +743,9 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 		if len(literalKw) == 0 && reg == nil {
 			matched = true
 		} else if !isRegex {
-			if caseSensitive {
+			if wholeWord {
+				matched = bytesContainsWholeWord(lineBytes, literalKw, caseSensitive)
+			} else if caseSensitive {
 				matched = bytes.Contains(lineBytes, literalKw)
 			} else {
 				matched = bytesContainsFoldASCII(lineBytes, literalKw)
@@ -743,7 +754,9 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 			// 正则模式：若提取出字面量，先用字面量做高速 O(1) 预过滤
 			if len(literalKw) > 0 {
 				hasCandidate := false
-				if caseSensitive {
+				if wholeWord {
+					hasCandidate = bytesContainsWholeWord(lineBytes, literalKw, caseSensitive)
+				} else if caseSensitive {
 					hasCandidate = bytes.Contains(lineBytes, literalKw)
 				} else {
 					hasCandidate = bytesContainsFoldASCII(lineBytes, literalKw)
@@ -839,6 +852,84 @@ func bytesContainsFoldASCII(s, substr []byte) bool {
 				}
 			}
 			if matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// bytesContainsWholeWord 零内存分配检查 s 中是否包含全词匹配的 substr (支持大小写敏感控制与单词边界 \b)
+func bytesContainsWholeWord(s, substr []byte, caseSensitive bool) bool {
+	n := len(substr)
+	if n == 0 {
+		return true
+	}
+	m := len(s)
+	if m < n {
+		return false
+	}
+
+	c0 := substr[0]
+	c0Alt := c0
+	if !caseSensitive {
+		if c0 >= 'a' && c0 <= 'z' {
+			c0Alt = c0 - 32
+		} else if c0 >= 'A' && c0 <= 'Z' {
+			c0Alt = c0 + 32
+		}
+	}
+
+	maxI := m - n
+	for i := 0; i <= maxI; i++ {
+		b := s[i]
+		var hitFirst bool
+		if caseSensitive {
+			hitFirst = (b == c0)
+		} else {
+			hitFirst = (b == c0 || b == c0Alt)
+		}
+
+		if hitFirst {
+			// 前边界检查：i == 0 或者前一个字符不是单词字符
+			if i > 0 && isWordByte(s[i-1]) {
+				continue
+			}
+
+			matched := true
+			for j := 1; j < n; j++ {
+				sb := s[i+j]
+				tb := substr[j]
+				if caseSensitive {
+					if sb != tb {
+						matched = false
+						break
+					}
+				} else {
+					if sb != tb {
+						if sb >= 'A' && sb <= 'Z' {
+							sb += 32
+						}
+						if tb >= 'A' && tb <= 'Z' {
+							tb += 32
+						}
+						if sb != tb {
+							matched = false
+							break
+						}
+					}
+				}
+			}
+
+			if matched {
+				// 后边界检查：i+n == m 或者后一个字符不是单词字符
+				if i+n < m && isWordByte(s[i+n]) {
+					continue
+				}
 				return true
 			}
 		}

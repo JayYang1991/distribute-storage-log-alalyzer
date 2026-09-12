@@ -178,9 +178,10 @@ type SearchQuery struct {
 	ArchiveID    string `json:"archive_id"`
 	FilePath     string `json:"file_path"`
 	Keyword      string `json:"keyword"`
-	IsRegex      bool   `json:"is_regex"`
-	CaseSensitive bool  `json:"case_sensitive"`
-	Level        string `json:"level"` // ALL, INFO, WARN, ERROR, etc.
+	IsRegex       bool   `json:"is_regex"`
+	CaseSensitive bool   `json:"case_sensitive"`
+	WholeWord     bool   `json:"whole_word"` // 全词匹配模式
+	Level         string `json:"level"` // ALL, INFO, WARN, ERROR, etc.
 	StartTime    string `json:"start_time"`
 	EndTime      string `json:"end_time"`
 	Page         int    `json:"page"`

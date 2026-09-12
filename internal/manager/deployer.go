@@ -600,7 +600,11 @@ WantedBy=multi-user.target
 			if actState == "active" {
 				fmt.Fprintf(logWriter, "[SSH Deploy] ✔ Worker Systemd 服务 [%s] 健康检查通过 (active)！已配置故障 3 秒自动拉起 (Restart=always)\n", svcFile)
 			} else {
-				return fmt.Errorf("Worker Systemd 服务 [%s] 启动健康检查失败 (状态: %s)", svcFile, actState)
+				var diagBuf bytes.Buffer
+				_ = runRemoteCmd(client, fmt.Sprintf("%ssystemctl status %s --no-pager || true", sudoPrefix, svcFile), &diagBuf)
+				_ = runRemoteCmd(client, fmt.Sprintf("%sjournalctl -u %s -n 50 --no-pager || true", sudoPrefix, svcFile), &diagBuf)
+				fmt.Fprintf(logWriter, "[SSH Deploy] ❌ Worker Systemd 服务 [%s] 启动诊断信息:\n%s\n", svcFile, diagBuf.String())
+				return fmt.Errorf("Worker Systemd 服务 [%s] 启动健康检查失败 (状态: %s), 详细诊断日志已输出", svcFile, actState)
 			}
 		} else {
 			// 降级：后台守护进程
@@ -609,7 +613,17 @@ WantedBy=multi-user.target
 			if err := runRemoteCmd(client, startCmd, logWriter); err != nil {
 				return fmt.Errorf("启动 Worker 进程 (磁盘: %s) 失败: %w", diskDev, err)
 			}
-			fmt.Fprintf(logWriter, "[SSH Deploy] ✔ Worker 实例 [%s] 启动成功 (无 Systemd 环境，已通过 nohup 托管)\n", instName)
+			time.Sleep(1 * time.Second)
+			var checkBuf bytes.Buffer
+			_ = runRemoteCmd(client, fmt.Sprintf("pgrep -f '%s.*--port=%d' >/dev/null && echo 'OK' || echo 'FAIL'", opts.InstallDir, instPort), &checkBuf)
+			if strings.TrimSpace(checkBuf.String()) == "OK" {
+				fmt.Fprintf(logWriter, "[SSH Deploy] ✔ Worker 实例 [%s] 启动成功 (无 Systemd 环境，已通过 nohup 托管)\n", instName)
+			} else {
+				var failLog bytes.Buffer
+				_ = runRemoteCmd(client, fmt.Sprintf("tail -n 30 %s/logs/worker-%s.log 2>/dev/null || true", opts.InstallDir, diskName), &failLog)
+				fmt.Fprintf(logWriter, "[SSH Deploy] ❌ Worker 实例 [%s] 进程启动失败，日志如下:\n%s\n", instName, failLog.String())
+				return fmt.Errorf("Worker 实例 [%s] 进程启动失败", instName)
+			}
 		}
 	}
 

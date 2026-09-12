@@ -367,6 +367,9 @@
                     <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
                       <input type="checkbox" id="search-case-sensitive"> 区分大小写
                     </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                      <input type="checkbox" id="search-whole-word"> 全词匹配
+                    </label>
                     <label style="display: flex; align-items: center; gap: 6px;">
                       上下文展开:
                       <select id="search-context-lines" class="form-control" style="width: 70px; padding: 2px 6px;">
@@ -720,6 +723,9 @@
                   <label style="display: flex; align-items: center; gap: 3px; cursor: pointer;">
                     <input type="checkbox" id="archive-search-case"> 大小写
                   </label>
+                  <label style="display: flex; align-items: center; gap: 3px; cursor: pointer;">
+                    <input type="checkbox" id="archive-search-whole-word"> 全词
+                  </label>
                 </div>
               </div>
               <div id="archive-search-summary" style="padding: 6px 12px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border-color); display: none; align-items: center; justify-content: space-between;">
@@ -763,6 +769,9 @@
                 <button class="btn btn-secondary btn-xs" title="下一个匹配 (Enter)" onclick="app.viewerSearchNext()">⬇️</button>
                 <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer; margin-left: 6px;">
                   <input type="checkbox" id="viewer-search-case" onchange="app.onViewerSearchInput()"> 大小写
+                </label>
+                <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer;">
+                  <input type="checkbox" id="viewer-search-whole-word" onchange="app.onViewerSearchInput()"> 全词
                 </label>
                 <label style="font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer;">
                   <input type="checkbox" id="viewer-search-regex" onchange="app.onViewerSearchInput()"> 正则

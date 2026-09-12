@@ -224,7 +224,7 @@ func TestSearchWithBloomSkip(t *testing.T) {
 	}
 
 	// 执行并行检索
-	hits, err := searchInSingleFileParallel(context.Background(), logPath, "large_sparse.log", fi.Size(), nil, []byte("disk_sector_corrupt"), false, false, "", 1, 100)
+	hits, err := searchInSingleFileParallel(context.Background(), logPath, "large_sparse.log", fi.Size(), nil, []byte("disk_sector_corrupt"), false, false, false, "", 1, 100)
 	if err != nil {
 		t.Fatalf("searchInSingleFileParallel 失败: %v", err)
 	}
@@ -359,10 +359,81 @@ func BenchmarkSearch_2_Optimized(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		hits := searchInSingleFile(context.Background(), testFile, "service_0.log", nil, []byte("connection reset"), true, false, "ERROR", 2, 50)
+		hits := searchInSingleFile(context.Background(), testFile, "service_0.log", nil, []byte("connection reset"), true, false, false, "ERROR", 2, 50)
 		if len(hits) == 0 {
 			b.Fatal("未命中")
 		}
 	}
 }
+
+func TestSearchWholeWordMatching(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "search_ww_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir) // 清理临时文件
+
+	logPath := filepath.Join(tempDir, "test.log")
+	content := `line 1: this is a plain error message
+line 2: system error_code=500 encountered
+line 3: prefixmyerror happens here
+line 4: error. at end of sentence
+line 5: an Error with capital E
+line 6: no matching word here
+`
+	if err := os.WriteFile(logPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 常规子串匹配 (WholeWord: false, Keyword: "error") -> 应命中 line 1, 2, 3, 4, 5
+	resSub, err := SearchLogs(tempDir, &model.SearchQuery{
+		Keyword:   "error",
+		WholeWord: false,
+	})
+	if err != nil {
+		t.Fatalf("SearchLogs sub failed: %v", err)
+	}
+	if resSub.TotalHits != 5 {
+		t.Fatalf("expected 5 substring hits, got %d", resSub.TotalHits)
+	}
+
+	// 2. 全词匹配 (WholeWord: true, Keyword: "error") -> 仅应命中 line 1, 4, 5 (排除 line 2 的 error_code 与 line 3 的 prefixmyerror)
+	resWW, err := SearchLogs(tempDir, &model.SearchQuery{
+		Keyword:   "error",
+		WholeWord: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchLogs WW failed: %v", err)
+	}
+	if resWW.TotalHits != 3 {
+		t.Fatalf("expected 3 whole word hits (lines 1, 4, 5), got %d: %+v", resWW.TotalHits, resWW.Hits)
+	}
+
+	// 3. 全词匹配 + 大小写敏感 (WholeWord: true, CaseSensitive: true, Keyword: "error") -> 仅命中 line 1, 4
+	resWWCase, err := SearchLogs(tempDir, &model.SearchQuery{
+		Keyword:       "error",
+		WholeWord:     true,
+		CaseSensitive: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchLogs WW Case failed: %v", err)
+	}
+	if resWWCase.TotalHits != 2 {
+		t.Fatalf("expected 2 case-sensitive whole word hits (lines 1, 4), got %d", resWWCase.TotalHits)
+	}
+
+	// 4. 全词匹配 + 正则模式 (WholeWord: true, IsRegex: true, Keyword: "error") -> 同样精准支持全词边界
+	resWWRegex, err := SearchLogs(tempDir, &model.SearchQuery{
+		Keyword:   "error",
+		IsRegex:   true,
+		WholeWord: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchLogs WW Regex failed: %v", err)
+	}
+	if resWWRegex.TotalHits != 3 {
+		t.Fatalf("expected 3 regex whole word hits, got %d", resWWRegex.TotalHits)
+	}
+}
+
 

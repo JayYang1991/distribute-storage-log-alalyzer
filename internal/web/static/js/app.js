@@ -2024,6 +2024,7 @@ const app = {
     const level = document.getElementById("archive-search-level")?.value || "ALL";
     const isRegex = !!document.getElementById("archive-search-regex")?.checked;
     const caseSensitive = !!document.getElementById("archive-search-case")?.checked;
+    const wholeWord = !!document.getElementById("archive-search-whole-word")?.checked;
 
     const resultsBox = document.getElementById("archive-search-results");
     const summaryBox = document.getElementById("archive-search-summary");
@@ -2039,6 +2040,7 @@ const app = {
         level,
         is_regex: isRegex,
         case_sensitive: caseSensitive,
+        whole_word: wholeWord,
         context_lines: 1,
         page: 1,
         page_size: 500, // 扩大单次拉取量
@@ -2059,6 +2061,7 @@ const app = {
         level,
         isRegex,
         caseSensitive,
+        wholeWord,
         pageSize: 200,
       };
 
@@ -2186,11 +2189,19 @@ const app = {
 
     const keyword = this.archiveSearchContext?.keyword || "";
     const caseSensitive = this.archiveSearchContext?.caseSensitive || false;
+    const isRegex = this.archiveSearchContext?.isRegex || false;
+    const wholeWord = this.archiveSearchContext?.wholeWord || false;
 
     let highlightedSnippet = this.escape(h.content || "");
     if (keyword) {
-      const reg = new RegExp(`(${this.escapeRegex(keyword)})`, caseSensitive ? "g" : "gi");
-      highlightedSnippet = highlightedSnippet.replace(reg, '<mark class="v-match">$1</mark>');
+      let pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      if (wholeWord) {
+        pattern = `\\b(?:${pattern})\\b`;
+      }
+      try {
+        const reg = new RegExp(`(${pattern})`, caseSensitive ? "g" : "gi");
+        highlightedSnippet = highlightedSnippet.replace(reg, '<mark class="v-match">$1</mark>');
+      } catch (e) {}
     }
 
     const levelBadge = h.level === "ERROR" || h.level === "FATAL" || h.level === "CRITICAL"
@@ -2239,6 +2250,7 @@ const app = {
         level: this.archiveSearchContext.level,
         is_regex: this.archiveSearchContext.isRegex,
         case_sensitive: this.archiveSearchContext.caseSensitive,
+        whole_word: this.archiveSearchContext.wholeWord,
         context_lines: 1,
         page: page,
         page_size: this.archiveSearchContext.pageSize,
@@ -2450,7 +2462,8 @@ const app = {
         } else if (searchInput && searchInput.value === highlightKeyword) {
           const isCase = !!document.getElementById("viewer-search-case")?.checked;
           const isRegex = !!document.getElementById("viewer-search-regex")?.checked;
-          this.applyViewerSearchHighlights(highlightKeyword, isCase, isRegex);
+          const isWholeWord = !!document.getElementById("viewer-search-whole-word")?.checked;
+          this.applyViewerSearchHighlights(highlightKeyword, isCase, isRegex, isWholeWord);
           if (targetLine > 0) {
             const targetEl = document.getElementById(`v-line-${targetLine}`);
             if (targetEl) {
@@ -2702,6 +2715,7 @@ const app = {
     const keyword = (input ? input.value : "").trim();
     const isCase = !!document.getElementById("viewer-search-case")?.checked;
     const isRegex = !!document.getElementById("viewer-search-regex")?.checked;
+    const isWholeWord = !!document.getElementById("viewer-search-whole-word")?.checked;
     const isFilter = !!document.getElementById("viewer-search-filter-mode")?.checked;
     const counter = document.getElementById("viewer-search-counter");
 
@@ -2734,11 +2748,11 @@ const app = {
     }
 
     this.viewerSearchDebounceTimer = setTimeout(() => {
-      this.executeViewerFileSearch(keyword, isCase, isRegex, isFilter);
+      this.executeViewerFileSearch(keyword, isCase, isRegex, isWholeWord, isFilter);
     }, 300);
   },
 
-  async executeViewerFileSearch(keyword, isCase, isRegex, isFilter) {
+  async executeViewerFileSearch(keyword, isCase, isRegex, isWholeWord, isFilter) {
     if (!this.currentViewingFile) return;
     const counter = document.getElementById("viewer-search-counter");
 
@@ -2754,6 +2768,7 @@ const app = {
         keyword: keyword,
         is_regex: isRegex,
         case_sensitive: isCase,
+        whole_word: isWholeWord,
         page: 1,
         page_size: 1000,
         context_lines: 0
@@ -2814,10 +2829,10 @@ const app = {
 
       if (isFilter) {
         // 过滤模式：仅显示包含关键字的日志
-        this.renderViewerFilteredLines(keyword, isCase, isRegex);
+        this.renderViewerFilteredLines(keyword, isCase, isRegex, isWholeWord);
       } else {
         // 常规模式：高亮当前 DOM 视口中的匹配词，并平滑跳转至匹配行
-        this.applyViewerSearchHighlights(keyword, isCase, isRegex);
+        this.applyViewerSearchHighlights(keyword, isCase, isRegex, isWholeWord);
         const matchLine = this.viewerFileSearchHits[activeIndex].line_number;
         this.jumpToMatchLine(matchLine, keyword);
       }
@@ -2833,15 +2848,16 @@ const app = {
     const keyword = (input ? input.value : "").trim();
     const isCase = !!document.getElementById("viewer-search-case")?.checked;
     const isRegex = !!document.getElementById("viewer-search-regex")?.checked;
+    const isWholeWord = !!document.getElementById("viewer-search-whole-word")?.checked;
 
     this.viewerIsFilterMode = isFilter;
 
     if (isFilter) {
       if (keyword) {
         if (this.viewerFileSearchHits && this.viewerFileSearchHits.length > 0) {
-          this.renderViewerFilteredLines(keyword, isCase, isRegex);
+          this.renderViewerFilteredLines(keyword, isCase, isRegex, isWholeWord);
         } else {
-          this.executeViewerFileSearch(keyword, isCase, isRegex, true);
+          this.executeViewerFileSearch(keyword, isCase, isRegex, isWholeWord, true);
         }
       } else {
         const viewer = document.getElementById("viewer-content");
@@ -2865,7 +2881,7 @@ const app = {
     }
   },
 
-  renderViewerFilteredLines(keyword, isCase, isRegex) {
+  renderViewerFilteredLines(keyword, isCase, isRegex, isWholeWord) {
     const viewer = document.getElementById("viewer-content");
     if (!viewer) return;
 
@@ -2881,7 +2897,10 @@ const app = {
 
     let reg;
     try {
-      const pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      let pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      if (isWholeWord) {
+        pattern = `\\b(?:${pattern})\\b`;
+      }
       reg = new RegExp(`(${pattern})`, isCase ? "g" : "gi");
     } catch (e) {
       reg = null;
@@ -3032,13 +3051,16 @@ const app = {
     });
   },
 
-  applyViewerSearchHighlights(keyword, isCase, isRegex) {
+  applyViewerSearchHighlights(keyword, isCase, isRegex, isWholeWord) {
     this.clearViewerDOMHighlights();
     if (!keyword) return;
 
     let reg;
     try {
-      const pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      let pattern = isRegex ? keyword : this.escapeRegex(keyword);
+      if (isWholeWord) {
+        pattern = `\\b(?:${pattern})\\b`;
+      }
       reg = new RegExp(`(${pattern})`, isCase ? "g" : "gi");
     } catch (e) {
       return;
@@ -3246,6 +3268,7 @@ const app = {
     const filePath = document.getElementById("search-filepath").value.trim();
     const isRegex = document.getElementById("search-is-regex").checked;
     const caseSensitive = document.getElementById("search-case-sensitive").checked;
+    const wholeWord = !!document.getElementById("search-whole-word")?.checked;
     const contextLines = parseInt(document.getElementById("search-context-lines").value, 10);
 
     const btn = document.getElementById("btn-exec-search");
@@ -3263,6 +3286,7 @@ const app = {
         file_path: filePath,
         is_regex: isRegex,
         case_sensitive: caseSensitive,
+        whole_word: wholeWord,
         context_lines: contextLines,
         page,
         page_size: 50,
@@ -3277,7 +3301,7 @@ const app = {
       document.getElementById("search-cost-badge").innerText = `耗时 ${data.cost_ms} ms`;
       document.getElementById("search-result-title").innerText = `检索结果 (找到 ${data.total_hits} 处匹配)`;
 
-      this.renderSearchHits(data.hits, keyword);
+      this.renderSearchHits(data.hits, keyword, isRegex, caseSensitive, wholeWord);
     } catch (e) {
       alert("检索失败: " + e.message);
     } finally {
@@ -3286,7 +3310,7 @@ const app = {
     }
   },
 
-  renderSearchHits(hits, keyword) {
+  renderSearchHits(hits, keyword, isRegex = false, caseSensitive = false, wholeWord = false) {
     const container = document.getElementById("search-hits-container");
     container.innerHTML = "";
 
@@ -3301,8 +3325,14 @@ const app = {
 
       let highlighted = this.escape(h.content);
       if (keyword) {
-        const reg = new RegExp(`(${this.escapeRegex(keyword)})`, "gi");
-        highlighted = highlighted.replace(reg, '<span class="highlight">$1</span>');
+        let pattern = isRegex ? keyword : this.escapeRegex(keyword);
+        if (wholeWord) {
+          pattern = `\\b(?:${pattern})\\b`;
+        }
+        try {
+          const reg = new RegExp(`(${pattern})`, caseSensitive ? "g" : "gi");
+          highlighted = highlighted.replace(reg, '<span class="highlight">$1</span>');
+        } catch (e) {}
       }
 
       let ctxHtml = "";
