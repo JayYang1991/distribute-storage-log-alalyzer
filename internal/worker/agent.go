@@ -1038,16 +1038,57 @@ func (a *Agent) ReportAlarm(alarmType, severity, title, message string) {
 	log.Printf("[Worker Alarm] 上报告警 [%s] 到管理节点失败: %s", alarmType, title)
 }
 
-// checkSelfHealth 检查业务组件健康状态，发现异常及时上报告警
+// ResolveAlarm 向管理节点上报故障自愈，自动将 active 状态的告警标记为 resolved
+func (a *Agent) ResolveAlarm(alarmType string) {
+	reqPayload := model.AlarmReportReq{
+		NodeID:    a.nodeID,
+		AlarmType: alarmType,
+		Action:    "resolve",
+	}
+	data, _ := json.Marshal(reqPayload)
+
+	mgrURLs := strings.Split(a.cfg.ManagerURL, ",")
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for _, rawURL := range mgrURLs {
+		cleanURL := strings.TrimSpace(rawURL)
+		if cleanURL == "" {
+			continue
+		}
+		targetURL := fmt.Sprintf("%s/api/alarms/report", strings.TrimRight(cleanURL, "/"))
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Cluster-Token", a.cfg.ClusterToken)
+
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+	}
+}
+
+// checkSelfHealth 检查业务组件健康状态，发现异常及时上报告警；恢复后自动触发自愈消警
 func (a *Agent) checkSelfHealth(res model.SystemResource) {
-	// 1. 磁盘空间严重不足检测
-	if res.DiskFreeMB > 0 && res.DiskFreeMB < 1024 {
-		a.ReportAlarm(
-			model.AlarmTypeDiskFull,
-			model.SeverityCritical,
-			fmt.Sprintf("业务存储磁盘空间严重不足 (剩余 %d MB)", res.DiskFreeMB),
-			fmt.Sprintf("计算节点 %s 存储目录 %s 可用空间仅剩 %d MB (< 1GB)，可能导致日志写入及解压失败，请尽快扩容或清理", a.cfg.NodeName, a.cfg.DataDir, res.DiskFreeMB),
-		)
+	// 1. 磁盘空间严重不足检测与自愈
+	if res.DiskFreeMB > 0 {
+		if res.DiskFreeMB < 1024 {
+			a.ReportAlarm(
+				model.AlarmTypeDiskFull,
+				model.SeverityCritical,
+				fmt.Sprintf("业务存储磁盘空间严重不足 (剩余 %d MB)", res.DiskFreeMB),
+				fmt.Sprintf("计算节点 %s 存储目录 %s 可用空间仅剩 %d MB (< 1GB)，可能导致日志写入及解压失败，请尽快扩容或清理", a.cfg.NodeName, a.cfg.DataDir, res.DiskFreeMB),
+			)
+		} else if res.DiskFreeMB > 2048 {
+			// 磁盘可用空间恢复至 2GB 以上，自动解除磁盘空间告急告警
+			a.ResolveAlarm(model.AlarmTypeDiskFull)
+		}
 	}
 
 	// 2. 存储挂载目录只读与 I/O 异常检测 (降频至 60s 且复用固定 marker 文件，避免频繁 create/unlink 冲击分布式存储 MDS)
@@ -1071,12 +1112,15 @@ func (a *Agent) checkSelfHealth(res model.SystemResource) {
 					"业务存储文件系统发生只读或 I/O 写入故障",
 					fmt.Sprintf("计算节点 %s 存储目录 %s 无法写入测试标记: %v", a.cfg.NodeName, a.cfg.DataDir, wErr),
 				)
+			} else {
+				// 磁盘写入正常：触发自愈消警，自动消除可能残留的 DISK_READONLY 故障告警
+				a.ResolveAlarm(model.AlarmTypeDiskReadOnly)
 			}
 			_ = f.Close()
 		}
 	}
 
-	// 3. 内存超高使用率检测
+	// 3. 内存超高使用率检测与自愈
 	if res.MemTotalMB > 0 {
 		usageRatio := float64(res.MemUsedMB) / float64(res.MemTotalMB)
 		if usageRatio > 0.92 {
@@ -1086,6 +1130,9 @@ func (a *Agent) checkSelfHealth(res model.SystemResource) {
 				fmt.Sprintf("业务节点内存占用过高 (%.1f%%)", usageRatio*100),
 				fmt.Sprintf("计算节点 %s 当前内存已使用 %d MB / %d MB (%.1f%%)，面临 OOM 风险", a.cfg.NodeName, res.MemUsedMB, res.MemTotalMB, usageRatio*100),
 			)
+		} else if usageRatio < 0.80 {
+			// 内存使用率回落至 80% 以下，自动解除高内存告警
+			a.ResolveAlarm(model.AlarmTypeHighMemory)
 		}
 	}
 }

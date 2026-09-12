@@ -218,4 +218,34 @@ func TestAlarmAPIReportAndHeartbeatAutoResolve(t *testing.T) {
 	if resolvedOffline != nil {
 		t.Fatalf("心跳恢复后，NODE_OFFLINE 活跃告警应该被自动解除，但依然存在: %+v", resolvedOffline)
 	}
+
+	// 5. 模拟业务节点上报 DISK_READONLY 告警，随后故障恢复上报 resolve 自愈消警
+	_, _ = st.CreateOrAggregateAlarm(&model.Alarm{
+		NodeID:    "worker_01",
+		NodeName:  "storage-worker-01",
+		AlarmType: model.AlarmTypeDiskReadOnly,
+		Severity:  model.SeverityCritical,
+		Title:     "存储文件系统只读",
+		Message:   "无法写入",
+	})
+	if a, _ := st.FindActiveAlarm("worker_01", model.AlarmTypeDiskReadOnly); a == nil {
+		t.Fatalf("预期存在活跃的 DISK_READONLY 告警")
+	}
+
+	resolveReqBody, _ := json.Marshal(model.AlarmReportReq{
+		NodeID:    "worker_01",
+		AlarmType: model.AlarmTypeDiskReadOnly,
+		Action:    "resolve",
+	})
+	resReq := httptest.NewRequest(http.MethodPost, "/api/alarms/report", bytes.NewReader(resolveReqBody))
+	resReq.Header.Set("X-Cluster-Token", cfg.ClusterToken)
+	resW := httptest.NewRecorder()
+	srv.handleAlarmReport(resW, resReq)
+
+	if resW.Code != http.StatusOK {
+		t.Fatalf("自愈消警接口响应异常: code=%d, body=%s", resW.Code, resW.Body.String())
+	}
+	if a, _ := st.FindActiveAlarm("worker_01", model.AlarmTypeDiskReadOnly); a != nil {
+		t.Fatalf("自愈上报后，DISK_READONLY 告警应已被解除，但依然处于 active 状态: %+v", a)
+	}
 }

@@ -2401,6 +2401,26 @@ func (s *Server) handleAlarmReport(w http.ResponseWriter, r *http.Request) {
 		nodeIP = n.IP
 	}
 
+	// 自愈消警分支：当 Worker 检查对应故障恢复时，自动将 active 状态的告警流转为 resolved
+	if req.Action == "resolve" {
+		resolved, err := s.store.ResolveAlarm(req.NodeID, req.AlarmType)
+		if err != nil {
+			http.Error(w, "自动消警失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if resolved != nil {
+			log.Printf("[告警中心] 收到业务组件 [%s] 故障自愈通知: 自动解除告警 [%s] (%s)",
+				nodeName, resolved.AlarmType, resolved.Title)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"action":   "resolve",
+			"resolved": resolved != nil,
+		})
+		return
+	}
+
 	alarm := &model.Alarm{
 		NodeID:    req.NodeID,
 		NodeName:  nodeName,

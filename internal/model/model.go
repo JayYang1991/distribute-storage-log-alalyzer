@@ -368,6 +368,7 @@ type AlarmReportReq struct {
 	Severity  string `json:"severity"`
 	Title     string `json:"title"`
 	Message   string `json:"message"`
+	Action    string `json:"action,omitempty"` // "report"(默认产生/更新告警) 或 "resolve"(自愈解除告警)
 }
 
 // AlarmSummary 告警全局指标统计
