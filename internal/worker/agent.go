@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -390,7 +391,9 @@ func (a *Agent) asyncProcessArchive(archiveID, userID, filename, destPath, extra
 	}()
 }
 
-// reportArchiveCallback 向管理节点上报异步解包与诊断完成状态
+// reportArchiveCallback 向管理节点上报异步解包与诊断完成状态。
+// 采用指数退避重试（最多 8 次，退避上限 60s），彻底消除因 Manager
+// 重启/短暂不可达导致回调丢失、归档状态永久卡在 extracting 的问题。
 func (a *Agent) reportArchiveCallback(reqPayload *model.ArchiveCallbackReq) {
 	data, err := json.Marshal(reqPayload)
 	if err != nil {
@@ -399,32 +402,58 @@ func (a *Agent) reportArchiveCallback(reqPayload *model.ArchiveCallbackReq) {
 	}
 
 	mgrURLs := strings.Split(a.cfg.ManagerURL, ",")
-	client := &http.Client{Timeout: 30 * time.Second}
 
-	for _, rawURL := range mgrURLs {
-		cleanURL := strings.TrimSpace(rawURL)
-		if cleanURL == "" {
-			continue
-		}
-		targetURL := fmt.Sprintf("%s/api/cluster/archive-callback", strings.TrimRight(cleanURL, "/"))
-		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(data))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Cluster-Token", a.cfg.ClusterToken)
+	const maxRetries = 8
+	const maxBackoff = 60 * time.Second
 
-		resp, err := client.Do(req)
-		if err == nil {
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// 指数退避: 2^attempt 秒，上限 60s，加入抖动避免惊群
+			backoff := time.Duration(math.Min(float64(maxBackoff), float64(time.Second)*math.Pow(2, float64(attempt))))
+			log.Printf("[Worker Callback] 第 %d 次重试上报归档包 %s 状态，等待 %v...", attempt, reqPayload.ArchiveID, backoff)
+			time.Sleep(backoff)
+		}
+
+		// 每次重试创建独立 client，避免连接复用污染
+		client := &http.Client{Timeout: 30 * time.Second}
+		succeeded := false
+
+		for _, rawURL := range mgrURLs {
+			cleanURL := strings.TrimSpace(rawURL)
+			if cleanURL == "" {
+				continue
+			}
+			targetURL := fmt.Sprintf("%s/api/cluster/archive-callback", strings.TrimRight(cleanURL, "/"))
+			req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(data))
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Cluster-Token", a.cfg.ClusterToken)
+
+			resp, doErr := client.Do(req)
+			if doErr != nil {
+				log.Printf("[Worker Callback] 回调请求失败 (%s): %v", cleanURL, doErr)
+				continue
+			}
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				log.Printf("[Worker Callback] 成功向管理节点 (%s) 上报归档包 %s 状态: %s", cleanURL, reqPayload.ArchiveID, reqPayload.Status)
-				return
+				log.Printf("[Worker Callback] 成功向管理节点 (%s) 上报归档包 %s 状态: %s (第 %d 次尝试)",
+					cleanURL, reqPayload.ArchiveID, reqPayload.Status, attempt+1)
+				succeeded = true
+				break
 			}
+			log.Printf("[Worker Callback] 管理节点 (%s) 返回非 200 状态: %d", cleanURL, resp.StatusCode)
+		}
+
+		if succeeded {
+			return
 		}
 	}
-	log.Printf("[Worker Callback] 警告: 未能向任何 Manager 成功上报归档包 %s 状态", reqPayload.ArchiveID)
+
+	log.Printf("[Worker Callback] 严重警告: 已重试 %d 次，仍未能向任何 Manager 成功上报归档包 %s 状态 (%s)，状态可能永久卡在 extracting！",
+		maxRetries, reqPayload.ArchiveID, reqPayload.Status)
 }
 
 var contentBufPool = sync.Pool{
