@@ -1,7 +1,10 @@
 package indexer
 
 import (
+	"strings"
 	"testing"
+
+	"dist-log-analyzer/internal/model"
 )
 
 func TestPreprocessLogAndDrainClustering(t *testing.T) {
@@ -51,5 +54,65 @@ func TestExtractTraceID(t *testing.T) {
 		if got != tc.expected {
 			t.Errorf("for %q, expected %q, got %q", tc.input, tc.expected, got)
 		}
+	}
+}
+
+func TestLogLevelAbbreviations(t *testing.T) {
+	cases := []struct {
+		log           string
+		expectedLevel string
+	}{
+		{"2026-09-13 12:00:00 [ERR] disk write failed", "ERROR"},
+		{"2026-09-13 12:00:00 [ERROR] disk write failed", "ERROR"},
+		{"2026-09-13 12:00:00 [CRIT] heartbeat lost to peer", "FATAL"},
+		{"2026-09-13 12:00:00 [FATAL] heartbeat lost to peer", "FATAL"},
+		{"2026-09-13 12:00:00 [FTL] crash detected", "FATAL"},
+		{"2026-09-13 12:00:00 [WRN] latency is high", "WARN"},
+		{"2026-09-13 12:00:00 [WARNING] latency is high", "WARN"},
+		{"2026-09-13 12:00:00 [INF] server started", "INFO"},
+		{"2026-09-13 12:00:00 [DBG] processing packet", "DEBUG"},
+	}
+
+	for _, c := range cases {
+		_, lvl, _ := PreprocessLog(c.log)
+		if lvl != c.expectedLevel {
+			t.Errorf("log %q: expected level %s, got %s", c.log, c.expectedLevel, lvl)
+		}
+	}
+}
+
+func TestPreprocessCustomRules(t *testing.T) {
+	customRules := []*model.PreprocessRule{
+		{
+			ID:          "rule_tenant_mask",
+			Name:        "租户ID通配",
+			Type:        model.PreprocessTypeMask,
+			Pattern:     `\btenant_[0-9a-zA-Z]+\b`,
+			Replacement: "<*>",
+			Enabled:     true,
+		},
+		{
+			ID:          "rule_custom_fatal",
+			Name:        "特定panic匹配为FATAL",
+			Type:        model.PreprocessTypeLevelMapping,
+			Pattern:     `(?i)runtime error: panic`,
+			Replacement: "FATAL",
+			Enabled:     true,
+		},
+	}
+
+	raw1 := "2026-09-13 12:00:00 [INFO] handling request for tenant_98234a on cluster"
+	cleaned1, lvl1, _ := PreprocessLogWithRules(raw1, customRules)
+	if lvl1 != "INFO" {
+		t.Errorf("expected level INFO, got %s", lvl1)
+	}
+	if !strings.Contains(cleaned1, "<*>") || strings.Contains(cleaned1, "tenant_98234a") {
+		t.Errorf("expected tenant_98234a masked to <*>, got: %s", cleaned1)
+	}
+
+	raw2 := "2026-09-13 12:00:00 [INFO] caught runtime error: panic in thread main"
+	_, lvl2, _ := PreprocessLogWithRules(raw2, customRules)
+	if lvl2 != "FATAL" {
+		t.Errorf("expected level overridden to FATAL, got %s", lvl2)
 	}
 }

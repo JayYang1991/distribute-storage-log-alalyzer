@@ -9,6 +9,7 @@ const app = {
   nodes: [],
   users: [],
   rules: [],
+  preprocessRules: [],
   currentViewingArchiveID: null,
   currentErrorArchiveID: null,
 
@@ -222,6 +223,9 @@ const app = {
       this.populateDiffArchiveSelects();
     } else if (tabName === "alarms" && isAdmin) {
       this.fetchAlarms();
+    } else if (tabName === "rules") {
+      this.loadRules();
+      if (isAdmin) this.loadPreprocessRules();
     }
   },
 
@@ -234,6 +238,7 @@ const app = {
         this.loadNodes(),
         this.loadArchives(),
         this.loadRules(),
+        this.loadPreprocessRules(),
         this.fetchHAStatus(),
         this.fetchAlarmSummary(),
         this.loadUsers(),
@@ -4141,6 +4146,244 @@ const app = {
     if (!confirm("确定要恢复官方内置的 Ceph / HDFS / MinIO 预设规则库吗？")) return;
     await this.api("/api/rules/reset-defaults", "POST");
     this.loadRules();
+  },
+
+  // ================= 预处理与模式泛化定制规则管理 =================
+
+  async loadPreprocessRules() {
+    try {
+      const res = await this.api("/api/preprocess/rules");
+      if (res.ok) {
+        this.preprocessRules = await res.json();
+        this.renderPreprocessRules();
+      }
+    } catch (e) {
+      console.error("加载预处理规则失败:", e);
+    }
+  },
+
+  renderPreprocessRules() {
+    const tbody = document.querySelector("#table-preprocess-rules tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+
+    if (!this.preprocessRules || this.preprocessRules.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 20px;">暂无自定义预处理规则，点击右上角“添加预处理规则”创建</td></tr>`;
+      return;
+    }
+
+    this.preprocessRules.forEach(r => {
+      const tr = document.createElement("tr");
+      const isMask = r.type === "mask";
+      const typeBadge = isMask
+        ? `<span class="badge badge-info" style="font-size: 11px;">🎭 变量掩码 (mask)</span>`
+        : `<span class="badge badge-warning" style="font-size: 11px;">🏷️ 级别重映射 (level_mapping)</span>`;
+
+      let targetHtml = "";
+      if (isMask) {
+        targetHtml = `<code style="color: #38bdf8; font-weight: 600;">${this.escape(r.target_value || "<*>")}</code>`;
+      } else {
+        const sevClass = (r.target_value || "ERROR").toLowerCase();
+        targetHtml = `<span class="badge badge-${sevClass}">${this.escape(r.target_value)}</span>`;
+      }
+
+      const enabledBadge = r.enabled
+        ? `<span class="badge badge-success" style="cursor: pointer;" onclick="app.togglePreprocessRule('${r.id}', false)" title="点击快速禁用">已启用</span>`
+        : `<span class="badge badge-muted" style="cursor: pointer;" onclick="app.togglePreprocessRule('${r.id}', true)" title="点击快速启用">已禁用</span>`;
+
+      tr.innerHTML = `
+        <td><strong>${this.escape(r.name)}</strong></td>
+        <td>${typeBadge}</td>
+        <td><code style="font-size: 11px; color: #a5b4fc; background: rgba(99, 102, 241, 0.1); padding: 2px 6px; border-radius: 4px;">${this.escape(r.pattern)}</code></td>
+        <td>${targetHtml}</td>
+        <td><span style="font-family: monospace; font-size: 12px;">${r.priority ?? 10}</span></td>
+        <td style="max-width: 260px; font-size: 12px; color: var(--text-muted);">${this.escape(r.description || "-")}</td>
+        <td>${enabledBadge}</td>
+        <td>
+          ${this.currentUser?.role === "admin" ? `
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-secondary btn-sm" onclick="app.openEditPreprocessRuleModal('${r.id}')">编辑</button>
+              <button class="btn btn-danger btn-sm" onclick="app.deletePreprocessRule('${r.id}')">删除</button>
+            </div>
+          ` : '-'}
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+  },
+
+  onPreprocessRuleTypeChange() {
+    const type = document.getElementById("preprocess-rule-type").value;
+    const targetLabel = document.getElementById("label-preprocess-target");
+    const targetInput = document.getElementById("preprocess-rule-target");
+    const helpText = document.getElementById("preprocess-target-help");
+
+    if (type === "mask") {
+      targetLabel.innerText = "目标替换掩码 *";
+      targetInput.placeholder = "默认 <*>";
+      if (!targetInput.value || targetInput.value === "ERROR" || targetInput.value === "FATAL" || targetInput.value === "WARN") {
+        targetInput.value = "<*>";
+      }
+      helpText.innerHTML = "匹配到的模式部分将被泛化替换为此内容，通常固定为 <code>&lt;*&gt;</code>。";
+    } else {
+      targetLabel.innerText = "重映射日志级别 *";
+      targetInput.placeholder = "如 ERROR, FATAL, WARN, INFO, DEBUG";
+      if (!targetInput.value || targetInput.value === "<*>") {
+        targetInput.value = "ERROR";
+      }
+      helpText.innerHTML = "当日志命中此正则表达式时，强制将日志级别提升或重定向为该级别（如 <code>ERROR</code>）。";
+    }
+  },
+
+  openCreatePreprocessRuleModal() {
+    document.getElementById("preprocess-rule-id").value = "";
+    document.getElementById("preprocess-rule-name").value = "";
+    document.getElementById("preprocess-rule-type").value = "mask";
+    document.getElementById("preprocess-rule-priority").value = "10";
+    document.getElementById("preprocess-rule-pattern").value = "";
+    document.getElementById("preprocess-rule-target").value = "<*>";
+    document.getElementById("preprocess-rule-desc").value = "";
+    document.getElementById("preprocess-rule-enabled").checked = true;
+    this.onPreprocessRuleTypeChange();
+    this.openModal("modal-preprocess-rule");
+  },
+
+  openEditPreprocessRuleModal(id) {
+    const r = this.preprocessRules.find(item => item.id === id);
+    if (!r) return;
+    document.getElementById("preprocess-rule-id").value = r.id;
+    document.getElementById("preprocess-rule-name").value = r.name || "";
+    document.getElementById("preprocess-rule-type").value = r.type || "mask";
+    document.getElementById("preprocess-rule-priority").value = r.priority ?? 10;
+    document.getElementById("preprocess-rule-pattern").value = r.pattern || "";
+    document.getElementById("preprocess-rule-target").value = r.target_value || (r.type === "mask" ? "<*>" : "ERROR");
+    document.getElementById("preprocess-rule-desc").value = r.description || "";
+    document.getElementById("preprocess-rule-enabled").checked = !!r.enabled;
+    this.onPreprocessRuleTypeChange();
+    this.openModal("modal-preprocess-rule");
+  },
+
+  async submitPreprocessRule() {
+    const id = document.getElementById("preprocess-rule-id").value.trim();
+    const name = document.getElementById("preprocess-rule-name").value.trim();
+    const type = document.getElementById("preprocess-rule-type").value;
+    const priority = parseInt(document.getElementById("preprocess-rule-priority").value) || 10;
+    const pattern = document.getElementById("preprocess-rule-pattern").value.trim();
+    const targetValue = document.getElementById("preprocess-rule-target").value.trim();
+    const description = document.getElementById("preprocess-rule-desc").value.trim();
+    const enabled = document.getElementById("preprocess-rule-enabled").checked;
+
+    if (!name || !pattern || !targetValue) {
+      alert("请填写完整的规则名称、正则表达式和目标值！");
+      return;
+    }
+
+    try {
+      const payload = {
+        name,
+        type,
+        priority,
+        pattern,
+        target_value: targetValue,
+        description,
+        enabled,
+      };
+
+      const url = id ? `/api/preprocess/rules/${id}` : "/api/preprocess/rules";
+      const method = id ? "PUT" : "POST";
+      const res = await this.api(url, method, payload);
+      if (!res.ok) throw new Error(await res.text());
+
+      this.closeModal("modal-preprocess-rule");
+      this.loadPreprocessRules();
+    } catch (e) {
+      alert("保存预处理规则失败: " + e.message);
+    }
+  },
+
+  async togglePreprocessRule(id, enabled) {
+    const r = this.preprocessRules.find(item => item.id === id);
+    if (!r) return;
+    try {
+      const payload = { ...r, enabled };
+      const res = await this.api(`/api/preprocess/rules/${id}`, "PUT", payload);
+      if (!res.ok) throw new Error(await res.text());
+      this.loadPreprocessRules();
+    } catch (e) {
+      alert("更新规则状态失败: " + e.message);
+    }
+  },
+
+  async deletePreprocessRule(id) {
+    if (!confirm("确定要删除该预处理规则吗？删除后将不再对新聚类生效。")) return;
+    try {
+      const res = await this.api(`/api/preprocess/rules/${id}`, "DELETE");
+      if (!res.ok) throw new Error(await res.text());
+      this.loadPreprocessRules();
+    } catch (e) {
+      alert("删除规则失败: " + e.message);
+    }
+  },
+
+  openPreprocessTestModal() {
+    document.getElementById("preprocess-test-result-box").style.display = "none";
+    if (!document.getElementById("preprocess-test-input").value) {
+      this.fillPreprocessTestSample("err");
+    }
+    this.openModal("modal-preprocess-test");
+  },
+
+  fillPreprocessTestSample(type) {
+    const input = document.getElementById("preprocess-test-input");
+    if (type === "err") {
+      input.value = "2026-09-13 14:15:20 [ERR] [client 192.168.1.102:44582] auth token signature invalid (err_code: -1004)";
+    } else if (type === "crit") {
+      input.value = "2026-09-13 14:18:02 [CRIT] heartbeat lost on storage osd.12 after 30000ms timeout";
+    } else if (type === "tenant") {
+      input.value = "2026-09-13 14:22:15 [INFO] tenant-882194 executed bucket object flush on cluster-node-1";
+    } else if (type === "ceph") {
+      input.value = "2026-09-13 14:25:01 [WRN] osd.4 reported 12 slow requests (> 30.0 sec) during backfill";
+    }
+  },
+
+  async runPreprocessTest() {
+    const rawLog = document.getElementById("preprocess-test-input").value.trim();
+    if (!rawLog) {
+      alert("请输入待试算的原始单行日志！");
+      return;
+    }
+
+    try {
+      const res = await this.api("/api/preprocess/test", "POST", { raw_log: rawLog });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+
+      const resultBox = document.getElementById("preprocess-test-result-box");
+      const levelBadge = document.getElementById("preprocess-test-level-badge");
+      const cleanedPre = document.getElementById("preprocess-test-cleaned");
+      const matchedBox = document.getElementById("preprocess-test-matched-box");
+      const matchedList = document.getElementById("preprocess-test-matched-list");
+
+      resultBox.style.display = "block";
+
+      const lvl = (data.extracted_level || "UNKNOWN").toUpperCase();
+      const sevClass = lvl.toLowerCase();
+      levelBadge.innerHTML = `<span class="badge badge-${sevClass}" style="font-size: 12px; padding: 4px 10px;">规范化级别: ${lvl}</span>`;
+
+      cleanedPre.innerText = data.cleaned_log || "(空)";
+
+      if (data.matched_rules && data.matched_rules.length > 0) {
+        matchedBox.style.display = "block";
+        matchedList.innerHTML = data.matched_rules.map(name =>
+          `<span class="badge badge-info" style="font-size: 11px;">🎯 ${this.escape(name)}</span>`
+        ).join("");
+      } else {
+        matchedBox.style.display = "none";
+        matchedList.innerHTML = "";
+      }
+    } catch (e) {
+      alert("清洗试算失败: " + e.message);
+    }
   },
 
   // ================= 仪表盘统计 =================

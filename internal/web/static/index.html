@@ -461,6 +461,42 @@
               </div>
             </div>
           </div>
+
+          <!-- 预处理与模式泛化定制卡片 -->
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">⚙️ 日志预处理定制与级别映射规则 (Drain 聚合预处理)</span>
+              <div style="display: flex; gap: 10px;" id="admin-preprocess-actions">
+                <button class="btn btn-secondary btn-sm" onclick="app.openPreprocessTestModal();">🧪 在线即时清洗试算</button>
+                <button class="btn btn-primary btn-sm" onclick="app.openCreatePreprocessRuleModal();">➕ 添加预处理规则</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px; line-height: 1.6; background: rgba(15, 23, 42, 0.4); padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+                💡 <strong>预处理引擎机制与特性：</strong><br>
+                • <strong>原生缩写规范化：</strong>系统内置支持 <code>ERR → ERROR</code>、<code>CRIT/FTL → FATAL</code>、<code>WRN → WARN</code>、<code>INF → INFO</code>、<code>DBG → DEBUG</code> 等缩写自动纠偏。<br>
+                • <strong>变量掩码泛化 (Mask)：</strong>针对租户ID（如 <code>tenant-\d+</code>）、SessionToken 等高频变动参数，在 Drain 聚类前替换为 <code>&lt;*&gt;</code>，避免生成海量琐碎模板。<br>
+                • <strong>级别重映射 (Level Mapping)：</strong>针对业务私有错误特征或关键词重定义日志级别（如业务特定 <code>RESULT_FAIL</code> 强制重定向为 <code>ERROR</code>）。
+              </div>
+              <div class="table-responsive">
+                <table id="table-preprocess-rules">
+                  <thead>
+                    <tr>
+                      <th>规则名称</th>
+                      <th>规则类型</th>
+                      <th>匹配正则 (Regex Pattern)</th>
+                      <th>目标值 / 替换掩码</th>
+                      <th>优先级</th>
+                      <th>规则描述</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 7. 实时告警中心 Tab -->
@@ -1421,6 +1457,117 @@
     </div>
   </div>
 
-  <script src="/js/app.js?v=20260913_diffjump"></script>
+  <!-- 模态框 10: 添加/编辑预处理规则 -->
+  <div class="modal-overlay" id="modal-preprocess-rule">
+    <div class="modal-content" style="max-width: 560px;">
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ 新增/编辑日志预处理定制规则</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-preprocess-rule')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-preprocess-rule" onsubmit="event.preventDefault(); app.submitPreprocessRule();">
+          <input type="hidden" id="preprocess-rule-id" value="">
+          <div class="form-group">
+            <label class="form-label">规则名称 *</label>
+            <input type="text" class="form-control" id="preprocess-rule-name" placeholder="例如：租户ID脱敏泛化" required>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">规则类型 *</label>
+              <select class="form-control" id="preprocess-rule-type" onchange="app.onPreprocessRuleTypeChange()">
+                <option value="mask">变量掩码泛化 (Mask)</option>
+                <option value="level_mapping">级别重映射 (Level Mapping)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">执行优先级 (Priority)</label>
+              <input type="number" class="form-control" id="preprocess-rule-priority" value="10" placeholder="数值越大越先执行">
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">匹配正则表达式 (Regex Pattern) *</label>
+            <input type="text" class="form-control" id="preprocess-rule-pattern" placeholder="例如：(?i)tenant-\d+ 或 (?i)RESULT_FAIL" required>
+            <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">支持标准 Go 语言正则表达式，忽略大小写可加 <code>(?i)</code></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" id="label-preprocess-target">目标替换掩码 *</label>
+            <input type="text" class="form-control" id="preprocess-rule-target" value="<*>" placeholder="掩码类型填 <*>; 级别映射填 ERROR/WARN/FATAL/INFO" required>
+            <div id="preprocess-target-help" style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">
+              掩码类型建议统一使用 <code>&lt;*&gt;</code>；若为级别映射请填大写级别（如 <code>ERROR</code>, <code>FATAL</code>, <code>WARN</code>）
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">规则描述说明</label>
+            <input type="text" class="form-control" id="preprocess-rule-desc" placeholder="简述该预处理规则适用的日志场景与目标">
+          </div>
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" id="preprocess-rule-enabled" checked> 启用该预处理规则
+            </label>
+          </div>
+          <div class="modal-footer" style="padding: 14px 0 0 0; display: flex; justify-content: flex-end; gap: 8px;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-preprocess-rule')">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存预处理规则</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 11: 在线即时清洗与缩写解析试算 -->
+  <div class="modal-overlay" id="modal-preprocess-test">
+    <div class="modal-content" style="max-width: 680px;">
+      <div class="modal-header">
+        <h3 class="modal-title">🧪 在线日志预处理清洗与缩写解析试算</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-preprocess-test')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          输入任意原始单行日志，系统将结合<strong>原生日志级别缩写规范化引擎</strong>与<strong>已启用的管理员定制预处理规则</strong>，即时反馈清洗结果与提取的规范级别。
+        </div>
+
+        <div style="display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap;">
+          <span style="font-size: 11px; color: var(--text-dim); line-height: 24px;">快捷样例:</span>
+          <button type="button" class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 8px;" onclick="app.fillPreprocessTestSample('err')">ERR 缩写样例</button>
+          <button type="button" class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 8px;" onclick="app.fillPreprocessTestSample('crit')">CRIT 缩写样例</button>
+          <button type="button" class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 8px;" onclick="app.fillPreprocessTestSample('tenant')">租户ID掩码样例</button>
+          <button type="button" class="btn btn-secondary btn-sm" style="font-size: 11px; padding: 2px 8px;" onclick="app.fillPreprocessTestSample('ceph')">OSD 降级样例</button>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" style="font-weight: 600;">原始单行日志文本 (Raw Log)</label>
+          <textarea class="form-control" id="preprocess-test-input" rows="3" placeholder="例如：2026-09-13 15:30:12 [ERR] client tenant-9527 connection reset by peer (errno 104)"></textarea>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 14px;">
+          <button type="button" class="btn btn-primary btn-sm" onclick="app.runPreprocessTest()">⚡ 立即执行清洗试算</button>
+        </div>
+
+        <!-- 试算结果区域 -->
+        <div id="preprocess-test-result-box" style="display: none; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 14px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-size: 13px; font-weight: 600; color: var(--text-color);">试算结果分析</span>
+            <div id="preprocess-test-level-badge"></div>
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px;">规范化清洗后模板 (Cleaned Template Text):</div>
+            <pre id="preprocess-test-cleaned" style="background: #090d16; border: 1px solid var(--border-color); border-radius: 4px; padding: 10px; font-size: 12px; color: #38bdf8; white-space: pre-wrap; word-break: break-all; margin: 0;"></pre>
+          </div>
+
+          <div id="preprocess-test-matched-box" style="display: none; font-size: 12px;">
+            <div style="color: var(--text-dim); margin-bottom: 4px;">🎯 命中的自定义预处理规则:</div>
+            <div id="preprocess-test-matched-list" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+          </div>
+        </div>
+
+        <div class="modal-footer" style="padding: 14px 0 0 0; margin-top: 14px; display: flex; justify-content: flex-end;">
+          <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-preprocess-test')">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/app.js?v=20260913_preprocess"></script>
 </body>
 </html>

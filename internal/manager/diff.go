@@ -223,6 +223,20 @@ func (s *Server) CompareArchiveScopes(archiveIDA, subPathA, archiveIDB, subPathB
 	minerA := indexer.NewDrainMiner(0.55, 4)
 	minerB := indexer.NewDrainMiner(0.55, 4)
 
+	// 注入管理员启用的定制文本预处理与变量掩码规则
+	if prepRules, pErr := s.store.ListPreprocessRules(); pErr == nil {
+		var activeRules []*model.PreprocessRule
+		for _, pr := range prepRules {
+			if pr.Enabled {
+				activeRules = append(activeRules, pr)
+			}
+		}
+		if len(activeRules) > 0 {
+			minerA.SetPreprocessRules(activeRules)
+			minerB.SetPreprocessRules(activeRules)
+		}
+	}
+
 	mineScopedArchiveSamples(arcA.ExtractPath, subPathA, minerA, 1000)
 	mineScopedArchiveSamples(arcB.ExtractPath, subPathB, minerB, 1000)
 

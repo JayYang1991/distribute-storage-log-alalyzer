@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,6 +150,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// 通用分布式日志分析增强：基准差分对比与模板聚类
 	mux.HandleFunc("/api/analysis/diff", s.handleAnalysisDiff)
 	mux.HandleFunc("/api/analysis/templates", s.handleAnalysisTemplates)
+
+	// 管理员文本预处理与变量掩码定制扩展
+	mux.HandleFunc("/api/preprocess/rules", s.handlePreprocessRules)
+	mux.HandleFunc("/api/preprocess/rules/", s.handlePreprocessRuleItem)
+	mux.HandleFunc("/api/preprocess/test", s.handlePreprocessTest)
 
 	// 运维监控度量与微服务标准探针
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -2792,6 +2798,17 @@ func (s *Server) handleAnalysisTemplates(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	miner := indexer.NewDrainMiner(0.55, 4)
+	if prepRules, pErr := s.store.ListPreprocessRules(); pErr == nil {
+		var activeRules []*model.PreprocessRule
+		for _, pr := range prepRules {
+			if pr.Enabled {
+				activeRules = append(activeRules, pr)
+			}
+		}
+		if len(activeRules) > 0 {
+			miner.SetPreprocessRules(activeRules)
+		}
+	}
 	mineArchiveSamples(arc.ExtractPath, miner, 2000)
 	templates := miner.GetTemplates()
 	for i := range templates {
@@ -2992,5 +3009,159 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// ================= 管理员文本预处理定制与变量掩码规则 =================
+
+func (s *Server) handlePreprocessRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.store.ListPreprocessRules()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rules == nil {
+			rules = []*model.PreprocessRule{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rules)
+
+	case http.MethodPost:
+		currentUser, err := s.authenticate(r)
+		if err != nil || currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可配置文本预处理规则", http.StatusForbidden)
+			return
+		}
+		var rule model.PreprocessRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(rule.Name) == "" || strings.TrimSpace(rule.Pattern) == "" {
+			http.Error(w, "规则名称与匹配正则表达式不能为空", http.StatusBadRequest)
+			return
+		}
+		// 校验正则表达式合法性
+		if _, err := regexp.Compile(rule.Pattern); err != nil {
+			http.Error(w, fmt.Sprintf("无效的正则表达式: %v", err), http.StatusBadRequest)
+			return
+		}
+		if rule.Type == "" {
+			rule.Type = model.PreprocessTypeMask
+		}
+		if rule.Type == model.PreprocessTypeMask && rule.Replacement == "" {
+			rule.Replacement = "<*>"
+		}
+		if rule.ID == "" {
+			rule.ID = fmt.Sprintf("prep_rule_%d", time.Now().UnixNano())
+		}
+		if err := s.store.SavePreprocessRule(&rule); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rule)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handlePreprocessRuleItem(w http.ResponseWriter, r *http.Request) {
+	ruleID := strings.TrimPrefix(r.URL.Path, "/api/preprocess/rules/")
+	if ruleID == "" {
+		http.Error(w, "缺少 rule_id", http.StatusBadRequest)
+		return
+	}
+
+	currentUser, err := s.authenticate(r)
+	if err != nil || currentUser.Role != model.RoleAdmin {
+		http.Error(w, "仅管理员可操作", http.StatusForbidden)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var req model.PreprocessRule
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		existing, err := s.store.GetPreprocessRule(ruleID)
+		if err != nil || existing == nil {
+			http.Error(w, "预处理规则未找到", http.StatusNotFound)
+			return
+		}
+		if req.Pattern != "" {
+			if _, pErr := regexp.Compile(req.Pattern); pErr != nil {
+				http.Error(w, fmt.Sprintf("无效的正则表达式: %v", pErr), http.StatusBadRequest)
+				return
+			}
+			existing.Pattern = req.Pattern
+		}
+		if req.Name != "" {
+			existing.Name = req.Name
+		}
+		if req.Type != "" {
+			existing.Type = req.Type
+		}
+		existing.Replacement = req.Replacement
+		existing.Description = req.Description
+		existing.Enabled = req.Enabled
+		existing.Order = req.Order
+
+		if err := s.store.SavePreprocessRule(existing); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(existing)
+
+	case http.MethodDelete:
+		if err := s.store.DeletePreprocessRule(ruleID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handlePreprocessTest 在线测试预处理与正则清洗效果
+func (s *Server) handlePreprocessTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		SampleLog    string                  `json:"sample_log"`
+		CustomRules  []*model.PreprocessRule `json:"custom_rules,omitempty"`
+		UsePersisted bool                    `json:"use_persisted"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rulesToApply := req.CustomRules
+	if req.UsePersisted {
+		if stored, err := s.store.ListPreprocessRules(); err == nil {
+			rulesToApply = append(rulesToApply, stored...)
+		}
+	}
+
+	cleaned, level, ts := indexer.PreprocessLogWithRules(req.SampleLog, rulesToApply)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"raw_log":   req.SampleLog,
+		"cleaned":   cleaned,
+		"level":     level,
+		"timestamp": ts,
+	})
 }
 

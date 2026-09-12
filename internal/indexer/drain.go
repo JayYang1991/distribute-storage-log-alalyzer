@@ -16,7 +16,8 @@ import (
 
 var (
 	reTimestamp = regexp.MustCompile(`^(\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?|\[\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\]|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})`)
-	reLogLevel  = regexp.MustCompile(`(?i)\b(FATAL|CRITICAL|ERROR|WARN(?:ING)?|INFO|DEBUG|TRACE)\b`)
+	// 全面支持日志级别全拼与常用缩写 (如 ERR, CRIT, WRN, INF, DBG, FTL, TRC)
+	reLogLevel  = regexp.MustCompile(`(?i)\b(FATAL|FTL|CRIT(?:ICAL)?|ERROR|ERR|WARN(?:ING)?|WRN|INFO|INF|DEBUG|DBG|TRACE|TRC)\b`)
 	reIPv4Port  = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b`)
 	reUUID      = regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`)
 	reHex       = regexp.MustCompile(`\b0x[0-9a-fA-F]+\b`)
@@ -53,6 +54,7 @@ type DrainMiner struct {
 	simThreshold float64
 	maxClusters  int
 	clusters     []*Cluster
+	customRules  []*model.PreprocessRule
 }
 
 // NewDrainMiner 创建 Drain 挖掘器
@@ -71,8 +73,20 @@ func NewDrainMiner(simThreshold float64, maxDepth int) *DrainMiner {
 	}
 }
 
+// SetPreprocessRules 注入管理员定制文本预处理与掩码规则
+func (d *DrainMiner) SetPreprocessRules(rules []*model.PreprocessRule) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.customRules = rules
+}
+
 // PreprocessLog 清洗原始单行日志，剥离时间戳、提取级别并泛化动态变量
 func PreprocessLog(raw string) (cleaned string, level string, ts string) {
+	return PreprocessLogWithRules(raw, nil)
+}
+
+// PreprocessLogWithRules 清洗日志并应用管理员自定义的掩码与级别映射规则
+func PreprocessLogWithRules(raw string, rules []*model.PreprocessRule) (cleaned string, level string, ts string) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return "", "INFO", ""
@@ -84,17 +98,23 @@ func PreprocessLog(raw string) (cleaned string, level string, ts string) {
 		s = strings.TrimSpace(s[loc[1]:])
 	}
 
-	// 2. 提取日志级别
+	// 2. 提取并规范化日志级别 (原生支持 ERR, CRIT, WRN 等各种缩写)
 	level = "INFO"
 	if match := reLogLevel.FindString(s); match != "" {
 		u := strings.ToUpper(match)
-		if strings.HasPrefix(u, "WARN") {
+		if strings.HasPrefix(u, "WARN") || u == "WRN" {
 			level = "WARN"
 		} else if strings.HasPrefix(u, "ERR") {
 			level = "ERROR"
-		} else if u == "FATAL" || u == "CRITICAL" {
+		} else if u == "FATAL" || strings.HasPrefix(u, "CRIT") || u == "FTL" {
 			level = "FATAL"
-		} else if u == "INFO" || u == "DEBUG" || u == "TRACE" {
+		} else if strings.HasPrefix(u, "INF") {
+			level = "INFO"
+		} else if strings.HasPrefix(u, "DBG") || u == "DEBUG" {
+			level = "DEBUG"
+		} else if strings.HasPrefix(u, "TRC") || u == "TRACE" {
+			level = "TRACE"
+		} else {
 			level = u
 		}
 	}
@@ -113,6 +133,33 @@ func PreprocessLog(raw string) (cleaned string, level string, ts string) {
 		s = reQuoted.ReplaceAllString(s, `"<*>"`)
 	}
 	s = fastReplaceDigits(s)
+
+	// 4. 应用管理员定制预处理扩展规则 (Mask 变量泛化与 Level Mapping)
+	for _, rule := range rules {
+		if rule == nil || !rule.Enabled || rule.Pattern == "" {
+			continue
+		}
+		reg, err := regexp.Compile(rule.Pattern)
+		if err != nil {
+			continue
+		}
+
+		if rule.Type == model.PreprocessTypeLevelMapping {
+			if reg.MatchString(raw) || reg.MatchString(s) {
+				targetLvl := strings.ToUpper(strings.TrimSpace(rule.Replacement))
+				if targetLvl != "" {
+					level = targetLvl
+				}
+			}
+		} else {
+			// mask 类型替换
+			replacement := rule.Replacement
+			if replacement == "" {
+				replacement = "<*>"
+			}
+			s = reg.ReplaceAllString(s, replacement)
+		}
+	}
 
 	return s, level, ts
 }
@@ -172,7 +219,11 @@ func (d *DrainMiner) AddLog(raw string, file string) {
 
 // AddLogWithLine 向聚类器投递一条日志，并携带该行在文件中的具体物理行号
 func (d *DrainMiner) AddLogWithLine(raw string, file string, lineNo int64) {
-	cleaned, level, ts := PreprocessLog(raw)
+	d.mu.Lock()
+	rules := d.customRules
+	d.mu.Unlock()
+
+	cleaned, level, ts := PreprocessLogWithRules(raw, rules)
 	if cleaned == "" {
 		return
 	}

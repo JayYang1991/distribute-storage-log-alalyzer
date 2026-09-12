@@ -255,6 +255,26 @@ type LogTemplate struct {
 	Files      []string `json:"files,omitempty"`       // 关联文件列表
 }
 
+// 预处理规则类型
+const (
+	PreprocessTypeMask         = "mask"          // 动态变量通配替换 (如将租户ID/订单号等替换为 <*>)
+	PreprocessTypeLevelMapping = "level_mapping" // 自定义特定模式映射为指定日志级别
+)
+
+// PreprocessRule 管理员定制文本预处理与变量掩码规则
+type PreprocessRule struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`                  // 规则名称 (例如: "业务租户ID通配")
+	Type        string    `json:"type"`                  // mask 或 level_mapping
+	Pattern     string    `json:"pattern"`               // 正则表达式
+	Replacement string    `json:"replacement,omitempty"` // 替换占位符 (默认 <*>，或对应目标日志级别)
+	Description string    `json:"description,omitempty"` // 规则说明
+	Enabled     bool      `json:"enabled"`               // 是否启用
+	Order       int       `json:"order"`                 // 执行优先级顺序
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // SubArchiveItem 归档包内嵌套子压缩包/独立子模块元数据
 type SubArchiveItem struct {
 	Name       string `json:"name"`        // 子包或子模块名称 (如 "node-01")

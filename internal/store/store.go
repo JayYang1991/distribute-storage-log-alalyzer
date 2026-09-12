@@ -28,6 +28,7 @@ var (
 	bucketSettings            = []byte("settings")
 	bucketAlarms              = []byte("alarms")
 	bucketDecommissionedNodes = []byte("decommissioned_nodes")
+	bucketPreprocessRules     = []byte("preprocess_rules")
 )
 
 type Store struct {
@@ -54,7 +55,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化各 bucket
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms, bucketDecommissionedNodes} {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms, bucketDecommissionedNodes, bucketPreprocessRules} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -74,7 +75,47 @@ func NewStore(cfg *config.Config) (*Store, error) {
 	// 初始化默认普通业务用户(用于多视图与权限分离体验)
 	_ = s.initDefaultUser("user", "user123")
 
+	// 初始化默认文本预处理扩展规则
+	_ = s.initDefaultPreprocessRules()
+
 	return s, nil
+}
+
+func (s *Store) initDefaultPreprocessRules() error {
+	rules, err := s.ListPreprocessRules()
+	if err == nil && len(rules) > 0 {
+		return nil // 已存在规则无需重复初始化
+	}
+
+	defaultRules := []*model.PreprocessRule{
+		{
+			ID:          "prep_rule_auth_token",
+			Name:        "鉴权 Token / Session 变量通配",
+			Type:        model.PreprocessTypeMask,
+			Pattern:     `(?i)\b(?:token|auth_token|session_id|sess_id)=[a-zA-Z0-9_\-\.]+`,
+			Replacement: "<*>",
+			Description: "自动将日志中的认证凭据/会话ID动态变量泛化为 <*>，防止相似日志模式分散",
+			Enabled:     true,
+			Order:       10,
+			CreatedAt:   time.Now(),
+		},
+		{
+			ID:          "prep_rule_tenant_prefix",
+			Name:        "业务租户前缀 ID 通配示例",
+			Type:        model.PreprocessTypeMask,
+			Pattern:     `\btenant_[0-9a-zA-Z_\-]+\b`,
+			Replacement: "<*>",
+			Description: "自动将包含 tenant_xxx 格式的业务多租户隔离标识通配为 <*>",
+			Enabled:     true,
+			Order:       20,
+			CreatedAt:   time.Now(),
+		},
+	}
+
+	for _, r := range defaultRules {
+		_ = s.SavePreprocessRule(r)
+	}
+	return nil
 }
 
 // BackupSnapshot 将 bbolt 数据库以只读事务流式导出到 writer (零阻塞一致性热快照)
@@ -671,6 +712,68 @@ func (s *Store) ListRules() ([]*model.Rule, error) {
 func (s *Store) DeleteRule(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketRules)
+		return b.Delete([]byte(id))
+	})
+}
+
+// ================= 文本预处理与变量掩码定制规则 =================
+
+func (s *Store) SavePreprocessRule(r *model.PreprocessRule) error {
+	r.UpdatedAt = time.Now()
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now()
+	}
+	data, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPreprocessRules)
+		return b.Put([]byte(r.ID), data)
+	})
+}
+
+func (s *Store) GetPreprocessRule(id string) (*model.PreprocessRule, error) {
+	var r *model.PreprocessRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPreprocessRules)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("preprocess rule not found")
+		}
+		return json.Unmarshal(data, &r)
+	})
+	return r, err
+}
+
+func (s *Store) ListPreprocessRules() ([]*model.PreprocessRule, error) {
+	var list []*model.PreprocessRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPreprocessRules)
+		return b.ForEach(func(k, v []byte) error {
+			var r model.PreprocessRule
+			if err := json.Unmarshal(v, &r); err == nil {
+				list = append(list, &r)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	// 按 Order 与创建时间升序排序
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Order != list[j].Order {
+			return list[i].Order < list[j].Order
+		}
+		return list[i].CreatedAt.Before(list[j].CreatedAt)
+	})
+	return list, nil
+}
+
+func (s *Store) DeletePreprocessRule(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketPreprocessRules)
 		return b.Delete([]byte(id))
 	})
 }
