@@ -22,6 +22,7 @@ HA_MODE="standalone"
 PEER_URL=""
 VIP=""
 VIP_INTERFACE=""
+FS_TYPE="ext4"
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -405,26 +406,40 @@ else
         # 检查是否格式化与挂载
         if [ "$IS_ROOT" = true ]; then
             mkdir -p "$inst_mount"
+
+            # 智能探测或兜底文件系统类型 (优先使用命令行参数，未指定时探测 blkid，兜底 ext4)
+            current_fs="$FS_TYPE"
+            if [ -z "$current_fs" ]; then
+                current_fs=$(blkid -s TYPE -o value "$disk_dev" 2>/dev/null || true)
+            fi
+            if [ -z "$current_fs" ]; then
+                current_fs="ext4"
+            fi
+
             # 检查该磁盘是否已被挂载
             if ! grep -qs "$inst_mount" /proc/mounts; then
                 if [ "$FORMAT_DISK" = true ]; then
-                    echo "     ⚡ 正在执行磁盘格式化 ($FS_TYPE: $disk_dev)..."
+                    echo "     ⚡ 正在执行磁盘格式化 ($current_fs: $disk_dev)..."
                     umount "$disk_dev" 2>/dev/null || true
-                    if [ "$FS_TYPE" == "xfs" ]; then
+                    if [ "$current_fs" == "xfs" ]; then
                         mkfs.xfs -f "$disk_dev" >/dev/null 2>&1 || true
                     else
                         mkfs.ext4 -F "$disk_dev" >/dev/null 2>&1 || true
                     fi
                 fi
                 echo "     正在挂载磁盘 $disk_dev 到 $inst_mount..."
-                mount "$disk_dev" "$inst_mount" 2>/dev/null || mount -o defaults "$disk_dev" "$inst_mount" 2>/dev/null || true
+                mount "$disk_dev" "$inst_mount" 2>/dev/null || mount -t "$current_fs" "$disk_dev" "$inst_mount" 2>/dev/null || true
 
                 # 写入 /etc/fstab (若未存在)
                 if ! grep -qs "$inst_mount" /etc/fstab; then
-                    echo "$disk_dev $inst_mount $FS_TYPE defaults 0 0" >> /etc/fstab
+                    echo "$disk_dev $inst_mount $current_fs defaults 0 0" >> /etc/fstab
                 fi
             else
                 echo "     ✔ 磁盘已处于挂载状态 ($inst_mount)"
+                # 即使已被挂载，若 /etc/fstab 缺失则自动补全，防止机器重启后失效
+                if ! grep -qs "$inst_mount" /etc/fstab; then
+                    echo "$disk_dev $inst_mount $current_fs defaults 0 0" >> /etc/fstab
+                fi
             fi
         fi
 

@@ -84,10 +84,10 @@ func (s *Server) Start(ctx context.Context) error {
 		fileServer := http.FileServer(s.staticFS)
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			p := r.URL.Path
-			if strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".png") || strings.HasSuffix(p, ".woff2") {
+			if strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".html") || p == "/" {
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			} else if strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".png") || strings.HasSuffix(p, ".woff2") {
 				w.Header().Set("Cache-Control", "public, max-age=86400")
-			} else if strings.HasSuffix(p, ".html") || p == "/" {
-				w.Header().Set("Cache-Control", "no-cache")
 			}
 			fileServer.ServeHTTP(w, r)
 		})

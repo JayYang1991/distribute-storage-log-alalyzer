@@ -1191,3 +1191,46 @@ mark.v-match.v-match-active {
   transform: translateY(-1px);
 }
 
+/* 基准差分选择完整元数据预览卡片 */
+.diff-selection-card {
+  margin-top: 8px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  word-break: break-all;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  animation: fadeIn 0.2s ease;
+}
+
+.diff-selection-card.card-b {
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.diff-selection-card .filename-full {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 600;
+  color: var(--text-main);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.diff-selection-card .meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.diff-selection-card .meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+

@@ -626,10 +626,39 @@ const app = {
     }
   },
 
-  downloadDatabaseBackup() {
+  async downloadDatabaseBackup() {
     if (!confirm("确定要导出当前元数据库 (bbolt) 实时一致性热快照吗？")) return;
-    const token = localStorage.getItem("token") || "";
-    window.open(`/api/system/backup?token=${encodeURIComponent(token)}`, "_blank");
+    try {
+      const token = localStorage.getItem("token") || "";
+      const res = await fetch(`/api/system/backup?token=${encodeURIComponent(token)}`, {
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        alert("导出元数据快照失败: " + text);
+        return;
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("Content-Disposition") || "";
+      let filename = `analyzer-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.db`;
+      const match = disposition.match(/filename="?([^";]+)"?/);
+      if (match && match[1]) {
+        filename = match[1];
+      }
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (e) {
+      alert("下载快照发生异常: " + e.message);
+    }
   },
 
   openDeployModal() {
@@ -3430,7 +3459,9 @@ const app = {
       if (a.status === "ready") {
         readyArchives.push(a);
         const tagText = a.tags && a.tags.length > 0 ? ` [${a.tags.join(", ")}]` : "";
-        opts += `<option value="${a.id}">${this.escape(a.filename)}${this.escape(tagText)} (${(a.size / (1024 * 1024)).toFixed(1)} MB)</option>`;
+        const sizeStr = a.size > 1024 * 1024 ? `${(a.size / (1024 * 1024)).toFixed(1)} MB` : `${(a.size / 1024).toFixed(1)} KB`;
+        const fullTitle = `${a.filename}${tagText} (${sizeStr}, ${a.file_count || 0} 个文件)`;
+        opts += `<option value="${a.id}" title="${this.escape(fullTitle)}">${this.escape(a.filename)}${this.escape(tagText)} (${sizeStr})</option>`;
       }
     });
 
@@ -3445,6 +3476,100 @@ const app = {
     if (readyArchives.length >= 1 && selParent) {
       selParent.selectedIndex = 1;
     }
+
+    this.updateDiffArchivePreview('a');
+    this.updateDiffArchivePreview('b');
+    this.updateDiffParentPreview();
+  },
+
+  updateDiffArchivePreview(side) {
+    const sel = document.getElementById(`diff-archive-${side}`);
+    const previewEl = document.getElementById(`diff-preview-${side}`);
+    const tagEl = document.getElementById(`diff-tag-${side}`);
+    if (!sel || !previewEl) return;
+
+    const archiveID = sel.value;
+    if (!archiveID) {
+      previewEl.style.display = "none";
+      if (tagEl) tagEl.innerText = "";
+      sel.title = "";
+      return;
+    }
+
+    const a = this.archives.find(item => item.id === archiveID);
+    if (!a) {
+      previewEl.style.display = "none";
+      return;
+    }
+
+    sel.title = `${a.filename} (${(a.size / (1024 * 1024)).toFixed(1)} MB)`;
+    const tags = a.tags && a.tags.length > 0 ? a.tags.join(", ") : "无";
+    if (tagEl) tagEl.innerText = a.tags && a.tags.length > 0 ? `标签: ${tags}` : "";
+
+    const sizeStr = a.size > 1024 * 1024 ? `${(a.size / (1024 * 1024)).toFixed(2)} MB` : `${(a.size / 1024).toFixed(1)} KB`;
+    const uploadTime = a.upload_time ? new Date(a.upload_time).toLocaleString() : "-";
+    const nodeName = a.storage_node_name || a.assigned_worker || "本地主节点";
+
+    previewEl.innerHTML = `
+      <div class="filename-full" title="${this.escape(a.filename)}">📄 ${this.escape(a.filename)}</div>
+      <div class="meta-line">
+        <span class="meta-item">💾 大小: <strong>${sizeStr}</strong></span>
+        <span class="meta-item">📁 文件数: <strong>${a.file_count || 0}</strong></span>
+        <span class="meta-item">📝 总行数: <strong>${(a.total_lines || 0).toLocaleString()}</strong></span>
+        <span class="meta-item">🖥️ 节点: <strong>${this.escape(nodeName)}</strong></span>
+        <span class="meta-item">🏷️ 标签: <strong>${this.escape(tags)}</strong></span>
+        <span class="meta-item">🕒 上传: <strong>${uploadTime}</strong></span>
+      </div>
+    `;
+    previewEl.style.display = "flex";
+  },
+
+  updateDiffParentPreview() {
+    const sel = document.getElementById("diff-parent-archive");
+    const previewEl = document.getElementById("diff-parent-preview");
+    if (!sel || !previewEl) return;
+    const archiveID = sel.value;
+    if (!archiveID) {
+      previewEl.style.display = "none";
+      return;
+    }
+    const a = this.archives.find(item => item.id === archiveID);
+    if (!a) {
+      previewEl.style.display = "none";
+      return;
+    }
+    sel.title = a.filename;
+    const sizeStr = a.size > 1024 * 1024 ? `${(a.size / (1024 * 1024)).toFixed(2)} MB` : `${(a.size / 1024).toFixed(1)} KB`;
+    previewEl.innerHTML = `
+      <div class="filename-full">📦 ${this.escape(a.filename)}</div>
+      <div class="meta-line">
+        <span class="meta-item">💾 压缩包大小: <strong>${sizeStr}</strong></span>
+        <span class="meta-item">📁 解压文件总数: <strong>${a.file_count || 0}</strong></span>
+        <span class="meta-item">🖥️ 存储节点: <strong>${this.escape(a.storage_node_name || "本地主节点")}</strong></span>
+      </div>
+    `;
+    previewEl.style.display = "flex";
+  },
+
+  updateDiffSubArchivePreview(side) {
+    const sel = document.getElementById(`diff-sub-archive-${side}`);
+    const previewEl = document.getElementById(`diff-sub-preview-${side}`);
+    if (!sel || !previewEl) return;
+    const subPath = sel.value;
+    if (!subPath) {
+      previewEl.style.display = "none";
+      return;
+    }
+    const selectedOpt = sel.options[sel.selectedIndex];
+    const text = selectedOpt ? selectedOpt.text : subPath;
+    sel.title = text;
+    previewEl.innerHTML = `
+      <div class="filename-full">🧩 ${this.escape(subPath)}</div>
+      <div class="meta-line">
+        <span class="meta-item">${this.escape(text)}</span>
+      </div>
+    `;
+    previewEl.style.display = "flex";
   },
 
   onDiffModeChange() {
@@ -3457,8 +3582,10 @@ const app = {
       if (secIntra) secIntra.style.display = "block";
       this.onDiffParentArchiveChange();
     } else {
-      if (secInter) secInter.style.display = "grid";
+      if (secInter) secInter.style.display = "block";
       if (secIntra) secIntra.style.display = "none";
+      this.updateDiffArchivePreview('a');
+      this.updateDiffArchivePreview('b');
     }
   },
 
@@ -3469,9 +3596,13 @@ const app = {
     const selSubB = document.getElementById("diff-sub-archive-b");
     const hint = document.getElementById("diff-sub-hint");
 
+    this.updateDiffParentPreview();
+
     if (!archiveID) {
       if (selSubA) selSubA.innerHTML = '<option value="">-- 请先选择外层日志包 --</option>';
       if (selSubB) selSubB.innerHTML = '<option value="">-- 请先选择外层日志包 --</option>';
+      this.updateDiffSubArchivePreview('a');
+      this.updateDiffSubArchivePreview('b');
       if (hint) hint.innerHTML = "";
       return;
     }
@@ -3489,6 +3620,8 @@ const app = {
         const emptyOpt = '<option value="">未检测到独立子包目录</option>';
         if (selSubA) selSubA.innerHTML = emptyOpt;
         if (selSubB) selSubB.innerHTML = emptyOpt;
+        this.updateDiffSubArchivePreview('a');
+        this.updateDiffSubArchivePreview('b');
         if (hint) {
           hint.innerHTML = '<span style="color: var(--warning);">⚠️ 该日志包内所有文件均直接平铺在根目录下，未检测到多个独立子包/节点模块。建议使用上方“跨日志包对比”模式。</span>';
         }
@@ -3499,7 +3632,7 @@ const app = {
       subs.forEach(s => {
         const sizeStr = s.total_size > 1024 * 1024 ? `${(s.total_size / (1024 * 1024)).toFixed(1)} MB` : `${(s.total_size / 1024).toFixed(1)} KB`;
         const nestedBadge = s.has_nested ? " [含深层嵌套]" : "";
-        subOpts += `<option value="${this.escape(s.path)}">📦 ${this.escape(s.name)}${nestedBadge} (${s.total_files} 个文件, ${sizeStr})</option>`;
+        subOpts += `<option value="${this.escape(s.path)}" title="${this.escape(s.path)} (${s.total_files} 文件, ${sizeStr})">📦 ${this.escape(s.name)}${nestedBadge} (${s.total_files} 个文件, ${sizeStr})</option>`;
       });
 
       if (selSubA) selSubA.innerHTML = subOpts;
@@ -3517,6 +3650,8 @@ const app = {
           hint.innerHTML = `<span style="color: #fbbf24;">ℹ️ 该包仅探测到 1 个子模块 [${subs[0].name}]，同包差分至少需要 2 个不同子包参与对比。</span>`;
         }
       }
+      this.updateDiffSubArchivePreview('a');
+      this.updateDiffSubArchivePreview('b');
     } catch (err) {
       if (hint) hint.innerHTML = `<span style="color: var(--danger);">探测包内子包失败: ${err.message}</span>`;
     }
