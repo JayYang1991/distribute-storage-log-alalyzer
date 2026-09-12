@@ -538,7 +538,21 @@
                 选择一份“正常/健康基准日志包”与一份“故障/异常现场日志包”（或两台配置相同但吞吐异常的节点日志），系统将自动进行全方位特征差分比对：包括<strong>解压文件增减、告警激增率、以及基于 Drain 算法自动挖掘的全新突发异常模式（Zero-Shot Patterns）</strong>。
               </div>
 
-              <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 16px; align-items: flex-end;">
+              <!-- 差分对比模式选择器 -->
+              <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-color);">
+                <span style="font-weight: 600; font-size: 13px; color: var(--text-primary);">对比分析维度:</span>
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                  <input type="radio" name="diff-mode" id="diff-mode-inter" value="inter" checked onchange="app.onDiffModeChange()">
+                  <span>📦 跨日志包对比 (两份独立的归档包)</span>
+                </label>
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                  <input type="radio" name="diff-mode" id="diff-mode-intra" value="intra" onchange="app.onDiffModeChange()">
+                  <span style="color: #38bdf8; font-weight: 500;">🧩 同一压缩包内多子包/节点对比 (聚合大包内部两两对比)</span>
+                </label>
+              </div>
+
+              <!-- 模式 1: 跨日志包对比选择器 (默认) -->
+              <div id="diff-selector-inter" style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 16px; align-items: flex-end;">
                 <div class="form-group" style="margin-bottom: 0;">
                   <label class="form-label" style="font-weight: 600; color: #34d399;">📗 基准日志包 A (正常状态 / 升级前)</label>
                   <select class="form-control" id="diff-archive-a"></select>
@@ -547,9 +561,31 @@
                   <label class="form-label" style="font-weight: 600; color: #f87171;">📕 待测/故障日志包 B (异常现场 / 升级后)</label>
                   <select class="form-control" id="diff-archive-b"></select>
                 </div>
-                <button class="btn btn-primary" id="btn-run-diff" onclick="app.executeDiffAnalysis();" style="height: 38px;">
-                  🚀 执行深度差分比对
+                <button class="btn btn-primary" id="btn-run-diff-inter" onclick="app.executeDiffAnalysis();" style="height: 38px;">
+                  🚀 执行跨包差分比对
                 </button>
+              </div>
+
+              <!-- 模式 2: 同一压缩包内多子包对比选择器 -->
+              <div id="diff-selector-intra" style="display: none;">
+                <div style="margin-bottom: 14px;">
+                  <label class="form-label" style="font-weight: 600; color: #38bdf8;">📁 选择目标综合聚合日志包 (含多个内部节点/多层嵌套子压缩包) *</label>
+                  <select class="form-control" id="diff-parent-archive" onchange="app.onDiffParentArchiveChange()"></select>
+                </div>
+                <div id="diff-sub-archives-box" style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 16px; align-items: flex-end;">
+                  <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-weight: 600; color: #34d399;">📗 基准内部子包 / 正常节点 A *</label>
+                    <select class="form-control" id="diff-sub-archive-a"></select>
+                  </div>
+                  <div class="form-group" style="margin-bottom: 0;">
+                    <label class="form-label" style="font-weight: 600; color: #f87171;">📕 待测内部子包 / 故障节点 B *</label>
+                    <select class="form-control" id="diff-sub-archive-b"></select>
+                  </div>
+                  <button class="btn btn-primary" id="btn-run-diff-intra" onclick="app.executeDiffAnalysis();" style="height: 38px;">
+                    🚀 执行包内深度差分比对
+                  </button>
+                </div>
+                <div id="diff-sub-hint" style="font-size: 11px; color: var(--text-dim); margin-top: 8px;"></div>
               </div>
             </div>
           </div>

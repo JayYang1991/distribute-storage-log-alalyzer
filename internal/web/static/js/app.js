@@ -1776,10 +1776,22 @@ const app = {
       if (fileCountEl) fileCountEl.innerText = this.browserFiles.filter(f => !f.is_directory).length;
 
       this.fileTreeRoot = this.buildFileTree(this.browserFiles);
-      // 默认展开所有层级目录，便于用户直观浏览全部文件结构
-      this.expandAllTreeDirs(false);
+      // 智能层级展开：小于 120 个文件时全展开；海量文件场景下仅展开前两层与目标文件链路，避免几万 DOM 节点卡死浏览器
+      if (!this.expandedDirs) this.expandedDirs = new Set();
+      this.expandedDirs.clear();
 
-      // 若当前未选中任何文件，默认打开第一个非目录文件，并展开其父目录
+      if (this.browserFiles.length <= 120) {
+        this.expandAllTreeDirs(false);
+      } else {
+        // 展开第一层子目录，其余层级保留折叠状态按需点击展开
+        Object.values(this.fileTreeRoot.children || {}).forEach(c => {
+          if (c.isDirectory && c.path) {
+            this.expandedDirs.add(c.path);
+          }
+        });
+      }
+
+      // 若当前未选中任何文件，默认打开第一个非目录文件，并展开其父目录链路
       const firstFile = this.browserFiles.find(f => !f.is_directory);
       if (firstFile) {
         this.ensureParentDirsExpanded(firstFile.relative_path);
@@ -1976,13 +1988,22 @@ const app = {
     return null;
   },
 
-  // 关键字高亮渲染辅助函数
-  highlightMatch(text, query) {
-    if (!query) return text;
-    const q = this.escapeRegex(query.trim());
-    if (!q) return text;
-    const reg = new RegExp(`(${q})`, "gi");
-    return text.replace(reg, '<mark class="v-match">$1</mark>');
+  // 关键字高亮渲染辅助函数 (先精确按正则分段，再独立转义，杜绝破坏 HTML 实体与 XSS 注入)
+  highlightMatch(rawText, query) {
+    if (!rawText) return "";
+    if (!query || !query.trim()) return this.escape(rawText);
+    const q = query.trim();
+    const reg = new RegExp(this.escapeRegex(q), "gi");
+    let result = "";
+    let lastIndex = 0;
+    let match;
+    while ((match = reg.exec(rawText)) !== null) {
+      result += this.escape(rawText.substring(lastIndex, match.index));
+      result += `<mark class="v-match">${this.escape(match[0])}</mark>`;
+      lastIndex = reg.lastIndex;
+    }
+    result += this.escape(rawText.substring(lastIndex));
+    return result;
   },
 
   // 渲染层级目录树
@@ -2035,7 +2056,7 @@ const app = {
 
       const arrow = `<span class="tree-arrow">${isExpanded ? '▼' : '▶'}</span>`;
       const icon = `<span class="tree-icon">${isExpanded ? '📂' : '📁'}</span>`;
-      const nameHtml = this.highlightMatch(this.escape(node.name), filterQuery);
+      const nameHtml = this.highlightMatch(node.name, filterQuery);
       const countBadge = `<span class="tree-badge">${node.totalFiles}</span>`;
 
       row.innerHTML = `${arrow}${icon}<span class="file-tree-name" title="${this.escape(node.path)}">${nameHtml}</span>${countBadge}`;
@@ -2088,7 +2109,7 @@ const app = {
         icon = "📦";
       }
 
-      const nameHtml = this.highlightMatch(this.escape(node.name), filterQuery);
+      const nameHtml = this.highlightMatch(node.name, filterQuery);
       const f = node.file;
       const sizeStr = f && f.size > 0 ? (f.size > 1024 * 1024 ? `${(f.size / (1024 * 1024)).toFixed(1)} MB` : `${(f.size / 1024).toFixed(1)} KB`) : '';
       const sizeBadge = sizeStr ? `<span class="tree-size" style="font-size: 10px; color: var(--text-dim); margin-right: 2px;">${sizeStr}</span>` : '';
@@ -3401,45 +3422,161 @@ const app = {
   populateDiffArchiveSelects() {
     const selA = document.getElementById("diff-archive-a");
     const selB = document.getElementById("diff-archive-b");
-    if (!selA || !selB) return;
+    const selParent = document.getElementById("diff-parent-archive");
 
     let opts = '<option value="">-- 请选择日志包 --</option>';
+    let readyArchives = [];
     this.archives.forEach(a => {
       if (a.status === "ready") {
+        readyArchives.push(a);
         const tagText = a.tags && a.tags.length > 0 ? ` [${a.tags.join(", ")}]` : "";
         opts += `<option value="${a.id}">${this.escape(a.filename)}${this.escape(tagText)} (${(a.size / (1024 * 1024)).toFixed(1)} MB)</option>`;
       }
     });
-    selA.innerHTML = opts;
-    selB.innerHTML = opts;
 
-    if (this.archives.length >= 2) {
-      selA.selectedIndex = 1;
-      selB.selectedIndex = 2;
+    if (selA) selA.innerHTML = opts;
+    if (selB) selB.innerHTML = opts;
+    if (selParent) selParent.innerHTML = opts;
+
+    if (readyArchives.length >= 2) {
+      if (selA) selA.selectedIndex = 1;
+      if (selB) selB.selectedIndex = 2;
+    }
+    if (readyArchives.length >= 1 && selParent) {
+      selParent.selectedIndex = 1;
+    }
+  },
+
+  onDiffModeChange() {
+    const isIntra = document.querySelector('input[name="diff-mode"]:checked')?.value === "intra";
+    const secInter = document.getElementById("diff-selector-inter");
+    const secIntra = document.getElementById("diff-selector-intra");
+
+    if (isIntra) {
+      if (secInter) secInter.style.display = "none";
+      if (secIntra) secIntra.style.display = "block";
+      this.onDiffParentArchiveChange();
+    } else {
+      if (secInter) secInter.style.display = "grid";
+      if (secIntra) secIntra.style.display = "none";
+    }
+  },
+
+  async onDiffParentArchiveChange() {
+    const selParent = document.getElementById("diff-parent-archive");
+    const archiveID = selParent?.value;
+    const selSubA = document.getElementById("diff-sub-archive-a");
+    const selSubB = document.getElementById("diff-sub-archive-b");
+    const hint = document.getElementById("diff-sub-hint");
+
+    if (!archiveID) {
+      if (selSubA) selSubA.innerHTML = '<option value="">-- 请先选择外层日志包 --</option>';
+      if (selSubB) selSubB.innerHTML = '<option value="">-- 请先选择外层日志包 --</option>';
+      if (hint) hint.innerHTML = "";
+      return;
+    }
+
+    if (selSubA) selSubA.innerHTML = '<option value="">正在探测包内子包与节点...</option>';
+    if (selSubB) selSubB.innerHTML = '<option value="">正在探测包内子包与节点...</option>';
+    if (hint) hint.innerHTML = "⏳ 正在扫描该压缩包内所有解压出来的独立子压缩包、多层嵌套包与子模块目录...";
+
+    try {
+      const res = await this.api(`/api/archives/${archiveID}/sub-archives`);
+      if (!res.ok) throw new Error(await res.text());
+      const subs = await res.json();
+
+      if (!Array.isArray(subs) || subs.length === 0) {
+        const emptyOpt = '<option value="">未检测到独立子包目录</option>';
+        if (selSubA) selSubA.innerHTML = emptyOpt;
+        if (selSubB) selSubB.innerHTML = emptyOpt;
+        if (hint) {
+          hint.innerHTML = '<span style="color: var(--warning);">⚠️ 该日志包内所有文件均直接平铺在根目录下，未检测到多个独立子包/节点模块。建议使用上方“跨日志包对比”模式。</span>';
+        }
+        return;
+      }
+
+      let subOpts = '<option value="">-- 请选择参与对比的内部子包/模块 --</option>';
+      subs.forEach(s => {
+        const sizeStr = s.total_size > 1024 * 1024 ? `${(s.total_size / (1024 * 1024)).toFixed(1)} MB` : `${(s.total_size / 1024).toFixed(1)} KB`;
+        const nestedBadge = s.has_nested ? " [含深层嵌套]" : "";
+        subOpts += `<option value="${this.escape(s.path)}">📦 ${this.escape(s.name)}${nestedBadge} (${s.total_files} 个文件, ${sizeStr})</option>`;
+      });
+
+      if (selSubA) selSubA.innerHTML = subOpts;
+      if (selSubB) selSubB.innerHTML = subOpts;
+
+      if (subs.length >= 2) {
+        if (selSubA) selSubA.selectedIndex = 1;
+        if (selSubB) selSubB.selectedIndex = 2;
+        if (hint) {
+          hint.innerHTML = `<span style="color: #34d399;">✔ 智能识别出该包内包含 <strong>${subs.length}</strong> 个内部独立子压缩包/节点，已自动为您预选前两项进行控制变量差分诊断。</span>`;
+        }
+      } else if (subs.length === 1) {
+        if (selSubA) selSubA.selectedIndex = 1;
+        if (hint) {
+          hint.innerHTML = `<span style="color: #fbbf24;">ℹ️ 该包仅探测到 1 个子模块 [${subs[0].name}]，同包差分至少需要 2 个不同子包参与对比。</span>`;
+        }
+      }
+    } catch (err) {
+      if (hint) hint.innerHTML = `<span style="color: var(--danger);">探测包内子包失败: ${err.message}</span>`;
     }
   },
 
   async executeDiffAnalysis() {
-    const idA = document.getElementById("diff-archive-a")?.value;
-    const idB = document.getElementById("diff-archive-b")?.value;
-    if (!idA || !idB) {
-      alert("请同时选择基准日志包 A 与待测日志包 B");
-      return;
-    }
-    if (idA === idB) {
-      alert("请选择两份不同的日志包进行差分对比！");
-      return;
+    const isIntra = document.querySelector('input[name="diff-mode"]:checked')?.value === "intra";
+    let idA = "";
+    let idB = "";
+    let subA = "";
+    let subB = "";
+
+    const btnInter = document.getElementById("btn-run-diff-inter");
+    const btnIntra = document.getElementById("btn-run-diff-intra");
+    const activeBtn = isIntra ? btnIntra : btnInter;
+
+    if (isIntra) {
+      const parentID = document.getElementById("diff-parent-archive")?.value;
+      subA = document.getElementById("diff-sub-archive-a")?.value;
+      subB = document.getElementById("diff-sub-archive-b")?.value;
+
+      if (!parentID) {
+        alert("请先选择目标综合聚合日志包");
+        return;
+      }
+      if (!subA || !subB) {
+        alert("请同时选择包内的基准子包 A 与待测子包 B");
+        return;
+      }
+      if (subA === subB) {
+        alert("同一包内对比必须选择两个不同的内部子包或节点！");
+        return;
+      }
+      idA = parentID;
+      idB = parentID;
+    } else {
+      idA = document.getElementById("diff-archive-a")?.value;
+      idB = document.getElementById("diff-archive-b")?.value;
+      if (!idA || !idB) {
+        alert("请同时选择基准日志包 A 与待测日志包 B");
+        return;
+      }
+      if (idA === idB) {
+        alert("跨包对比请选择两份不同的归档包！若对比同一个压缩包内的不同子包，请切换至【同一压缩包内多子包对比】模式。");
+        return;
+      }
     }
 
-    const btn = document.getElementById("btn-run-diff");
-    btn.disabled = true;
-    btn.innerText = "正在深度差分计算...";
+    if (activeBtn) {
+      activeBtn.disabled = true;
+      activeBtn.innerText = "正在深度差分计算...";
+    }
 
     const resCard = document.getElementById("diff-result-card");
     try {
       const res = await this.api("/api/analysis/diff", "POST", {
         archive_id_a: idA,
+        sub_path_a: subA,
         archive_id_b: idB,
+        sub_path_b: subB,
       });
       if (!res.ok) {
         throw new Error(await res.text());
@@ -3468,7 +3605,7 @@ const app = {
           `;
         }).join("");
       } else {
-        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--success); padding: 15px;">✔ 待测包未见突发异质日志模式！</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--success); padding: 15px;">✔ 待测目标未见突发异质日志模式！</td></tr>`;
       }
 
       // 渲染文件增减清单
@@ -3489,8 +3626,10 @@ const app = {
     } catch (err) {
       alert("差分比对失败: " + err.message);
     } finally {
-      btn.disabled = false;
-      btn.innerText = "🚀 执行深度差分比对";
+      if (activeBtn) {
+        activeBtn.disabled = false;
+        activeBtn.innerText = isIntra ? "🚀 执行包内深度差分比对" : "🚀 执行跨包差分比对";
+      }
     }
   },
 

@@ -31,3 +31,34 @@ func TestIsInternalIndexFile(t *testing.T) {
 		}
 	}
 }
+
+func TestIsSafeSubpath(t *testing.T) {
+	cases := []struct {
+		base     string
+		target   string
+		expected bool
+	}{
+		{"/data/logs", "/data/logs", true},
+		{"/data/logs", "/data/logs/syslog.log", true},
+		{"/data/logs", "/data/logs/sub/dir/app.log", true},
+		// 恶意攻击场景 1: 前缀截断绕过 (/data/logs-evil)
+		{"/data/logs", "/data/logs-evil", false},
+		{"/data/logs", "/data/logs-evil/hack.sh", false},
+		// 恶意攻击场景 2: 向上穿越
+		{"/data/logs", "/data/logs/../../etc/passwd", false},
+		{"/data/logs", "/etc/shadow", false},
+		{"/data/logs", "/data", false},
+		// 相对路径测试
+		{"data/logs", "data/logs/sys.log", true},
+		{"data/logs", "data/logs_fake/sys.log", false},
+		{"data/logs", "data/logs/../logs/sys.log", true},
+		{"data/logs", "data/logs/../../outside", false},
+	}
+
+	for _, c := range cases {
+		got := IsSafeSubpath(c.base, c.target)
+		if got != c.expected {
+			t.Errorf("IsSafeSubpath(%q, %q) = %v, expected %v", c.base, c.target, got, c.expected)
+		}
+	}
+}

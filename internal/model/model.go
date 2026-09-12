@@ -1,6 +1,7 @@
 package model
 
 import (
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -116,6 +117,17 @@ type LogFileItem struct {
 	ModTime      time.Time `json:"mod_time"`
 	IsDirectory  bool      `json:"is_directory"`
 	LineCount    int64     `json:"line_count"`
+}
+
+// TreeNodeItem 目录树按需懒加载单节点结构
+type TreeNodeItem struct {
+	ArchiveID    string    `json:"archive_id"`
+	Name         string    `json:"name"`
+	RelativePath string    `json:"relative_path"`
+	Size         int64     `json:"size"`
+	ModTime      time.Time `json:"mod_time"`
+	IsDirectory  bool      `json:"is_directory"`
+	ChildCount   int       `json:"child_count"`
 }
 
 // FaultSeverity 故障等级
@@ -240,12 +252,24 @@ type LogTemplate struct {
 	Files     []string `json:"files,omitempty"`      // 关联文件列表
 }
 
+// SubArchiveItem 归档包内嵌套子压缩包/独立子模块元数据
+type SubArchiveItem struct {
+	Name       string `json:"name"`        // 子包或子模块名称 (如 "node-01")
+	Path       string `json:"path"`        // 相对解压路径 (如 "node-01" 或 "sosreport-node1")
+	TotalFiles int    `json:"total_files"` // 涵盖的总文件数 (包含所有深层递归子文件)
+	TotalSize  int64  `json:"total_size"`  // 占用空间字节数
+	HasNested  bool   `json:"has_nested"`  // 是否包含更深层的嵌套目录或子包
+}
+
 // DiffReport 双日志包横向基准差分对比报告
 type DiffReport struct {
 	ArchiveIDA     string           `json:"archive_id_a"`
 	ArchiveNameA   string           `json:"archive_name_a"`
+	SubPathA       string           `json:"sub_path_a,omitempty"` // 子包相对路径
 	ArchiveIDB     string           `json:"archive_id_b"`
 	ArchiveNameB   string           `json:"archive_name_b"`
+	SubPathB       string           `json:"sub_path_b,omitempty"` // 子包相对路径
+	ScopeType      string           `json:"scope_type,omitempty"` // inter_archive (跨包) 或 intra_archive (同包子包对比)
 	TotalFilesA    int              `json:"total_files_a"`
 	TotalFilesB    int              `json:"total_files_b"`
 	AddedFiles     []string         `json:"added_files,omitempty"`
@@ -362,4 +386,21 @@ func IsInternalIndexFile(p string) bool {
 	name := strings.ToLower(p)
 	return strings.HasSuffix(name, ".lidx") || strings.HasSuffix(name, ".bidx") ||
 		strings.HasSuffix(name, ".lidx.tmp") || strings.HasSuffix(name, ".bidx.tmp")
+}
+
+// IsSafeSubpath 检查 target 是否严格位于 base 根目录之下（包含 base 本身），防止任意路径遍历或前缀截断绕过
+func IsSafeSubpath(base, target string) bool {
+	cleanBase := filepath.Clean(base)
+	cleanTarget := filepath.Clean(target)
+	if cleanBase == cleanTarget {
+		return true
+	}
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
 }

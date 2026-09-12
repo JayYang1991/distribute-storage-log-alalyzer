@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1476,6 +1477,21 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 获取内部子压缩包/独立子节点列表 (用于同包内基准差分比对)
+	if len(parts) == 2 && parts[1] == "sub-archives" {
+		if archive.ExtractPath == "" {
+			http.Error(w, "日志包解包尚未完成，请稍后重试", http.StatusBadRequest)
+			return
+		}
+		subs, err := DetectSubArchives(archive.ExtractPath)
+		if err != nil {
+			subs = []model.SubArchiveItem{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(subs)
+		return
+	}
+
 	// 获取文件树
 	if len(parts) == 2 && parts[1] == "files" {
 		if archive.ExtractPath == "" {
@@ -1486,22 +1502,25 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		// 若日志存放在远程业务节点，代理从该业务节点获取
 		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
 			url := fmt.Sprintf("http://%s:%d/api/worker/storage/files?archive_id=%s&extract_path=%s",
-				archive.StorageNodeIP, archive.StorageNodePort, archive.ID, archive.ExtractPath)
+				archive.StorageNodeIP, archive.StorageNodePort, archive.ID, url.QueryEscape(archive.ExtractPath))
 			resp, err := s.httpClient.Get(url)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				var remoteFiles []*model.LogFileItem
-				if err := json.NewDecoder(resp.Body).Decode(&remoteFiles); err == nil {
-					filtered := make([]*model.LogFileItem, 0, len(remoteFiles))
-					for _, f := range remoteFiles {
-						if !model.IsInternalIndexFile(f.RelativePath) {
-							filtered = append(filtered, f)
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					var remoteFiles []*model.LogFileItem
+					if err := json.NewDecoder(resp.Body).Decode(&remoteFiles); err == nil {
+						resp.Body.Close()
+						filtered := make([]*model.LogFileItem, 0, len(remoteFiles))
+						for _, f := range remoteFiles {
+							if !model.IsInternalIndexFile(f.RelativePath) {
+								filtered = append(filtered, f)
+							}
 						}
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(filtered)
+						return
 					}
-					w.Header().Set("Content-Type", "application/json")
-					_ = json.NewEncoder(w).Encode(filtered)
-					return
 				}
+				resp.Body.Close()
 			}
 		}
 
@@ -1529,6 +1548,107 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 按需懒加载目录节点 (单层直接子项读取，彻底避免一次性遍历海量文件导致网络和页面假死)
+	if len(parts) == 2 && parts[1] == "tree-nodes" {
+		if archive.ExtractPath == "" {
+			http.Error(w, "日志仍在解包分析中，请稍后刷新", http.StatusBadRequest)
+			return
+		}
+
+		subDir := r.URL.Query().Get("dir")
+
+		// 若日志存放在远程业务节点，代理从该业务节点获取
+		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
+			reqURL := fmt.Sprintf("http://%s:%d/api/worker/storage/tree-nodes?archive_id=%s&extract_path=%s&dir=%s",
+				archive.StorageNodeIP, archive.StorageNodePort, archive.ID, url.QueryEscape(archive.ExtractPath), url.QueryEscape(subDir))
+			resp, err := s.httpClient.Get(reqURL)
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					var remoteNodes []*model.TreeNodeItem
+					if err := json.NewDecoder(resp.Body).Decode(&remoteNodes); err == nil {
+						resp.Body.Close()
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(remoteNodes)
+						return
+					}
+				}
+				resp.Body.Close()
+			}
+		}
+
+		targetDir := archive.ExtractPath
+		if subDir != "" {
+			targetDir = filepath.Join(archive.ExtractPath, subDir)
+		}
+		if !model.IsSafeSubpath(archive.ExtractPath, targetDir) {
+			http.Error(w, "非法访问路径", http.StatusForbidden)
+			return
+		}
+
+		cleanTarget := filepath.Clean(targetDir)
+		entries, err := os.ReadDir(cleanTarget)
+		if err != nil {
+			if os.IsNotExist(err) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode([]*model.TreeNodeItem{})
+				return
+			}
+			http.Error(w, fmt.Sprintf("无法读取目录: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		nodes := make([]*model.TreeNodeItem, 0, len(entries))
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			fullChildPath := filepath.Join(cleanTarget, name)
+			rel, rErr := filepath.Rel(archive.ExtractPath, fullChildPath)
+			if rErr != nil || model.IsInternalIndexFile(rel) {
+				continue
+			}
+
+			info, iErr := entry.Info()
+			if iErr != nil {
+				continue
+			}
+
+			isDir := entry.IsDir()
+			childCount := 0
+			if isDir {
+				if subEntries, err := os.ReadDir(fullChildPath); err == nil {
+					for _, se := range subEntries {
+						if !strings.HasPrefix(se.Name(), ".") && !model.IsInternalIndexFile(se.Name()) {
+							childCount++
+						}
+					}
+				}
+			}
+
+			nodes = append(nodes, &model.TreeNodeItem{
+				ArchiveID:    archive.ID,
+				Name:         name,
+				RelativePath: rel,
+				Size:         info.Size(),
+				ModTime:      info.ModTime(),
+				IsDirectory:  isDir,
+				ChildCount:   childCount,
+			})
+		}
+
+		sort.Slice(nodes, func(i, j int) bool {
+			if nodes[i].IsDirectory != nodes[j].IsDirectory {
+				return nodes[i].IsDirectory
+			}
+			return nodes[i].Name < nodes[j].Name
+		})
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(nodes)
+		return
+	}
+
 	// 查看具体文件内容 (带分页行支持)
 	if len(parts) == 2 && parts[1] == "file-content" {
 		relPath := r.URL.Query().Get("path")
@@ -1544,19 +1664,22 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		// 若日志存放在远程业务节点，代理从该节点获取
 		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
 			url := fmt.Sprintf("http://%s:%d/api/worker/storage/file-content?path=%s&extract_path=%s&start_line=%s&limit=%s",
-				archive.StorageNodeIP, archive.StorageNodePort, relPath, archive.ExtractPath,
+				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(relPath), url.QueryEscape(archive.ExtractPath),
 				r.URL.Query().Get("start_line"), r.URL.Query().Get("limit"))
 			resp, err := s.httpClient.Get(url)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.Copy(w, resp.Body)
-				return
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					defer resp.Body.Close()
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.Copy(w, resp.Body)
+					return
+				}
+				resp.Body.Close()
 			}
 		}
 
 		fullPath := filepath.Join(archive.ExtractPath, relPath)
-		if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(archive.ExtractPath)) {
+		if !model.IsSafeSubpath(archive.ExtractPath, fullPath) {
 			http.Error(w, "非法文件路径", http.StatusForbidden)
 			return
 		}
@@ -1603,31 +1726,33 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			remoteURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-file?path=%s&extract_path=%s",
 				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(relPath), url.QueryEscape(archive.ExtractPath))
 			resp, err := s.httpClient.Get(remoteURL)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				fileName := filepath.Base(relPath)
-				if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-					w.Header().Set("Content-Disposition", cd)
-				} else {
-					w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					defer resp.Body.Close()
+					fileName := filepath.Base(relPath)
+					if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+						w.Header().Set("Content-Disposition", cd)
+					} else {
+						w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
+					}
+					if ct := resp.Header.Get("Content-Type"); ct != "" {
+						w.Header().Set("Content-Type", ct)
+					} else {
+						w.Header().Set("Content-Type", "application/octet-stream")
+					}
+					if cl := resp.Header.Get("Content-Length"); cl != "" {
+						w.Header().Set("Content-Length", cl)
+					}
+					_, _ = io.Copy(w, resp.Body)
+					return
 				}
-				if ct := resp.Header.Get("Content-Type"); ct != "" {
-					w.Header().Set("Content-Type", ct)
-				} else {
-					w.Header().Set("Content-Type", "application/octet-stream")
-				}
-				if cl := resp.Header.Get("Content-Length"); cl != "" {
-					w.Header().Set("Content-Length", cl)
-				}
-				_, _ = io.Copy(w, resp.Body)
-				return
+				resp.Body.Close()
 			}
 		}
 
 		// 本地读取解压目录下的指定日志文件
-		cleanExtract := filepath.Clean(archive.ExtractPath)
-		fullPath := filepath.Join(cleanExtract, relPath)
-		if !strings.HasPrefix(filepath.Clean(fullPath), cleanExtract) {
+		fullPath := filepath.Join(archive.ExtractPath, relPath)
+		if !model.IsSafeSubpath(archive.ExtractPath, fullPath) {
 			http.Error(w, "非法文件路径", http.StatusForbidden)
 			return
 		}
@@ -1660,23 +1785,26 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			remoteURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-archive?username=%s&filename=%s",
 				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(archive.Username), url.QueryEscape(archive.Filename))
 			resp, err := http.Get(remoteURL)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-					w.Header().Set("Content-Disposition", cd)
-				} else {
-					w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, archive.Filename))
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					defer resp.Body.Close()
+					if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+						w.Header().Set("Content-Disposition", cd)
+					} else {
+						w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, archive.Filename))
+					}
+					if ct := resp.Header.Get("Content-Type"); ct != "" {
+						w.Header().Set("Content-Type", ct)
+					} else {
+						w.Header().Set("Content-Type", "application/octet-stream")
+					}
+					if cl := resp.Header.Get("Content-Length"); cl != "" {
+						w.Header().Set("Content-Length", cl)
+					}
+					_, _ = io.Copy(w, resp.Body)
+					return
 				}
-				if ct := resp.Header.Get("Content-Type"); ct != "" {
-					w.Header().Set("Content-Type", ct)
-				} else {
-					w.Header().Set("Content-Type", "application/octet-stream")
-				}
-				if cl := resp.Header.Get("Content-Length"); cl != "" {
-					w.Header().Set("Content-Length", cl)
-				}
-				_, _ = io.Copy(w, resp.Body)
-				return
+				resp.Body.Close()
 			}
 		}
 
@@ -1846,11 +1974,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if reqErr == nil {
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := http.DefaultClient.Do(req)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				defer resp.Body.Close()
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.Copy(w, resp.Body)
-				return
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					defer resp.Body.Close()
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.Copy(w, resp.Body)
+					return
+				}
+				resp.Body.Close()
 			}
 		}
 	}
@@ -2603,7 +2734,9 @@ func (s *Server) handleAnalysisDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		ArchiveIDA string `json:"archive_id_a"`
+		SubPathA   string `json:"sub_path_a"`
 		ArchiveIDB string `json:"archive_id_b"`
+		SubPathB   string `json:"sub_path_b"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -2613,7 +2746,7 @@ func (s *Server) handleAnalysisDiff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "archive_id_a 和 archive_id_b 均不能为空", http.StatusBadRequest)
 		return
 	}
-	report, err := s.CompareArchives(req.ArchiveIDA, req.ArchiveIDB)
+	report, err := s.CompareArchiveScopes(req.ArchiveIDA, req.SubPathA, req.ArchiveIDB, req.SubPathB)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -2734,8 +2867,20 @@ func (s *Server) handleSystemUpgrade(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(800 * time.Millisecond)
 		_ = os.RemoveAll(tempDir)
 		if _, err := exec.LookPath("systemctl"); err == nil {
-			cmd := exec.Command("systemctl", "restart", "dist-log-manager")
-			_ = cmd.Run()
+			out, _ := exec.Command("systemctl", "list-units", "--type=service", "--state=running", "--no-pager").Output()
+			restartedAny := false
+			for _, line := range strings.Split(string(out), "\n") {
+				if strings.Contains(line, "dist-log-manager") || strings.Contains(line, "dist-log-worker") {
+					parts := strings.Fields(line)
+					if len(parts) > 0 {
+						_ = exec.Command("systemctl", "restart", parts[0]).Run()
+						restartedAny = true
+					}
+				}
+			}
+			if !restartedAny {
+				_ = exec.Command("systemctl", "restart", "dist-log-manager").Run()
+			}
 		}
 	}()
 }

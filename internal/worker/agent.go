@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/worker/storage/download-archive", a.handleStorageDownloadArchive)
 	mux.HandleFunc("/api/worker/storage/clean-archive", a.handleStorageCleanArchive)
 	mux.HandleFunc("/api/worker/storage/files", a.handleStorageFiles)
+	mux.HandleFunc("/api/worker/storage/tree-nodes", a.handleStorageTreeNodes)
 	mux.HandleFunc("/api/worker/decommission", a.handleDecommission)
 
 	addr := fmt.Sprintf("%s:%d", a.cfg.ListenHost, a.cfg.Port)
@@ -446,7 +448,7 @@ func (a *Agent) handleStorageFileContent(w http.ResponseWriter, r *http.Request)
 	}
 
 	fullPath := filepath.Join(extractPath, relPath)
-	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(extractPath)) {
+	if !model.IsSafeSubpath(extractPath, fullPath) {
 		http.Error(w, "非法访问路径", http.StatusForbidden)
 		return
 	}
@@ -488,9 +490,8 @@ func (a *Agent) handleStorageDownloadFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cleanExtract := filepath.Clean(extractPath)
-	fullPath := filepath.Join(cleanExtract, relPath)
-	if !strings.HasPrefix(filepath.Clean(fullPath), cleanExtract) {
+	fullPath := filepath.Join(extractPath, relPath)
+	if !model.IsSafeSubpath(extractPath, fullPath) {
 		http.Error(w, "非法访问路径", http.StatusForbidden)
 		return
 	}
@@ -526,7 +527,7 @@ func (a *Agent) handleStorageDownloadArchive(w http.ResponseWriter, r *http.Requ
 
 	archiveDir := filepath.Join(a.cfg.DataDir, "users", username, "archives")
 	fullPath := filepath.Join(archiveDir, filename)
-	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(archiveDir)) {
+	if !model.IsSafeSubpath(archiveDir, fullPath) {
 		http.Error(w, "非法访问路径", http.StatusForbidden)
 		return
 	}
@@ -632,6 +633,88 @@ func (a *Agent) handleStorageFiles(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(files)
+}
+
+// handleStorageTreeNodes 按需读取指定目录下的直接子节点
+func (a *Agent) handleStorageTreeNodes(w http.ResponseWriter, r *http.Request) {
+	archiveID := r.URL.Query().Get("archive_id")
+	extractPath := r.URL.Query().Get("extract_path")
+	subDir := r.URL.Query().Get("dir")
+	if extractPath == "" {
+		http.Error(w, "缺少 extract_path", http.StatusBadRequest)
+		return
+	}
+
+	targetDir := extractPath
+	if subDir != "" {
+		targetDir = filepath.Join(extractPath, subDir)
+	}
+	if !model.IsSafeSubpath(extractPath, targetDir) {
+		http.Error(w, "非法访问路径", http.StatusForbidden)
+		return
+	}
+
+	cleanTarget := filepath.Clean(targetDir)
+	entries, err := os.ReadDir(cleanTarget)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]*model.TreeNodeItem{})
+			return
+		}
+		http.Error(w, fmt.Sprintf("无法读取目录: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	nodes := make([]*model.TreeNodeItem, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		fullChildPath := filepath.Join(cleanTarget, name)
+		rel, rErr := filepath.Rel(extractPath, fullChildPath)
+		if rErr != nil || model.IsInternalIndexFile(rel) {
+			continue
+		}
+
+		info, iErr := entry.Info()
+		if iErr != nil {
+			continue
+		}
+
+		isDir := entry.IsDir()
+		childCount := 0
+		if isDir {
+			if subEntries, err := os.ReadDir(fullChildPath); err == nil {
+				for _, se := range subEntries {
+					if !strings.HasPrefix(se.Name(), ".") && !model.IsInternalIndexFile(se.Name()) {
+						childCount++
+					}
+				}
+			}
+		}
+
+		nodes = append(nodes, &model.TreeNodeItem{
+			ArchiveID:    archiveID,
+			Name:         name,
+			RelativePath: rel,
+			Size:         info.Size(),
+			ModTime:      info.ModTime(),
+			IsDirectory:  isDir,
+			ChildCount:   childCount,
+		})
+	}
+
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].IsDirectory != nodes[j].IsDirectory {
+			return nodes[i].IsDirectory
+		}
+		return nodes[i].Name < nodes[j].Name
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(nodes)
 }
 
 // AnalyzeTaskRequest 分布式诊断分析请求

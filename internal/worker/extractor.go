@@ -8,6 +8,7 @@ import (
 	"compress/bzip2"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -187,30 +188,36 @@ func moveDirContents(srcDir, dstDir string) error {
 	return nil
 }
 
-// unpackNestedArchives 递归解压目录中所有嵌套的压缩包与单文件压缩文件 (支持最多 10 层深度)
-func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
-	const maxDepth = 10
-	for depth := 0; depth < maxDepth; depth++ {
-		var nestedList []string
-		_ = filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
-			}
-			if model.IsInternalIndexFile(info.Name()) {
-				return nil
-			}
-			if getArchiveType(path) != archNone {
-				nestedList = append(nestedList, path)
-			}
+// collectArchivesInDir 收集指定目录下的压缩包文件
+func collectArchivesInDir(dir string, queue *[]string) {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
-		})
-
-		if len(nestedList) == 0 {
-			break
 		}
+		if model.IsInternalIndexFile(d.Name()) {
+			return nil
+		}
+		if getArchiveType(path) != archNone {
+			*queue = append(*queue, path)
+		}
+		return nil
+	})
+}
 
-		processedAny := false
-		for _, archPath := range nestedList {
+// unpackNestedArchives 使用增量式工作队列递归解压目录中所有嵌套的压缩包 (避免全盘重复扫描，复杂度从 O(D*N) 降至严格 O(N))
+func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
+	var queue []string
+	collectArchivesInDir(targetDir, &queue)
+
+	const maxDepth = 10
+	depth := 0
+
+	for len(queue) > 0 && depth < maxDepth {
+		depth++
+		currentBatch := queue
+		queue = nil
+
+		for _, archPath := range currentBatch {
 			if _, statErr := os.Stat(archPath); statErr != nil {
 				continue
 			}
@@ -238,7 +245,10 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 				if err == nil {
 					_ = os.Remove(archPath)
 					delete(lineMap, archPath)
-					processedAny = true
+					// 若单文件解压出来的目标文件自身又是某种压缩包 (如 foo.tar.gz 被解成了 foo.tar)，加入队列
+					if getArchiveType(targetFile) != archNone {
+						queue = append(queue, targetFile)
+					}
 				} else {
 					log.Printf("[Extractor] 解压嵌套单文件失败 %s: %v", archPath, err)
 				}
@@ -259,8 +269,8 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 
 				entries, _ := os.ReadDir(tmpDir)
 				var finalDest string
-				if len(entries) == 1 && entries[0].IsDir() {
-					// 压缩包内已经包含单一顶级目录 (例如 sosreport-node1)
+				// 仅当压缩包内部唯一的单一顶级目录名称与该子包名完全一致或以其开头时才直接展平，避免多个子包内普遍存在的常规公共目录名 (如 logs, var, etc) 产生混杂覆盖
+				if len(entries) == 1 && entries[0].IsDir() && (entries[0].Name() == cleanName || strings.EqualFold(entries[0].Name(), cleanName) || strings.HasPrefix(strings.ToLower(entries[0].Name()), strings.ToLower(cleanName))) {
 					innerDirName := entries[0].Name()
 					finalDest = filepath.Join(parentDir, innerDirName)
 					innerSrc := filepath.Join(tmpDir, innerDirName)
@@ -270,7 +280,7 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 						_ = moveDirContents(innerSrc, finalDest)
 					}
 				} else {
-					// 平铺文件或多个顶级目录，解压至以包名命名的专属目录
+					// 否则一律解压至以该压缩包基础名命名的专属目录 (例如 node-healthy/logs/...)，形成清晰的子包命名空间
 					finalDest = filepath.Join(parentDir, cleanName)
 					if _, destErr := os.Stat(finalDest); os.IsNotExist(destErr) {
 						_ = os.Rename(tmpDir, finalDest)
@@ -282,12 +292,10 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 				_ = os.RemoveAll(tmpDir)
 				_ = os.Remove(archPath)
 				delete(lineMap, archPath)
-				processedAny = true
-			}
-		}
 
-		if !processedAny {
-			break
+				// 关键优化：仅对新解压出的 finalDest 局部目录收集下一层嵌套压缩包，避免全盘重复扫描！
+				collectArchivesInDir(finalDest, &queue)
+			}
 		}
 	}
 }
@@ -422,9 +430,9 @@ func untar(r io.Reader, dest string, lineMap map[string]int64) error {
 			return err
 		}
 
-		// 防止 Zip Slip 漏洞
+		// 防止 Zip Slip 漏洞与前缀截断绕过
 		target := filepath.Join(dest, header.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dest)) {
+		if !model.IsSafeSubpath(dest, target) {
 			continue
 		}
 
@@ -462,7 +470,7 @@ func extractZip(src, dest string, lineMap map[string]int64) error {
 
 	for _, f := range r.File {
 		target := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dest)) {
+		if !model.IsSafeSubpath(dest, target) {
 			continue
 		}
 		if f.FileInfo().IsDir() {
@@ -505,7 +513,7 @@ func extract7z(src, dest string, lineMap map[string]int64) error {
 
 	for _, f := range r.File {
 		target := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dest)) {
+		if !model.IsSafeSubpath(dest, target) {
 			continue
 		}
 		if f.FileInfo().IsDir() {

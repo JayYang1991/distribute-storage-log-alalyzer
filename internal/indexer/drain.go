@@ -97,14 +97,70 @@ func PreprocessLog(raw string) (cleaned string, level string, ts string) {
 		}
 	}
 
-	// 3. 通用变量通配替换
-	s = reIPv4Port.ReplaceAllString(s, "<*>")
-	s = reUUID.ReplaceAllString(s, "<*>")
-	s = reHex.ReplaceAllString(s, "<*>")
-	s = reQuoted.ReplaceAllString(s, `"<*>"`)
-	s = reDigits.ReplaceAllString(s, "<*>")
+	// 3. 通用变量通配替换 (前置字符快速短路跳过 + 高性能词法扫描)
+	if strings.IndexByte(s, '.') != -1 {
+		s = reIPv4Port.ReplaceAllString(s, "<*>")
+	}
+	if strings.IndexByte(s, '-') != -1 {
+		s = reUUID.ReplaceAllString(s, "<*>")
+	}
+	if strings.Contains(s, "0x") || strings.Contains(s, "0X") {
+		s = reHex.ReplaceAllString(s, "<*>")
+	}
+	if strings.IndexByte(s, '"') != -1 || strings.IndexByte(s, '\'') != -1 {
+		s = reQuoted.ReplaceAllString(s, `"<*>"`)
+	}
+	s = fastReplaceDigits(s)
 
 	return s, level, ts
+}
+
+func fastReplaceDigits(s string) string {
+	n := len(s)
+	if n == 0 {
+		return s
+	}
+
+	hasDigit := false
+	for i := 0; i < n; i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return s
+	}
+
+	var buf strings.Builder
+	buf.Grow(n)
+
+	i := 0
+	for i < n {
+		b := s[i]
+		if b >= '0' && b <= '9' {
+			isWordBoundaryLeft := (i == 0) || !isWordByte(s[i-1])
+			start := i
+			for i < n && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+			isWordBoundaryRight := (i == n) || !isWordByte(s[i])
+
+			if isWordBoundaryLeft && isWordBoundaryRight {
+				buf.WriteString("<*>")
+			} else {
+				buf.WriteString(s[start:i])
+			}
+		} else {
+			buf.WriteByte(b)
+			i++
+		}
+	}
+	return buf.String()
+}
+
+func isWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
 // AddLog 向聚类器投递一条日志
@@ -301,6 +357,13 @@ func (d *DrainMiner) GetTemplates() []model.LogTemplate {
 	return res
 }
 
+var mineBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 1024*1024)
+		return &b
+	},
+}
+
 // MineFile 流式分析单个日志文件，提取模板
 func (d *DrainMiner) MineFile(filePath string, maxLines int) error {
 	f, err := os.Open(filePath)
@@ -309,9 +372,11 @@ func (d *DrainMiner) MineFile(filePath string, maxLines int) error {
 	}
 	defer f.Close()
 
+	bufPtr := mineBufPool.Get().(*[]byte)
+	defer mineBufPool.Put(bufPtr)
+
 	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	count := 0
 	for scanner.Scan() {
