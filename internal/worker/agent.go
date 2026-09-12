@@ -34,6 +34,7 @@ type Agent struct {
 	alarmCooldown    map[string]time.Time
 	alarmMu          sync.Mutex
 	isDecommissioned bool
+	lastDiskCheck    time.Time
 }
 
 func NewAgent(cfg *config.Config) *Agent {
@@ -798,17 +799,30 @@ func (a *Agent) checkSelfHealth(res model.SystemResource) {
 		)
 	}
 
-	// 2. 存储挂载目录只读与 I/O 异常检测
-	testFile := filepath.Join(a.cfg.DataDir, ".write_health_test.tmp")
-	if err := os.WriteFile(testFile, []byte("ok"), 0644); err != nil {
-		a.ReportAlarm(
-			model.AlarmTypeDiskReadOnly,
-			model.SeverityCritical,
-			"业务存储文件系统发生只读或 I/O 写入故障",
-			fmt.Sprintf("计算节点 %s 存储目录 %s 无法写入文件: %v，可能硬盘损坏或被内核置为只读模式", a.cfg.NodeName, a.cfg.DataDir, err),
-		)
-	} else {
-		_ = os.Remove(testFile)
+	// 2. 存储挂载目录只读与 I/O 异常检测 (降频至 60s 且复用固定 marker 文件，避免频繁 create/unlink 冲击分布式存储 MDS)
+	now := time.Now()
+	if now.Sub(a.lastDiskCheck) >= 60*time.Second {
+		a.lastDiskCheck = now
+		markerFile := filepath.Join(a.cfg.DataDir, ".write_health.marker")
+		f, err := os.OpenFile(markerFile, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			a.ReportAlarm(
+				model.AlarmTypeDiskReadOnly,
+				model.SeverityCritical,
+				"业务存储文件系统发生只读或 I/O 写入故障",
+				fmt.Sprintf("计算节点 %s 存储目录 %s 无法打开/创建测试标记: %v，可能硬盘损坏或被内核置为只读模式", a.cfg.NodeName, a.cfg.DataDir, err),
+			)
+		} else {
+			if _, wErr := f.WriteAt([]byte("ok\n"), 0); wErr != nil {
+				a.ReportAlarm(
+					model.AlarmTypeDiskReadOnly,
+					model.SeverityCritical,
+					"业务存储文件系统发生只读或 I/O 写入故障",
+					fmt.Sprintf("计算节点 %s 存储目录 %s 无法写入测试标记: %v", a.cfg.NodeName, a.cfg.DataDir, wErr),
+				)
+			}
+			_ = f.Close()
+		}
 	}
 
 	// 3. 内存超高使用率检测

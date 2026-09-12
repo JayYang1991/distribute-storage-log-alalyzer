@@ -439,7 +439,7 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	var lineNum int64 = 0
-	var ring []string
+	ring := newByteRing(contextLines)
 	var pending []*pendingSearchHit
 
 	checkCounter := 0
@@ -473,9 +473,7 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 		lineLevel := detectLogLevelBytes(lineBytes)
 		if levelFilter != "" && levelFilter != "ALL" {
 			if !matchLogLevel(lineLevel, levelFilter) {
-				if contextLines > 0 {
-					pushToRing(&ring, string(lineBytes), contextLines)
-				}
+				ring.push(lineBytes)
 				continue
 			}
 		}
@@ -498,9 +496,7 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 					hasCandidate = bytesContainsFoldASCII(lineBytes, literalKw)
 				}
 				if !hasCandidate {
-					if contextLines > 0 {
-						pushToRing(&ring, string(lineBytes), contextLines)
-					}
+					ring.push(lineBytes)
 					continue
 				}
 			}
@@ -510,15 +506,12 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 		}
 
 		if !matched {
-			if contextLines > 0 {
-				pushToRing(&ring, string(lineBytes), contextLines)
-			}
+			ring.push(lineBytes)
 			continue
 		}
 
 		lineText := string(lineBytes)
-		contextBefore := make([]string, len(ring))
-		copy(contextBefore, ring)
+		contextBefore := ring.toStrings()
 
 		newHit := model.SearchHit{
 			FilePath:      relPath,
@@ -539,9 +532,7 @@ func searchChunk(ctx context.Context, fullPath, relPath string, chunk fileChunk,
 			})
 		}
 
-		if contextLines > 0 {
-			pushToRing(&ring, lineText, contextLines)
-		}
+		ring.push(lineBytes)
 	}
 
 	for _, p := range pending {
@@ -692,7 +683,7 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	var hits []model.SearchHit
-	var ring []string
+	ring := newByteRing(contextLines)
 	var pending []*pendingSearchHit
 
 	var lineNum int64 = 0
@@ -733,9 +724,7 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 		lineLevel := detectLogLevelBytes(lineBytes)
 		if levelFilter != "" && levelFilter != "ALL" {
 			if !matchLogLevel(lineLevel, levelFilter) {
-				if contextLines > 0 {
-					pushToRing(&ring, string(lineBytes), contextLines)
-				}
+				ring.push(lineBytes)
 				continue
 			}
 		}
@@ -760,9 +749,7 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 					hasCandidate = bytesContainsFoldASCII(lineBytes, literalKw)
 				}
 				if !hasCandidate {
-					if contextLines > 0 {
-						pushToRing(&ring, string(lineBytes), contextLines)
-					}
+					ring.push(lineBytes)
 					continue
 				}
 			}
@@ -772,16 +759,13 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 		}
 
 		if !matched {
-			if contextLines > 0 {
-				pushToRing(&ring, string(lineBytes), contextLines)
-			}
+			ring.push(lineBytes)
 			continue
 		}
 
 		// 4. 命中：此时才分配 string 构造 SearchHit 实体
 		lineText := string(lineBytes)
-		contextBefore := make([]string, len(ring))
-		copy(contextBefore, ring)
+		contextBefore := ring.toStrings()
 
 		newHit := model.SearchHit{
 			FilePath:      relPath,
@@ -806,9 +790,7 @@ func searchInSingleFile(ctx context.Context, fullPath, relPath string, reg *rege
 		}
 
 		// 5. 将当前行推入前序环形缓冲区
-		if contextLines > 0 {
-			pushToRing(&ring, lineText, contextLines)
-		}
+		ring.push(lineBytes)
 	}
 
 	// 处理尾部未填满的 pending hits
@@ -903,6 +885,54 @@ func detectLogLevelBytes(b []byte) string {
 	return "INFO"
 }
 
+type byteRing struct {
+	lines  [][]byte
+	head   int
+	count  int
+	maxCap int
+}
+
+func newByteRing(maxCap int) *byteRing {
+	if maxCap <= 0 {
+		return nil
+	}
+	r := &byteRing{
+		lines:  make([][]byte, maxCap),
+		maxCap: maxCap,
+	}
+	for i := range r.lines {
+		r.lines[i] = make([]byte, 0, 256)
+	}
+	return r
+}
+
+func (r *byteRing) push(b []byte) {
+	if r == nil || r.maxCap <= 0 {
+		return
+	}
+	var slot int
+	if r.count < r.maxCap {
+		slot = (r.head + r.count) % r.maxCap
+		r.count++
+	} else {
+		slot = r.head
+		r.head = (r.head + 1) % r.maxCap
+	}
+	r.lines[slot] = append(r.lines[slot][:0], b...)
+}
+
+func (r *byteRing) toStrings() []string {
+	if r == nil || r.count == 0 {
+		return nil
+	}
+	res := make([]string, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := (r.head + i) % r.maxCap
+		res[i] = string(r.lines[idx])
+	}
+	return res
+}
+
 func pushToRing(ring *[]string, line string, maxCap int) {
 	if maxCap <= 0 {
 		return
@@ -953,7 +983,30 @@ var timeRegexList = []*regexp.Regexp{
 	regexp.MustCompile(`\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`),
 }
 
+func isDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
 func extractTimestamp(line string) string {
+	// Fast Path: 绝大多数 Linux 存储日志（Ceph/HDFS/MinIO/syslog）以 ISO 8601 或 YYYY-MM-DD 开头
+	if len(line) >= 19 {
+		b := line[:19]
+		if (b[4] == '-' || b[4] == '/') && (b[7] == '-' || b[7] == '/') &&
+			(b[10] == ' ' || b[10] == 'T') && b[13] == ':' && b[16] == ':' &&
+			isDigit(b[0]) && isDigit(b[1]) && isDigit(b[2]) && isDigit(b[3]) &&
+			isDigit(b[5]) && isDigit(b[6]) && isDigit(b[8]) && isDigit(b[9]) &&
+			isDigit(b[11]) && isDigit(b[12]) && isDigit(b[14]) && isDigit(b[15]) &&
+			isDigit(b[17]) && isDigit(b[18]) {
+			end := 19
+			if len(line) > 20 && line[19] == '.' {
+				end = 20
+				for end < len(line) && isDigit(line[end]) {
+					end++
+				}
+			}
+			return line[:end]
+		}
+	}
 	for _, reg := range timeRegexList {
 		if match := reg.FindString(line); match != "" {
 			return match

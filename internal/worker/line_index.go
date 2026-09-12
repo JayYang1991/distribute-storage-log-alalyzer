@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 const (
@@ -23,13 +25,37 @@ type SparseLineIndex struct {
 	ModTimeNano int64
 }
 
+const numIndexStripes = 64
+
+type indexStripeLock struct {
+	locks [numIndexStripes]sync.Mutex
+}
+
+func (s *indexStripeLock) getLock(key string) *sync.Mutex {
+	var h uint32
+	for i := 0; i < len(key); i++ {
+		h = 31*h + uint32(key[i])
+	}
+	return &s.locks[h%numIndexStripes]
+}
+
 var (
-	indexBuildMu sync.Mutex
-	indexMemoryCache = make(map[string]*SparseLineIndex)
-	indexCacheMu     sync.RWMutex
+	indexStripes  indexStripeLock
+	indexLRUCache *lru.Cache[string, *SparseLineIndex]
+	indexLRUOnce  sync.Once
 )
 
-// GetOrBuildLineIndex 获取或构建指定文件的稀疏行号索引
+func getIndexLRUCache() *lru.Cache[string, *SparseLineIndex] {
+	indexLRUOnce.Do(func() {
+		cache, err := lru.New[string, *SparseLineIndex](1000)
+		if err == nil {
+			indexLRUCache = cache
+		}
+	})
+	return indexLRUCache
+}
+
+// GetOrBuildLineIndex 获取或构建指定文件的稀疏行号索引 (支持多文件并发构建，带 LRU 容量上限)
 func GetOrBuildLineIndex(filePath string) (*SparseLineIndex, error) {
 	fi, err := os.Stat(filePath)
 	if err != nil {
@@ -37,39 +63,40 @@ func GetOrBuildLineIndex(filePath string) (*SparseLineIndex, error) {
 	}
 
 	if fi.Size() < minFileSizeBytesForIndex {
-		return nil, nil // 小于 4MB 的小文件无需构建索引
+		return nil, nil // 小于阈值无需构建索引
 	}
 
-	// 1. 检查内存缓存
-	indexCacheMu.RLock()
-	idx, ok := indexMemoryCache[filePath]
-	indexCacheMu.RUnlock()
-	if ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
-		return idx, nil
+	cache := getIndexLRUCache()
+
+	// 1. 检查内存 LRU 缓存
+	if cache != nil {
+		if idx, ok := cache.Get(filePath); ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
+			return idx, nil
+		}
 	}
 
 	// 2. 检查磁盘索引文件 (.lidx)
 	idxPath := filePath + ".lidx"
 	if idx, err := loadLineIndexFromDisk(idxPath, fi.Size(), fi.ModTime().UnixNano()); err == nil && idx != nil {
-		indexCacheMu.Lock()
-		indexMemoryCache[filePath] = idx
-		indexCacheMu.Unlock()
+		if cache != nil {
+			cache.Add(filePath, idx)
+		}
 		return idx, nil
 	}
 
-	// 3. 磁盘不存在或已过期，执行构建 (单飞锁防止并发重复构建)
-	indexBuildMu.Lock()
-	defer indexBuildMu.Unlock()
+	// 3. 条带化细粒度单飞构建，允许不同文件并行构建，同文件并发防重
+	lock := indexStripes.getLock(filePath)
+	lock.Lock()
+	defer lock.Unlock()
 
 	// 双重检查
-	indexCacheMu.RLock()
-	if idx, ok := indexMemoryCache[filePath]; ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
-		indexCacheMu.RUnlock()
-		return idx, nil
+	if cache != nil {
+		if idx, ok := cache.Get(filePath); ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
+			return idx, nil
+		}
 	}
-	indexCacheMu.RUnlock()
 
-	idx, err = buildSparseLineIndex(filePath, fi.Size(), fi.ModTime().UnixNano())
+	idx, err := buildSparseLineIndex(filePath, fi.Size(), fi.ModTime().UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -79,9 +106,9 @@ func GetOrBuildLineIndex(filePath string) (*SparseLineIndex, error) {
 		_ = saveLineIndexToDisk(p, data)
 	}(idxPath, idx)
 
-	indexCacheMu.Lock()
-	indexMemoryCache[filePath] = idx
-	indexCacheMu.Unlock()
+	if cache != nil {
+		cache.Add(filePath, idx)
+	}
 
 	return idx, nil
 }
@@ -190,6 +217,9 @@ func saveLineIndexToDisk(idxPath string, idx *SparseLineIndex) error {
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+
+	bw := bufio.NewWriterSize(f, 64*1024)
 
 	header := make([]byte, 36)
 	copy(header[0:8], indexMagic)
@@ -198,14 +228,17 @@ func saveLineIndexToDisk(idxPath string, idx *SparseLineIndex) error {
 	binary.LittleEndian.PutUint64(header[20:28], uint64(idx.FileSize))
 	binary.LittleEndian.PutUint64(header[28:36], uint64(idx.ModTimeNano))
 
-	if _, err := f.Write(header); err != nil {
-		_ = f.Close()
+	if _, err := bw.Write(header); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
 
-	if err := binary.Write(f, binary.LittleEndian, idx.Offsets); err != nil {
-		_ = f.Close()
+	if err := binary.Write(bw, binary.LittleEndian, idx.Offsets); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if err := bw.Flush(); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}

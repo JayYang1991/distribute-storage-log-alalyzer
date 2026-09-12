@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -236,5 +238,131 @@ func TestSearchWithBloomSkip(t *testing.T) {
 	}
 
 	t.Logf("✔ 布隆过滤跳过 + 绝对行号对齐测试通过！命中行: %d, 内容: %s", hits[0].LineNumber, hits[0].Content)
+}
+
+// 模拟优化前的旧版本单文件扫描 (每行强制 string 转换与切片搬移，命中时走全量正则)
+func searchInSingleFileLegacy(fullPath, relPath string, literalKw []byte, levelFilter string, contextLines int, maxHits int) []model.SearchHit {
+	f, _ := os.Open(fullPath)
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	bufPtr := searchBufPool.Get().(*[]byte)
+	defer searchBufPool.Put(bufPtr)
+	scanner.Buffer(*bufPtr, 10*1024*1024)
+
+	var hits []model.SearchHit
+	var ring []string
+	var pending []*pendingSearchHit
+	var lineNum int64
+
+	for scanner.Scan() {
+		lineNum++
+		lineBytes := scanner.Bytes()
+		if len(pending) > 0 {
+			lineText := string(lineBytes)
+			var active []*pendingSearchHit
+			for _, p := range pending {
+				p.hit.ContextAfter = append(p.hit.ContextAfter, lineText)
+				p.remaining--
+				if p.remaining <= 0 {
+					hits = append(hits, p.hit)
+				} else {
+					active = append(active, p)
+				}
+			}
+			pending = active
+			if len(hits) >= maxHits {
+				break
+			}
+		}
+
+		lineLevel := detectLogLevelBytes(lineBytes)
+		if levelFilter != "" && levelFilter != "ALL" {
+			if !matchLogLevel(lineLevel, levelFilter) {
+				if contextLines > 0 {
+					pushToRing(&ring, string(lineBytes), contextLines)
+				}
+				continue
+			}
+		}
+
+		matched := bytes.Contains(lineBytes, literalKw)
+		if !matched {
+			if contextLines > 0 {
+				pushToRing(&ring, string(lineBytes), contextLines)
+			}
+			continue
+		}
+
+		lineText := string(lineBytes)
+		contextBefore := make([]string, len(ring))
+		copy(contextBefore, ring)
+
+		newHit := model.SearchHit{
+			FilePath:      relPath,
+			LineNumber:    lineNum,
+			Content:       lineText,
+			Level:         lineLevel,
+			Timestamp:     timeRegexList[0].FindString(lineText),
+			ContextBefore: contextBefore,
+			ContextAfter:  make([]string, 0, contextLines),
+		}
+		if contextLines == 0 {
+			hits = append(hits, newHit)
+			if len(hits) >= maxHits {
+				break
+			}
+		} else {
+			pending = append(pending, &pendingSearchHit{hit: newHit, remaining: contextLines})
+		}
+		if contextLines > 0 {
+			pushToRing(&ring, lineText, contextLines)
+		}
+	}
+	for _, p := range pending {
+		hits = append(hits, p.hit)
+	}
+	return hits
+}
+
+func BenchmarkSearch_1_Legacy(b *testing.B) {
+	tempDir, err := os.MkdirTemp("", "search_bench_leg_*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	generateSearchBenchmarkFiles(b, tempDir, 1, 10000)
+	testFile := filepath.Join(tempDir, "service_0.log")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		hits := searchInSingleFileLegacy(testFile, "service_0.log", []byte("connection reset"), "ERROR", 2, 50)
+		if len(hits) == 0 {
+			b.Fatal("未命中")
+		}
+	}
+}
+
+func BenchmarkSearch_2_Optimized(b *testing.B) {
+	tempDir, err := os.MkdirTemp("", "search_bench_opt_*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	generateSearchBenchmarkFiles(b, tempDir, 1, 10000)
+	testFile := filepath.Join(tempDir, "service_0.log")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		hits := searchInSingleFile(context.Background(), testFile, "service_0.log", nil, []byte("connection reset"), true, false, "ERROR", 2, 50)
+		if len(hits) == 0 {
+			b.Fatal("未命中")
+		}
+	}
 }
 

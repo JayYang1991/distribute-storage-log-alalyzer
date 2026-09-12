@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"dist-log-analyzer/internal/store"
@@ -15,6 +16,7 @@ type HASyncEngine struct {
 	ha    *HAManager
 	store *store.Store
 
+	lastTxID      int
 	lastSyncTime  time.Time
 	lastSyncBytes int64
 	syncStatus    string // synced | syncing | error | none
@@ -76,6 +78,10 @@ func (e *HASyncEngine) syncOnce() {
 		return
 	}
 	req.Header.Set("X-Cluster-Token", e.ha.cfg.ClusterToken)
+	if e.lastTxID > 0 {
+		req.Header.Set("If-None-Match", fmt.Sprintf(`W/"tx-%d"`, e.lastTxID))
+		req.Header.Set("X-Last-TxID", strconv.Itoa(e.lastTxID))
+	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -85,6 +91,14 @@ func (e *HASyncEngine) syncOnce() {
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		// 主节点数据事务版本无更新，跳过全量文件下载与数据库热重载
+		e.syncStatus = "synced"
+		e.syncErr = nil
+		e.lastSyncTime = time.Now()
+		return
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		e.syncStatus = "error"
@@ -101,10 +115,19 @@ func (e *HASyncEngine) syncOnce() {
 		return
 	}
 
+	// 更新同步后的最新 TxID
+	if headerTxID := resp.Header.Get("X-DB-TxID"); headerTxID != "" {
+		if id, pErr := strconv.Atoi(headerTxID); pErr == nil {
+			e.lastTxID = id
+		}
+	} else if currentTxID, cErr := e.store.CurrentTxID(); cErr == nil {
+		e.lastTxID = currentTxID
+	}
+
 	e.syncStatus = "synced"
 	e.syncErr = nil
 	e.lastSyncTime = time.Now()
 	e.lastSyncBytes = bytesWritten
 
-	log.Printf("[HA Sync] 备机成功从主节点同步最新数据快照 (重载大小: %d 字节)", bytesWritten)
+	log.Printf("[HA Sync] 备机成功从主节点同步最新数据快照 (重载大小: %d 字节, TxID: %d)", bytesWritten, e.lastTxID)
 }

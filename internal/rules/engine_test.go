@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -208,6 +209,39 @@ func BenchmarkDiagnoseDirectory(b *testing.B) {
 		_, err := engine.DiagnoseDirectory("bench-01", "user-bench", "bench.tar.gz", tempDir)
 		if err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDiagnoseLine_1_Legacy(b *testing.B) {
+	sample := []byte("2026-09-12 20:30:15 [ERROR] osd.12 pg 2.1f peering blocked: waiting for replica ack")
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// 旧逻辑：每行在堆上重新分配小写切片，正则解析时间戳
+		lower := bytes.ToLower(sample)
+		ts := timeRegs[0].FindString(string(sample))
+		if len(lower) == 0 || ts == "" {
+			b.Fatal("invalid")
+		}
+	}
+}
+
+func BenchmarkDiagnoseLine_2_Optimized(b *testing.B) {
+	sample := []byte("2026-09-12 20:30:15 [ERROR] osd.12 pg 2.1f peering blocked: waiting for replica ack")
+	sampleStr := string(sample)
+	buf := make([]byte, len(sample))
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// 新逻辑：复用切片零堆分配，Fast-Path 时间戳检测
+		lower := toLowerBytes(sample, buf)
+		ts := extractTimestamp(sampleStr)
+		if len(lower) == 0 || ts == "" {
+			b.Fatal("invalid")
 		}
 	}
 }

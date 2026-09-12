@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -83,6 +84,23 @@ func (s *Store) Close() error {
 		return s.db.Close()
 	}
 	return nil
+}
+
+// CurrentTxID 获取 bbolt 当前最新事务版本号 (只读视图并发安全)
+func (s *Store) CurrentTxID() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.db == nil {
+		return 0, errors.New("database is not open")
+	}
+
+	var txID int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		txID = tx.ID()
+		return nil
+	})
+	return txID, err
 }
 
 // ExportSnapshot 导出 bbolt 当前数据快照流 (并发安全)
@@ -246,7 +264,7 @@ func (s *Store) CalculateUserStorageUsage(username string) (int64, error) {
 	return totalSize, err
 }
 
-// CheckUserQuota 校验用户存储配额
+// CheckUserQuota 校验用户存储配额 (优先利用缓存字段，避免无谓磁盘遍历)
 func (s *Store) CheckUserQuota(username string, incomingSize int64) error {
 	user, err := s.GetUserByUsername(username)
 	if err != nil {
@@ -255,15 +273,33 @@ func (s *Store) CheckUserQuota(username string, incomingSize int64) error {
 	if user.SpaceQuotaBytes <= 0 {
 		return nil // 无限制
 	}
-	usage, err := s.CalculateUserStorageUsage(username)
-	if err != nil {
-		return err
+	usage := user.UsedStorageBytes
+	if usage == 0 {
+		// 初始懒加载：若缓存为 0 且存在物理目录则同步一次
+		if actual, err := s.CalculateUserStorageUsage(username); err == nil && actual > 0 {
+			usage = actual
+			user.UsedStorageBytes = actual
+			_ = s.SaveUser(user)
+		}
 	}
 	if usage+incomingSize > user.SpaceQuotaBytes {
 		return fmt.Errorf("存储空间配额不足: 当前使用 %.2f MB, 尝试增加 %.2f MB, 配额上限 %.2f MB",
 			float64(usage)/(1024*1024), float64(incomingSize)/(1024*1024), float64(user.SpaceQuotaBytes)/(1024*1024))
 	}
 	return nil
+}
+
+// AdjustUserStorageUsage 增量更新用户的已用存储空间 (O(1) 操作，零磁盘 I/O)
+func (s *Store) AdjustUserStorageUsage(username string, deltaBytes int64) error {
+	u, err := s.GetUserByUsername(username)
+	if err != nil || u == nil {
+		return err
+	}
+	u.UsedStorageBytes += deltaBytes
+	if u.UsedStorageBytes < 0 {
+		u.UsedStorageBytes = 0
+	}
+	return s.SaveUser(u)
 }
 
 // ================= 用户数据存取 =================
@@ -305,10 +341,13 @@ func (s *Store) ListUsers() ([]*model.User, error) {
 			return nil
 		})
 	})
-	// 动态更新已用空间
+	// 懒初始化：仅对存储使用量为 0 的用户做一次冷启动校准，后续完全依赖增量维护
 	for _, u := range list {
-		if usage, err := s.CalculateUserStorageUsage(u.Username); err == nil {
-			u.UsedStorageBytes = usage
+		if u.UsedStorageBytes == 0 {
+			if usage, err := s.CalculateUserStorageUsage(u.Username); err == nil && usage > 0 {
+				u.UsedStorageBytes = usage
+				_ = s.SaveUser(u)
+			}
 		}
 	}
 	return list, err
@@ -499,10 +538,15 @@ func (s *Store) SaveArchive(a *model.LogArchive) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	oldArchive, _ := s.GetArchive(a.ID)
+	err = s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketArchives)
 		return b.Put([]byte(a.ID), data)
 	})
+	if err == nil && oldArchive == nil && a.Size > 0 && a.Username != "" {
+		_ = s.AdjustUserStorageUsage(a.Username, a.Size)
+	}
+	return err
 }
 
 func (s *Store) GetArchive(id string) (*model.LogArchive, error) {
@@ -559,6 +603,10 @@ func (s *Store) DeleteArchive(id, username string, isAdmin bool) error {
 	// 2. 删除关联的诊断报告
 	_ = s.DeleteReport(id)
 
+	if a.Size > 0 && a.Username != "" {
+		_ = s.AdjustUserStorageUsage(a.Username, -a.Size)
+	}
+
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketArchives)
 		return b.Delete([]byte(id))
@@ -614,20 +662,59 @@ func (s *Store) DeleteRule(id string) error {
 	})
 }
 
-// ================= 诊断报告 =================
+// ================= 诊断报告 (冷热分离) =================
+
+func (s *Store) reportFilePath(archiveID string) string {
+	return filepath.Join(s.dataDir, "reports", archiveID+".json")
+}
 
 func (s *Store) SaveReport(rep *model.DiagnosisReport) error {
-	data, err := json.Marshal(rep)
-	if err != nil {
-		return err
+	// 1. 冷数据：将完整报告（包含海量 Events）写入独立文件，先写临时文件再原子重命名
+	reportsDir := filepath.Join(s.dataDir, "reports")
+	if err := os.MkdirAll(reportsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create reports dir: %w", err)
 	}
+
+	fullData, err := json.Marshal(rep)
+	if err != nil {
+		return fmt.Errorf("failed to marshal full report: %w", err)
+	}
+
+	tmpPath := filepath.Join(reportsDir, fmt.Sprintf("%s.tmp.%d", rep.ArchiveID, time.Now().UnixNano()))
+	if err := os.WriteFile(tmpPath, fullData, 0644); err != nil {
+		return fmt.Errorf("failed to write full report file: %w", err)
+	}
+	targetPath := s.reportFilePath(rep.ArchiveID)
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename report file: %w", err)
+	}
+
+	// 2. 热数据：剥离 Events，仅保留摘要元数据存入 BoltDB，降低 B+ 树写放大和锁持有时间
+	meta := *rep
+	meta.Events = nil
+	metaData, err := json.Marshal(&meta)
+	if err != nil {
+		return fmt.Errorf("failed to marshal report meta: %w", err)
+	}
+
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketReports)
-		return b.Put([]byte(rep.ArchiveID), data)
+		return b.Put([]byte(rep.ArchiveID), metaData)
 	})
 }
 
 func (s *Store) GetReport(archiveID string) (*model.DiagnosisReport, error) {
+	// 1. 优先尝试从独立报告文件读取完整报告
+	filePath := s.reportFilePath(archiveID)
+	if fileData, err := os.ReadFile(filePath); err == nil {
+		var rep model.DiagnosisReport
+		if err := json.Unmarshal(fileData, &rep); err == nil {
+			return &rep, nil
+		}
+	}
+
+	// 2. 降级兜底（兼容历史全量存储在 BoltDB 中的旧报告）
 	var rep *model.DiagnosisReport
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketReports)
@@ -641,11 +728,16 @@ func (s *Store) GetReport(archiveID string) (*model.DiagnosisReport, error) {
 }
 
 func (s *Store) DeleteReport(archiveID string) error {
+	// 1. 删除磁盘文件
+	_ = os.Remove(s.reportFilePath(archiveID))
+
+	// 2. 删除 BoltDB 元数据
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketReports)
 		return b.Delete([]byte(archiveID))
 	})
 }
+
 
 // ================= 系统设置与高可用网络配置 =================
 
@@ -810,14 +902,10 @@ func (s *Store) ListAlarms(statusFilter string) ([]*model.Alarm, error) {
 		return nil, err
 	}
 
-	// 内存按 LastOccurAt 降序排序
-	for i := 0; i < len(list)-1; i++ {
-		for j := i + 1; j < len(list); j++ {
-			if list[i].LastOccurAt.Before(list[j].LastOccurAt) {
-				list[i], list[j] = list[j], list[i]
-			}
-		}
-	}
+	// 内存按 LastOccurAt 降序快速排序
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].LastOccurAt.After(list[j].LastOccurAt)
+	})
 	return list, nil
 }
 

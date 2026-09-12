@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/bzip2"
-	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +17,7 @@ import (
 	"dist-log-analyzer/internal/model"
 
 	"github.com/bodgit/sevenzip"
+	"github.com/klauspost/compress/gzip"
 )
 
 var extractBufPool = sync.Pool{
@@ -25,6 +25,38 @@ var extractBufPool = sync.Pool{
 		b := make([]byte, 2*1024*1024) // 2MB 大缓冲区，提升超大日志包解压写盘吞吐
 		return &b
 	},
+}
+
+// 动态自适应写缓冲区对象池，避免为数千个小文件重复分配 2MB 堆内存
+var smallWriterPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriterSize(nil, 64*1024) // 64KB 适配中小型日志
+	},
+}
+
+var largeWriterPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriterSize(nil, 1*1024*1024) // 1MB 适配超大日志文件
+	},
+}
+
+func getBufioWriter(w io.Writer, approxSize int64) (*bufio.Writer, func()) {
+	if approxSize > 0 && approxSize < 256*1024 {
+		bw := smallWriterPool.Get().(*bufio.Writer)
+		bw.Reset(w)
+		return bw, func() {
+			_ = bw.Flush()
+			bw.Reset(nil)
+			smallWriterPool.Put(bw)
+		}
+	}
+	bw := largeWriterPool.Get().(*bufio.Writer)
+	bw.Reset(w)
+	return bw, func() {
+		_ = bw.Flush()
+		bw.Reset(nil)
+		largeWriterPool.Put(bw)
+	}
 }
 
 // lineCountingWriter 包装 io.Writer，在数据写入磁盘的同时统计换行符数量，实现零二次磁盘 I/O
@@ -405,10 +437,10 @@ func untar(r io.Reader, dest string, lineMap map[string]int64) error {
 			if err != nil {
 				continue
 			}
-			bw := bufio.NewWriterSize(outFile, 2*1024*1024)
+			bw, release := getBufioWriter(outFile, header.Size)
 			cw := &lineCountingWriter{w: bw}
 			_, _ = io.CopyBuffer(cw, tr, *bufPtr)
-			_ = bw.Flush()
+			release()
 			outFile.Close()
 			if lineMap != nil {
 				lineMap[target] = cw.lines
@@ -448,10 +480,10 @@ func extractZip(src, dest string, lineMap map[string]int64) error {
 			outFile.Close()
 			continue
 		}
-		bw := bufio.NewWriterSize(outFile, 2*1024*1024)
+		bw, release := getBufioWriter(outFile, f.FileInfo().Size())
 		cw := &lineCountingWriter{w: bw}
 		_, _ = io.CopyBuffer(cw, rc, *bufPtr)
-		_ = bw.Flush()
+		release()
 		outFile.Close()
 		rc.Close()
 		if lineMap != nil {
@@ -495,10 +527,10 @@ func extract7z(src, dest string, lineMap map[string]int64) error {
 			outFile.Close()
 			continue
 		}
-		bw := bufio.NewWriterSize(outFile, 2*1024*1024)
+		bw, release := getBufioWriter(outFile, f.FileInfo().Size())
 		cw := &lineCountingWriter{w: bw}
 		_, _ = io.CopyBuffer(cw, rc, *bufPtr)
-		_ = bw.Flush()
+		release()
 		outFile.Close()
 		rc.Close()
 		if lineMap != nil {
@@ -529,8 +561,8 @@ func extractSingleGz(src, dest string, lineMap map[string]int64) error {
 	}
 	defer outFile.Close()
 
-	bw := bufio.NewWriterSize(outFile, 2*1024*1024)
-	defer bw.Flush()
+	bw, release := getBufioWriter(outFile, 0)
+	defer release()
 
 	cw := &lineCountingWriter{w: bw}
 	bufPtr := extractBufPool.Get().(*[]byte)
@@ -559,8 +591,8 @@ func extractSingleBz2(src, dest string, lineMap map[string]int64) error {
 	}
 	defer outFile.Close()
 
-	bw := bufio.NewWriterSize(outFile, 2*1024*1024)
-	defer bw.Flush()
+	bw, release := getBufioWriter(outFile, 0)
+	defer release()
 
 	cw := &lineCountingWriter{w: bw}
 	bufPtr := extractBufPool.Get().(*[]byte)
@@ -580,14 +612,20 @@ func copyFile(src, dest string, lineMap map[string]int64) error {
 	}
 	defer in.Close()
 
+	fi, _ := in.Stat()
+	var fileSize int64
+	if fi != nil {
+		fileSize = fi.Size()
+	}
+
 	out, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	bw := bufio.NewWriterSize(out, 2*1024*1024)
-	defer bw.Flush()
+	bw, release := getBufioWriter(out, fileSize)
+	defer release()
 
 	cw := &lineCountingWriter{w: bw}
 	bufPtr := extractBufPool.Get().(*[]byte)

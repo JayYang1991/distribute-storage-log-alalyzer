@@ -230,6 +230,28 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 		return nil, nil // 当前文件不符合任何已启用规则的作用文件范围，跳过扫描
 	}
 
+	// 2. 为当前活跃规则构建局部 AC 自动机快速索引与兜底规则列表
+	var acKeywords [][]byte
+	var acRuleIndices []int
+	var fallbackRules []*compiledRule
+
+	for rIdx, cr := range activeRules {
+		if len(cr.orKeywordsBytes) > 0 {
+			for _, kw := range cr.orKeywordsBytes {
+				acKeywords = append(acKeywords, kw)
+				acRuleIndices = append(acRuleIndices, rIdx)
+			}
+		} else {
+			fallbackRules = append(fallbackRules, cr)
+		}
+	}
+
+	var ac *ACAutomaton
+	if len(acKeywords) > 0 {
+		ac = NewACAutomaton(acKeywords, acRuleIndices)
+	}
+	hitSet := make([]bool, len(activeRules))
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -245,6 +267,8 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 	scanner.Buffer(*bufPtr, 10*1024*1024)
 
 	var lineNum int64 = 0
+	lineLowerBuf := make([]byte, 0, 1024)
+
 	for scanner.Scan() {
 		lineNum++
 		raw := scanner.Bytes()
@@ -253,37 +277,35 @@ func (e *Engine) DiagnoseFile(archiveID, relPath, filePath string, limit int) ([
 			continue
 		}
 
-		var lineLower []byte
-		var lineLowerInit bool
+		lineLowerBuf = toLowerBytes(trimmed, lineLowerBuf)
 
-		for _, cr := range activeRules {
-			// 性能优化：快速短路筛选。若规则提取出了候选关键字，且当前行小写文本未包含任何候选词，直接跳过此规则
-			if len(cr.orKeywordsBytes) > 0 {
-				if !lineLowerInit {
-					lineLower = bytes.ToLower(trimmed)
-					lineLowerInit = true
-				}
-				hasCandidate := false
-				for _, kw := range cr.orKeywordsBytes {
-					if bytes.Contains(lineLower, kw) {
-						hasCandidate = true
-						break
-					}
-				}
-				if !hasCandidate {
-					continue
-				}
+		// 收集当前行需要进一步断言或正则校验的目标规则列表
+		var candidateRules []*compiledRule
+
+		if ac != nil {
+			for i := range hitSet {
+				hitSet[i] = false
 			}
+			matchedIndices := ac.MatchOneLine(lineLowerBuf, hitSet)
+			for _, idx := range matchedIndices {
+				candidateRules = append(candidateRules, activeRules[idx])
+			}
+		}
 
+		if len(fallbackRules) > 0 {
+			candidateRules = append(candidateRules, fallbackRules...)
+		}
+
+		if len(candidateRules) == 0 {
+			continue
+		}
+
+		for _, cr := range candidateRules {
 			matched := false
 			if cr.regex != nil {
 				matched = cr.regex.Match(trimmed)
 			} else {
-				if !lineLowerInit {
-					lineLower = bytes.ToLower(trimmed)
-					lineLowerInit = true
-				}
-				matched = bytes.Contains(lineLower, cr.patternLowerB)
+				matched = bytes.Contains(lineLowerBuf, cr.patternLowerB)
 			}
 
 			if matched {
@@ -332,12 +354,52 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+func toLowerBytes(src, buf []byte) []byte {
+	if cap(buf) < len(src) {
+		buf = make([]byte, len(src))
+	} else {
+		buf = buf[:len(src)]
+	}
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		if c >= 'A' && c <= 'Z' {
+			buf[i] = c + 32
+		} else {
+			buf[i] = c
+		}
+	}
+	return buf
+}
+
 var timeRegs = []*regexp.Regexp{
 	regexp.MustCompile(`\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?`),
 	regexp.MustCompile(`\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`),
 }
 
+func isDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
 func extractTimestamp(line string) string {
+	// Fast Path: 常见 ISO 8601 或 YYYY-MM-DD
+	if len(line) >= 19 {
+		b := line[:19]
+		if (b[4] == '-' || b[4] == '/') && (b[7] == '-' || b[7] == '/') &&
+			(b[10] == ' ' || b[10] == 'T') && b[13] == ':' && b[16] == ':' &&
+			isDigit(b[0]) && isDigit(b[1]) && isDigit(b[2]) && isDigit(b[3]) &&
+			isDigit(b[5]) && isDigit(b[6]) && isDigit(b[8]) && isDigit(b[9]) &&
+			isDigit(b[11]) && isDigit(b[12]) && isDigit(b[14]) && isDigit(b[15]) &&
+			isDigit(b[17]) && isDigit(b[18]) {
+			end := 19
+			if len(line) > 20 && line[19] == '.' {
+				end = 20
+				for end < len(line) && isDigit(line[end]) {
+					end++
+				}
+			}
+			return line[:end]
+		}
+	}
 	for _, reg := range timeRegs {
 		if match := reg.FindString(line); match != "" {
 			return match

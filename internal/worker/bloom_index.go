@@ -1,12 +1,15 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"hash/fnv"
 	"io"
 	"os"
 	"sync"
+
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 const (
@@ -139,13 +142,37 @@ type ChunkBloomIndex struct {
 	Chunks      []BloomChunkMeta
 }
 
+const numBloomStripes = 64
+
+type bloomStripeLock struct {
+	locks [numBloomStripes]sync.Mutex
+}
+
+func (s *bloomStripeLock) getLock(key string) *sync.Mutex {
+	var h uint32
+	for i := 0; i < len(key); i++ {
+		h = 31*h + uint32(key[i])
+	}
+	return &s.locks[h%numBloomStripes]
+}
+
 var (
-	bloomBuildMu     sync.Mutex
-	bloomMemoryCache = make(map[string]*ChunkBloomIndex)
-	bloomCacheMu     sync.RWMutex
+	bloomStripes  bloomStripeLock
+	bloomLRUCache *lru.Cache[string, *ChunkBloomIndex]
+	bloomLRUOnce  sync.Once
 )
 
-// GetOrBuildBloomIndex 获取或构建指定大文件的分块布隆索引
+func getBloomLRUCache() *lru.Cache[string, *ChunkBloomIndex] {
+	bloomLRUOnce.Do(func() {
+		cache, err := lru.New[string, *ChunkBloomIndex](1000)
+		if err == nil {
+			bloomLRUCache = cache
+		}
+	})
+	return bloomLRUCache
+}
+
+// GetOrBuildBloomIndex 获取或构建指定大文件的分块布隆索引 (支持多文件并发构建，带 LRU 容量上限)
 func GetOrBuildBloomIndex(filePath string) (*ChunkBloomIndex, error) {
 	fi, err := os.Stat(filePath)
 	if err != nil {
@@ -153,39 +180,40 @@ func GetOrBuildBloomIndex(filePath string) (*ChunkBloomIndex, error) {
 	}
 
 	if fi.Size() < minFileSizeBytesForBloom {
-		return nil, nil // 小于 4MB 的小文件无需构建布隆索引
+		return nil, nil // 小于阈值无需构建布隆索引
 	}
 
-	// 1. 检查内存缓存
-	bloomCacheMu.RLock()
-	idx, ok := bloomMemoryCache[filePath]
-	bloomCacheMu.RUnlock()
-	if ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
-		return idx, nil
+	cache := getBloomLRUCache()
+
+	// 1. 检查内存 LRU 缓存
+	if cache != nil {
+		if idx, ok := cache.Get(filePath); ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
+			return idx, nil
+		}
 	}
 
 	// 2. 检查磁盘持久化文件 (.bidx)
 	bidxPath := filePath + ".bidx"
 	if idx, err := loadBloomIndexFromDisk(bidxPath, fi.Size(), fi.ModTime().UnixNano()); err == nil && idx != nil {
-		bloomCacheMu.Lock()
-		bloomMemoryCache[filePath] = idx
-		bloomCacheMu.Unlock()
+		if cache != nil {
+			cache.Add(filePath, idx)
+		}
 		return idx, nil
 	}
 
-	// 3. 单飞构建防并发雪崩
-	bloomBuildMu.Lock()
-	defer bloomBuildMu.Unlock()
+	// 3. 条带化细粒度单飞构建，允许不同文件并行构建，同文件并发防重
+	lock := bloomStripes.getLock(filePath)
+	lock.Lock()
+	defer lock.Unlock()
 
 	// 双重检查
-	bloomCacheMu.RLock()
-	if idx, ok := bloomMemoryCache[filePath]; ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
-		bloomCacheMu.RUnlock()
-		return idx, nil
+	if cache != nil {
+		if idx, ok := cache.Get(filePath); ok && idx != nil && idx.FileSize == fi.Size() && idx.ModTimeNano == fi.ModTime().UnixNano() {
+			return idx, nil
+		}
 	}
-	bloomCacheMu.RUnlock()
 
-	idx, err = buildChunkBloomIndex(filePath, fi.Size(), fi.ModTime().UnixNano())
+	idx, err := buildChunkBloomIndex(filePath, fi.Size(), fi.ModTime().UnixNano())
 	if err != nil {
 		return nil, err
 	}
@@ -195,9 +223,9 @@ func GetOrBuildBloomIndex(filePath string) (*ChunkBloomIndex, error) {
 		_ = saveBloomIndexToDisk(p, data)
 	}(bidxPath, idx)
 
-	bloomCacheMu.Lock()
-	bloomMemoryCache[filePath] = idx
-	bloomCacheMu.Unlock()
+	if cache != nil {
+		cache.Add(filePath, idx)
+	}
 
 	return idx, nil
 }
@@ -400,6 +428,9 @@ func saveBloomIndexToDisk(bidxPath string, idx *ChunkBloomIndex) error {
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+
+	bw := bufio.NewWriterSize(f, 64*1024)
 
 	header := make([]byte, 36)
 	copy(header[0:8], bloomMagic)
@@ -408,8 +439,7 @@ func saveBloomIndexToDisk(bidxPath string, idx *ChunkBloomIndex) error {
 	binary.LittleEndian.PutUint64(header[20:28], uint64(idx.FileSize))
 	binary.LittleEndian.PutUint64(header[28:36], uint64(idx.ModTimeNano))
 
-	if _, err := f.Write(header); err != nil {
-		_ = f.Close()
+	if _, err := bw.Write(header); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
@@ -424,11 +454,15 @@ func saveBloomIndexToDisk(bidxPath string, idx *ChunkBloomIndex) error {
 		binary.LittleEndian.PutUint64(recordBuf[24:32], uint64(c.EndOffset))
 		copy(recordBuf[32:32+bloomFilterBytes], c.Filter[:])
 
-		if _, err := f.Write(recordBuf); err != nil {
-			_ = f.Close()
+		if _, err := bw.Write(recordBuf); err != nil {
 			_ = os.Remove(tmpPath)
 			return err
 		}
+	}
+
+	if err := bw.Flush(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
 	}
 
 	_ = f.Close()

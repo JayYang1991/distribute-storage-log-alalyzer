@@ -29,22 +29,32 @@ import (
 )
 
 type Server struct {
-	cfg       *config.Config
-	store     *store.Store
-	scheduler *Scheduler
-	ha        *HAManager
-	sessions  sync.Map // token -> username
-	server    *http.Server
-	staticFS  http.FileSystem
+	cfg        *config.Config
+	store      *store.Store
+	scheduler  *Scheduler
+	ha         *HAManager
+	sessions   sync.Map // token -> username
+	server     *http.Server
+	staticFS   http.FileSystem
+	httpClient *http.Client
 }
 
 func NewServer(cfg *config.Config, s *store.Store, staticFS http.FileSystem) *Server {
+	transport := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	srv := &Server{
 		cfg:       cfg,
 		store:     s,
 		scheduler: NewScheduler(s),
 		ha:        NewHAManager(cfg, s),
 		staticFS:  staticFS,
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Minute,
+		},
 	}
 	// 初始化内置规则（如果数据库规则为空）
 	ruleList, _ := s.ListRules()
@@ -65,9 +75,18 @@ func (s *Server) Start(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 
-	// 静态文件与前端
+	// 静态前端文件托管
 	if s.staticFS != nil {
-		mux.Handle("/", http.FileServer(s.staticFS))
+		fileServer := http.FileServer(s.staticFS)
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			p := r.URL.Path
+			if strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css") || strings.HasSuffix(p, ".svg") || strings.HasSuffix(p, ".png") || strings.HasSuffix(p, ".woff2") {
+				w.Header().Set("Cache-Control", "public, max-age=86400")
+			} else if strings.HasSuffix(p, ".html") || p == "/" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
+			fileServer.ServeHTTP(w, r)
+		})
 	}
 
 	// 高可用 HA 路由
@@ -1127,33 +1146,61 @@ type workerUploadResult struct {
 }
 
 func (s *Server) forwardUploadToWorker(node *model.Node, file io.Reader, filename string, archiveID, username, userID string, rulesList []*model.Rule) (*workerUploadResult, error) {
-	var b bytes.Buffer
-	w := multipart.NewWriter(&b)
-	part, err := w.CreateFormFile("file", filename)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := io.Copy(part, file); err != nil {
-		return nil, err
-	}
-
-	_ = w.WriteField("archive_id", archiveID)
-	_ = w.WriteField("username", username)
-	_ = w.WriteField("user_id", userID)
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
 
 	rulesData, _ := json.Marshal(rulesList)
-	_ = w.WriteField("rules", string(rulesData))
-	_ = w.Close()
+
+	go func() {
+		var copyErr error
+		defer func() {
+			if copyErr != nil {
+				_ = pw.CloseWithError(copyErr)
+			} else {
+				_ = pw.Close()
+			}
+		}()
+
+		if err := mw.WriteField("archive_id", archiveID); err != nil {
+			copyErr = err
+			return
+		}
+		if err := mw.WriteField("username", username); err != nil {
+			copyErr = err
+			return
+		}
+		if err := mw.WriteField("user_id", userID); err != nil {
+			copyErr = err
+			return
+		}
+		if err := mw.WriteField("rules", string(rulesData)); err != nil {
+			copyErr = err
+			return
+		}
+
+		part, err := mw.CreateFormFile("file", filename)
+		if err != nil {
+			copyErr = err
+			return
+		}
+
+		// 64KB 流式传输缓冲区，避免大文件占用堆内存
+		buf := make([]byte, 64*1024)
+		if _, copyErr = io.CopyBuffer(part, file, buf); copyErr != nil {
+			return
+		}
+		copyErr = mw.Close()
+	}()
 
 	url := fmt.Sprintf("http://%s:%d/api/worker/storage/upload", node.IP, node.Port)
-	req, err := http.NewRequest(http.MethodPost, url, &b)
+	req, err := http.NewRequest(http.MethodPost, url, pr)
 	if err != nil {
+		_ = pr.Close()
 		return nil, err
 	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1385,7 +1432,7 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
 			url := fmt.Sprintf("http://%s:%d/api/worker/storage/files?archive_id=%s&extract_path=%s",
 				archive.StorageNodeIP, archive.StorageNodePort, archive.ID, archive.ExtractPath)
-			resp, err := http.Get(url)
+			resp, err := s.httpClient.Get(url)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
 				var remoteFiles []*model.LogFileItem
@@ -1444,7 +1491,7 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 			url := fmt.Sprintf("http://%s:%d/api/worker/storage/file-content?path=%s&extract_path=%s&start_line=%s&limit=%s",
 				archive.StorageNodeIP, archive.StorageNodePort, relPath, archive.ExtractPath,
 				r.URL.Query().Get("start_line"), r.URL.Query().Get("limit"))
-			resp, err := http.Get(url)
+			resp, err := s.httpClient.Get(url)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
 				w.Header().Set("Content-Type", "application/json")
@@ -1500,7 +1547,7 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
 			remoteURL := fmt.Sprintf("http://%s:%d/api/worker/storage/download-file?path=%s&extract_path=%s",
 				archive.StorageNodeIP, archive.StorageNodePort, url.QueryEscape(relPath), url.QueryEscape(archive.ExtractPath))
-			resp, err := http.Get(remoteURL)
+			resp, err := s.httpClient.Get(remoteURL)
 			if err == nil && resp.StatusCode == http.StatusOK {
 				defer resp.Body.Close()
 				fileName := filepath.Base(relPath)
@@ -2032,6 +2079,23 @@ func (s *Server) handleHASnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. 获取当前最新 TxID
+	txID, err := s.store.CurrentTxID()
+	if err == nil {
+		etag := fmt.Sprintf(`W/"tx-%d"`, txID)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("X-DB-TxID", strconv.Itoa(txID))
+
+		// 检查条件请求头 If-None-Match 或 X-Last-TxID
+		clientETag := r.Header.Get("If-None-Match")
+		clientTxIDStr := r.Header.Get("X-Last-TxID")
+		if clientETag == etag || (clientTxIDStr != "" && clientTxIDStr == strconv.Itoa(txID)) {
+			// 数据无任何变动，直接返回 304 Not Modified，节省全量网络流与备机 DB 重载开销
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"analyzer.db.snapshot\"")
 
@@ -2039,7 +2103,7 @@ func (s *Server) handleHASnapshot(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("[HA Snapshot] 导出快照流失败: %v (已写入 %d 字节)", err, written)
 	} else {
-		log.Printf("[HA Snapshot] 成功向备节点输出数据库快照流 (大小: %d 字节)", written)
+		log.Printf("[HA Snapshot] 成功向备节点输出数据库快照流 (大小: %d 字节, TxID: %d)", written, txID)
 	}
 }
 
