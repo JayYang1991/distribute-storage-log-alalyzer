@@ -2794,6 +2794,14 @@ func (s *Server) handleAnalysisTemplates(w http.ResponseWriter, r *http.Request)
 	miner := indexer.NewDrainMiner(0.55, 4)
 	mineArchiveSamples(arc.ExtractPath, miner, 2000)
 	templates := miner.GetTemplates()
+	for i := range templates {
+		if arc.ExtractPath != "" && templates[i].SampleFile != "" {
+			if rel, err := filepath.Rel(arc.ExtractPath, templates[i].SampleFile); err == nil {
+				templates[i].SampleFile = rel
+			}
+		}
+		templates[i].ArchiveID = arc.ID
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(templates)
 }

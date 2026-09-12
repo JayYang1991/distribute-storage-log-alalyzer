@@ -101,6 +101,19 @@ func TestCompareArchivesDiff(t *testing.T) {
 	// 验证挖掘出 B 中特有的新增日志模板
 	if len(diffRep.NewTemplates) == 0 {
 		t.Errorf("expected new anomaly templates in B, got none")
+	} else {
+		topTpl := diffRep.NewTemplates[0]
+		if topTpl.SampleFile == "" {
+			t.Errorf("expected top template SampleFile not empty, got %q", topTpl.SampleFile)
+		}
+		if topTpl.SampleLine <= 0 {
+			t.Errorf("expected top template SampleLine > 0, got %d", topTpl.SampleLine)
+		}
+		if topTpl.ArchiveID != arcB.ID {
+			t.Errorf("expected top template ArchiveID %q, got %q", arcB.ID, topTpl.ArchiveID)
+		}
+		t.Logf("✔ 样本定位验证通过: File=%s, Line=%d, ArchiveID=%s, Sample=%s",
+			topTpl.SampleFile, topTpl.SampleLine, topTpl.ArchiveID, topTpl.Sample)
 	}
 
 	t.Logf("✔ 差分对比成功，总结: %s", diffRep.SummaryText)

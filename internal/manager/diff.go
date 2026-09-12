@@ -236,6 +236,13 @@ func (s *Server) CompareArchiveScopes(archiveIDA, subPathA, archiveIDB, subPathB
 	for _, tpl := range tplsB {
 		if !patternsA[tpl.Pattern] {
 			if tpl.Level == "ERROR" || tpl.Level == "FATAL" || tpl.Count >= 2 {
+				// 转换为相对于归档包解压根目录的相对路径，并附带对应归档包 ID，便于前端日志查看器精准跳转直达
+				if arcB.ExtractPath != "" && tpl.SampleFile != "" {
+					if rel, err := filepath.Rel(arcB.ExtractPath, tpl.SampleFile); err == nil {
+						tpl.SampleFile = rel
+					}
+				}
+				tpl.ArchiveID = arcB.ID
 				report.NewTemplates = append(report.NewTemplates, tpl)
 			}
 		}

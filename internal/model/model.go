@@ -242,14 +242,17 @@ type TimeHistogramBucket struct {
 
 // LogTemplate 通用 Drain 日志模式提取聚类模板
 type LogTemplate struct {
-	ID        string   `json:"id"`                   // 模板唯一 ID
-	Pattern   string   `json:"pattern"`              // 提取的通配模式 (例如: Failed to connect to <*>:<*>)
-	Sample    string   `json:"sample"`               // 代表性原始日志样例
-	Count     int64    `json:"count"`                // 匹配该模板的日志频次
-	Level     string   `json:"level,omitempty"`      // 聚合最高级别 (INFO/WARN/ERROR/FATAL)
-	FirstSeen string   `json:"first_seen,omitempty"` // 首次出现时间
-	LastSeen  string   `json:"last_seen,omitempty"`  // 最后出现时间
-	Files     []string `json:"files,omitempty"`      // 关联文件列表
+	ID         string   `json:"id"`                    // 模板唯一 ID
+	Pattern    string   `json:"pattern"`               // 提取的通配模式 (例如: Failed to connect to <*>:<*>)
+	Sample     string   `json:"sample"`                // 代表性原始日志样例
+	SampleFile string   `json:"sample_file,omitempty"` // 样例所在相对文件路径 (例如: logs/ceph.log)
+	SampleLine int64    `json:"sample_line,omitempty"` // 样例所在文件行号 (1-based)
+	ArchiveID  string   `json:"archive_id,omitempty"`  // 所在归档包 ID
+	Count      int64    `json:"count"`                 // 匹配该模板的日志频次
+	Level      string   `json:"level,omitempty"`       // 聚合最高级别 (INFO/WARN/ERROR/FATAL)
+	FirstSeen  string   `json:"first_seen,omitempty"`  // 首次出现时间
+	LastSeen   string   `json:"last_seen,omitempty"`   // 最后出现时间
+	Files      []string `json:"files,omitempty"`       // 关联文件列表
 }
 
 // SubArchiveItem 归档包内嵌套子压缩包/独立子模块元数据

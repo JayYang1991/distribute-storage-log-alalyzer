@@ -3430,12 +3430,40 @@ const app = {
       `;
       templates.slice(0, 10).forEach(t => {
         const lvlClass = (t.level || "INFO").toLowerCase();
+        const targetArchID = t.archive_id || archiveID;
+        const sampleFile = t.sample_file || "";
+        const sampleLine = t.sample_line || 1;
+        const hasJumpTarget = !!(targetArchID && sampleFile);
+
+        let sampleTd = "";
+        if (hasJumpTarget) {
+          sampleTd = `
+            <td style="font-family: monospace; font-size: 11px; cursor: pointer; max-width: 380px;"
+                onclick="app.openViewerAndJump('${this.escape(targetArchID)}', '${this.escape(sampleFile)}', ${sampleLine})"
+                title="点击在解包查看器中直达 ${this.escape(sampleFile)} 第 ${sampleLine} 行">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;">
+                <span style="color: #38bdf8; font-size: 10px;">📄 ${this.escape(sampleFile)} : L${sampleLine}</span>
+                <span class="badge badge-primary" style="font-size: 9px; padding: 1px 4px;">👁️ 查看</span>
+              </div>
+              <div style="color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                ${this.escape(t.sample)}
+              </div>
+            </td>
+          `;
+        } else {
+          sampleTd = `
+            <td style="color: var(--text-dim); font-family: monospace; font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${this.escape(t.sample)}">
+              ${this.escape(t.sample)}
+            </td>
+          `;
+        }
+
         html += `
           <tr>
             <td><span class="badge badge-${lvlClass === 'error' || lvlClass === 'fatal' ? 'danger' : lvlClass === 'warn' ? 'warning' : 'muted'}">${t.level || 'INFO'}</span></td>
             <td><strong>${t.count}</strong> 次</td>
             <td><code style="color: #38bdf8; font-size: 11px;">${this.escape(t.pattern)}</code></td>
-            <td style="color: var(--text-dim); font-family: monospace; font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${this.escape(t.sample)}">${this.escape(t.sample)}</td>
+            ${sampleTd}
           </tr>
         `;
       });
@@ -3730,12 +3758,40 @@ const app = {
       if (data.new_templates && data.new_templates.length > 0) {
         tbody.innerHTML = data.new_templates.map(t => {
           const lvl = (t.level || "INFO").toLowerCase();
+          const targetArchID = t.archive_id || data.archive_id_b;
+          const sampleFile = t.sample_file || "";
+          const sampleLine = t.sample_line || 1;
+          const hasJumpTarget = !!(targetArchID && sampleFile);
+
+          let sampleHtml = "";
+          if (hasJumpTarget) {
+            sampleHtml = `
+              <div style="cursor: pointer; padding: 6px 10px; border-radius: 6px; background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(56, 189, 248, 0.25); transition: all 0.2s;"
+                   onmouseover="this.style.background='rgba(56, 189, 248, 0.12)'; this.style.borderColor='rgba(56, 189, 248, 0.6)';"
+                   onmouseout="this.style.background='rgba(15, 23, 42, 0.5)'; this.style.borderColor='rgba(56, 189, 248, 0.25)';"
+                   onclick="app.openViewerAndJump('${this.escape(targetArchID)}', '${this.escape(sampleFile)}', ${sampleLine})"
+                   title="点击在解包查看器中直达 ${this.escape(sampleFile)} 第 ${sampleLine} 行">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                  <span style="color: #38bdf8; font-size: 11px; font-weight: 600;">
+                    📄 ${this.escape(sampleFile)} <span style="color: #fbbf24; font-weight: normal;">(第 ${sampleLine} 行)</span>
+                  </span>
+                  <span class="badge badge-primary" style="font-size: 10px; padding: 2px 6px; line-height: 1.2;">👁️ 定位直达</span>
+                </div>
+                <div style="color: var(--text-color, #e2e8f0); font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; line-height: 1.4;">
+                  ${this.escape(t.sample)}
+                </div>
+              </div>
+            `;
+          } else {
+            sampleHtml = `<div style="color: var(--text-dim); font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all;">${this.escape(t.sample)}</div>`;
+          }
+
           return `
             <tr>
               <td><span class="badge badge-${lvl === 'error' || lvl === 'fatal' ? 'danger' : lvl === 'warn' ? 'warning' : 'muted'}">${t.level || 'INFO'}</span></td>
               <td><strong>${t.count}</strong> 次</td>
-              <td><code style="color: #fbbf24; font-size: 11px;">${this.escape(t.pattern)}</code></td>
-              <td style="color: var(--text-dim); font-family: monospace; font-size: 11px;">${this.escape(t.sample)}</td>
+              <td><code style="color: #fbbf24; font-size: 11px; word-break: break-all;">${this.escape(t.pattern)}</code></td>
+              <td>${sampleHtml}</td>
             </tr>
           `;
         }).join("");

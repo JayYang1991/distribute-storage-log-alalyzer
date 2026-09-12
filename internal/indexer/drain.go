@@ -33,14 +33,16 @@ type DrainNode struct {
 
 // Cluster 模板簇
 type Cluster struct {
-	ID        string
-	Tokens    []string
-	Sample    string
-	Count     int64
-	Level     string
-	FirstSeen string
-	LastSeen  string
-	Files     map[string]bool
+	ID         string
+	Tokens     []string
+	Sample     string
+	SampleFile string
+	SampleLine int64
+	Count      int64
+	Level      string
+	FirstSeen  string
+	LastSeen   string
+	Files      map[string]bool
 }
 
 // DrainMiner 日志模式挖掘聚类器
@@ -163,8 +165,13 @@ func isWordByte(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
-// AddLog 向聚类器投递一条日志
+// AddLog 向聚类器投递一条日志 (默认行号为 1)
 func (d *DrainMiner) AddLog(raw string, file string) {
+	d.AddLogWithLine(raw, file, 1)
+}
+
+// AddLogWithLine 向聚类器投递一条日志，并携带该行在文件中的具体物理行号
+func (d *DrainMiner) AddLogWithLine(raw string, file string, lineNo int64) {
 	cleaned, level, ts := PreprocessLog(raw)
 	if cleaned == "" {
 		return
@@ -209,14 +216,16 @@ func (d *DrainMiner) AddLog(raw string, file string) {
 		}
 		clusterID := fmt.Sprintf("tpl_%x", md5.Sum([]byte(strings.Join(rawTokens, " "))))[:10]
 		newCluster := &Cluster{
-			ID:        clusterID,
-			Tokens:    rawTokens,
-			Sample:    raw,
-			Count:     1,
-			Level:     level,
-			FirstSeen: ts,
-			LastSeen:  ts,
-			Files:     make(map[string]bool),
+			ID:         clusterID,
+			Tokens:     rawTokens,
+			Sample:     raw,
+			SampleFile: file,
+			SampleLine: lineNo,
+			Count:      1,
+			Level:      level,
+			FirstSeen:  ts,
+			LastSeen:   ts,
+			Files:      make(map[string]bool),
 		}
 		if file != "" {
 			newCluster.Files[file] = true
@@ -339,14 +348,16 @@ func (d *DrainMiner) GetTemplates() []model.LogTemplate {
 		sort.Strings(files)
 
 		res = append(res, model.LogTemplate{
-			ID:        c.ID,
-			Pattern:   strings.Join(c.Tokens, " "),
-			Sample:    c.Sample,
-			Count:     c.Count,
-			Level:     c.Level,
-			FirstSeen: c.FirstSeen,
-			LastSeen:  c.LastSeen,
-			Files:     files,
+			ID:         c.ID,
+			Pattern:    strings.Join(c.Tokens, " "),
+			Sample:     c.Sample,
+			SampleFile: c.SampleFile,
+			SampleLine: c.SampleLine,
+			Count:      c.Count,
+			Level:      c.Level,
+			FirstSeen:  c.FirstSeen,
+			LastSeen:   c.LastSeen,
+			Files:      files,
 		})
 	}
 
@@ -380,9 +391,9 @@ func (d *DrainMiner) MineFile(filePath string, maxLines int) error {
 
 	count := 0
 	for scanner.Scan() {
-		line := scanner.Text()
-		d.AddLog(line, filePath)
 		count++
+		line := scanner.Text()
+		d.AddLogWithLine(line, filePath, int64(count))
 		if maxLines > 0 && count >= maxLines {
 			break
 		}
