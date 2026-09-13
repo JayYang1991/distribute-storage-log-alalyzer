@@ -497,6 +497,41 @@
               </div>
             </div>
           </div>
+
+          <!-- 时序点位图表与自定义脚本库卡片 -->
+          <div class="card" style="margin-top: 20px;">
+            <div class="card-header">
+              <span class="card-title">📈 时序点位图表与自定义解析脚本库 (动态可视化引擎)</span>
+              <div style="display: flex; gap: 10px;" id="admin-chart-script-actions">
+                <button class="btn btn-primary btn-sm" onclick="app.openCreateChartScriptModal();">➕ 添加图表解析脚本</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 14px; line-height: 1.6; background: rgba(15, 23, 42, 0.4); padding: 10px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+                💡 <strong>时序图表脚本引擎机制与特性：</strong><br>
+                • <strong>目标文件名匹配：</strong>支持配置正则表达式或通配符（如 <code>(?i).*iostat.*\.log$</code>、<code>**/vmstat*.txt</code>），当用户点击匹配文件时自动挂载图表视图。<br>
+                • <strong>支持本地脚本一键上传：</strong>管理员可直接上传写好的本地 <code>.py</code> / <code>.sh</code> 脚本文件，或直接在界面在线微调编写。<br>
+                • <strong>海量点位极值降采样 (LTTB/Min-Max)：</strong>框架自适应压缩海量时序点至 1500 点以内，100% 保留异常波峰毛刺，框选局部时段自动提升展示精度。<br>
+                • <strong>突变定位与日志穿透：</strong>自动提取指标剧烈突变点，支持图表一键聚焦，并可直接点击穿透跳转至原始日志具体行号！
+              </div>
+              <div class="table-responsive">
+                <table id="table-chart-scripts">
+                  <thead>
+                    <tr>
+                      <th>规则名称</th>
+                      <th>目标文件名匹配正则</th>
+                      <th>执行解释器</th>
+                      <th>脚本文件/类型</th>
+                      <th>规则说明</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 7. 实时告警中心 Tab -->
@@ -971,6 +1006,9 @@
               </div>
               <div style="display: flex; gap: 8px; flex-shrink: 0; align-items: center;">
                 <span id="viewer-scroll-status" class="badge badge-muted" style="font-size: 11px; display: none;">自动流式加载</span>
+                <button id="btn-view-file-chart" class="btn btn-warning btn-sm" style="display: none;" onclick="app.openMatchedChartForCurrentFile()">
+                  📈 运行时序图表
+                </button>
                 <button id="btn-download-current-file" class="btn btn-primary btn-sm" style="display: none;" onclick="app.downloadCurrentViewingFile()">
                   📥 下载此文件
                 </button>
@@ -1568,6 +1606,154 @@
     </div>
   </div>
 
-  <script src="/js/app.js?v=20260913_preprocess"></script>
+  <!-- 模态框 12: 添加/编辑时序图表脚本规则 (支持设置文件名与本地脚本文件上传) -->
+  <div class="modal-overlay" id="modal-chart-script">
+    <div class="modal-content" style="max-width: 720px;">
+      <div class="modal-header">
+        <h3 class="modal-title">📈 新增/编辑时序图表解析脚本</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-chart-script')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-chart-script" onsubmit="event.preventDefault(); app.submitChartScript();">
+          <input type="hidden" id="chart-script-id" value="">
+          
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">脚本规则名称 *</label>
+              <input type="text" class="form-control" id="chart-script-name" placeholder="例如：Linux iostat 磁盘利用率分析" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">目标文件名匹配表达式 (Pattern) *</label>
+              <input type="text" class="form-control" id="chart-script-pattern" placeholder="例如：(?i).*iostat.*\.log$ 或 **/iostat*.txt" required>
+              <div style="font-size: 11px; color: var(--text-dim); margin-top: 4px;">支持文件名通配符或正则表达式，命中文件自动出现图表按钮</div>
+            </div>
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: flex-end;">
+            <div class="form-group">
+              <label class="form-label">执行解释器 (Interpreter) *</label>
+              <select class="form-control" id="chart-script-interpreter">
+                <option value="/usr/bin/python3">Python 3 (/usr/bin/python3)</option>
+                <option value="/bin/bash">Bash Shell (/bin/bash)</option>
+                <option value="/usr/bin/python">Python 2 (/usr/bin/python)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">从本地导入脚本文件</label>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <input type="file" id="chart-script-file-input" accept=".py,.sh,.awk,.txt" style="display: none;" onchange="app.onChartScriptFileSelected(event)">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('chart-script-file-input').click()" style="width: 100%;">
+                  📁 选择本地脚本文件 (.py / .sh) 导入内容
+                </button>
+              </div>
+              <div id="chart-script-file-name" style="font-size: 11px; color: #38bdf8; margin-top: 4px; display: none;"></div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+              <label class="form-label" style="margin-bottom: 0;">解析脚本代码 (接收参数 $1 为日志路径，输出标准 JSON) *</label>
+              <button type="button" class="btn btn-xs btn-secondary" onclick="app.insertChartScriptSample()">📋 填入标准 iostat 样例代码</button>
+            </div>
+            <textarea class="form-control" id="chart-script-content" rows="11" style="font-family: monospace; font-size: 12px; background: #090d16; color: #e2e8f0; line-height: 1.5;" placeholder="#!/usr/bin/env python3&#10;import sys, json&#10;log_file = sys.argv[1]&#10;# 解析并输出: { 'title': '...', 'x_axis': {'data': [...]}, 'series': [...], 'anomalies': [...] }" required></textarea>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">规则与图表描述</label>
+            <input type="text" class="form-control" id="chart-script-desc" placeholder="简要说明该图表监控的指标与业务意义">
+          </div>
+
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" id="chart-script-enabled" checked> 启用该图表解析规则
+            </label>
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0; display: flex; justify-content: flex-end; gap: 8px;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-chart-script')">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存脚本规则</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框 13: 时序点位图表展示器 (支持海量点位极值降采样、局部框选自动提升精度与突变点定位跳转) -->
+  <div class="modal-overlay" id="modal-chart-view">
+    <div class="modal-content" style="max-width: 950px; width: 95vw; max-height: 92vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="flex-shrink: 0;">
+        <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+          <h3 class="modal-title" id="chart-modal-title" style="display: inline-block;">📈 时序性能图表</h3>
+          <span id="chart-matched-file-badge" class="badge badge-info" style="margin-left: 10px; font-size: 11px;"></span>
+        </div>
+        <button class="modal-close" onclick="app.closeModal('modal-chart-view')">&times;</button>
+      </div>
+
+      <div class="modal-body" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 14px 20px;">
+        <!-- 工具控制条: 维度选择与分辨率指示 -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 8px 12px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 12px; color: var(--text-dim);">指标系列过滤:</span>
+            <select id="chart-series-filter" class="form-control form-control-sm" style="max-width: 220px;" onchange="app.onChartSeriesFilterChange()">
+              <option value="__all__">全部指标系列展示</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; font-size: 12px;">
+            <span id="chart-resolution-badge" class="badge badge-muted" style="font-size: 11px;">加载中...</span>
+            <button id="btn-chart-reset-zoom" class="btn btn-secondary btn-xs" style="display: none;" onclick="app.resetChartZoom()">
+              ↩ 恢复全景 (双击空白处)
+            </button>
+          </div>
+        </div>
+
+        <!-- 🚨 突变事件导航胶囊栏 -->
+        <div id="chart-anomalies-container" style="display: none; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 8px 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #f87171;">
+              <span>🚨 识别到突变异常事件 (<span id="chart-anomalies-count">0</span>):</span>
+              <span style="font-size: 11px; font-weight: normal; color: var(--text-dim);">点击任一标签一键平滑聚焦案发时刻</span>
+            </div>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-secondary btn-xs" onclick="app.navPrevAnomaly()" title="跳转定位到上一个突变点">◀ 上一处</button>
+              <button class="btn btn-secondary btn-xs" onclick="app.navNextAnomaly()" title="跳转定位到下一个突变点">下一处 ▶</button>
+            </div>
+          </div>
+          <div id="chart-anomalies-chips" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+        </div>
+
+        <!-- 原生 Canvas 画布区域 -->
+        <div style="position: relative; width: 100%; height: 360px; background: #090d16; border: 1px solid var(--border-color); border-radius: var(--radius-sm); overflow: hidden;">
+          <canvas id="chart-canvas" style="display: block; width: 100%; height: 100%; cursor: crosshair;"></canvas>
+          
+          <!-- 鼠标悬浮 / 突变点交互气泡卡片 -->
+          <div id="chart-tooltip-bubble" style="display: none; position: absolute; z-index: 20; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--primary); border-radius: 6px; padding: 8px 12px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); pointer-events: auto; max-width: 280px;">
+            <div id="chart-tooltip-time" style="font-weight: 600; color: #e2e8f0; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;"></div>
+            <div id="chart-tooltip-metrics" style="line-height: 1.5; color: #38bdf8;"></div>
+            <div id="chart-tooltip-anomaly" style="margin-top: 6px; font-size: 11px; color: #f87171; display: none;"></div>
+            <div id="chart-tooltip-jump-btn" style="margin-top: 6px; display: none;">
+              <button type="button" class="btn btn-primary btn-xs" style="width: 100%; font-size: 11px;" onclick="app.jumpFromChartToLogLine()">
+                📄 跳转到原始日志行
+              </button>
+            </div>
+          </div>
+
+          <!-- 框选缩放引导遮罩提示 -->
+          <div id="chart-brush-hint" style="position: absolute; bottom: 8px; right: 12px; font-size: 11px; color: var(--text-dim); pointer-events: none;">
+            💡 提示: 鼠标拖拽可框选局部区间自动提升展示精度，双击空白处恢复全景
+          </div>
+        </div>
+
+        <!-- 底部指标图例栏 -->
+        <div id="chart-legend-container" style="display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; padding: 4px 0;"></div>
+      </div>
+
+      <div class="modal-footer" style="flex-shrink: 0; padding: 12px 20px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+        <span id="chart-footer-desc" style="font-size: 12px; color: var(--text-dim);"></span>
+        <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-chart-view')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/app.js?v=20260913_chart_engine"></script>
 </body>
 </html>

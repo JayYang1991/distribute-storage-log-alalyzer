@@ -51,6 +51,94 @@
 10. **一键打包生成发布包**：
     - 项目提供 `package.sh` 脚本，一键构建静态二进制并打包为自包含的 `dist-log-analyzer-linux-amd64.tar.gz`（体积仅 ~3.0MB）与 SHA256 校验和。
 
+11. **自定义时序图表脚本引擎与突变定位穿透 (Zero-Code Dynamic Charting)**：
+    - **特定文件名规则绑定与本地脚本上传**：管理员在 Web 端可针对特定打点文件（如 `(?i).*iostat.*\.log$`、`**/vmstat*.txt`）配置解析脚本，支持**直接选择本地脚本文件（.py / .sh / .awk）一键上传导入**或在线编写微调；
+    - **海量点位极值降采样 (LTTB / Min-Max)**：面对数十万长期打点日志，框架自动分桶压缩至 1500 点以内，**100% 保证瞬时高负荷毛刺（如利用率 100% 尖峰）绝不失真**；
+    - **鼠标框选视口动态自适应提升精度**：在全景图上用鼠标拉框选中局部时段（如 14:20~14:25），系统自动从本地缓存无缝切片，**瞬间展开为未压缩的秒级原始高精度波动波形**；
+    - **突变点双轨识别与一键平滑聚焦**：支持脚本主动返回或框架一阶差分斜率跃变（$|\Delta y| > 3\sigma$）自动识别突变点，顶部提供导航胶囊一键平滑聚焦；
+    - **直达案发现场**：点击突变点悬浮气泡，一键穿透直达底层日志查看器并精准高亮对应的原始日志行号。
+
+---
+
+## 📈 自定义时序图表解析脚本引擎开发指南
+
+### 1. 脚本调用契约规范
+客户可以使用 Python、Shell、AWK 等任意语言编写解析脚本。脚本运行时的标准契约非常简单：
+- **命令行参数**: `$1` 为系统传入的目标日志文件绝对路径（Worker 本地只读访问）；
+- **标准输出 (stdout)**: 输出标准 JSON 字符串到 stdout。
+
+#### 标准输出 JSON 协议格式：
+```json
+{
+  "title": "iostat 磁盘 I/O 利用率时序分析",
+  "description": "监控各磁盘利用率波动及高负荷突变",
+  "x_axis": {
+    "label": "采集时间",
+    "type": "time",
+    "data": ["14:00:01", "14:00:02", "14:00:03"]
+  },
+  "series": [
+    {
+      "name": "sda 利用率 (%util)",
+      "unit": "%",
+      "chart_type": "line",
+      "data": [12.5, 98.2, 23.1]
+    }
+  ],
+  "anomalies": [
+    {
+      "time": "14:00:02",
+      "index": 1,
+      "metric": "sda 利用率 (%util)",
+      "value": 98.2,
+      "severity": "CRITICAL",
+      "reason": "设备 sda 磁盘利用率骤增达到危险高位 98.2%",
+      "line_number": 45802
+    }
+  ]
+}
+```
+
+### 2. Python 实战样例：20 行解析 `iostat -xz 1` 日志
+```python
+#!/usr/bin/env python3
+import sys, re, json
+
+log_file = sys.argv[1]
+timestamps, dev_util, anomalies = [], {}, []
+current_time, line_idx = "", 0
+re_time = re.compile(r"^(\\d{2}:\\d{2}:\\d{2}|\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})")
+
+with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+    for raw in f:
+        line_idx += 1
+        line = raw.strip()
+        tm = re_time.match(line)
+        if tm:
+            current_time = tm.group(1)
+            if current_time not in timestamps: timestamps.append(current_time)
+            continue
+        parts = line.split()
+        if len(parts) >= 12 and not parts[0].startswith("Device") and not parts[0].startswith("avg-cpu"):
+            dev, util = parts[0], float(parts[-1])
+            dev_util.setdefault(dev, []).append(util)
+            if util >= 85.0:
+                anomalies.append({
+                    "time": current_time, "index": len(timestamps)-1,
+                    "metric": f"{dev} 利用率", "value": util,
+                    "severity": "CRITICAL" if util >= 95.0 else "WARNING",
+                    "reason": f"磁盘利用率突变达到 {util}%", "line_number": line_idx
+                })
+
+series = [{"name": f"{d} 利用率", "unit": "%", "data": dev_util[d]} for d in sorted(dev_util.keys())[:8]]
+print(json.dumps({
+    "title": "iostat 磁盘利用率分析",
+    "x_axis": {"label": "采样时间", "data": timestamps},
+    "series": series,
+    "anomalies": anomalies
+}))
+```
+
 ---
 
 ## 🚀 快速上手

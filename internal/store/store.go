@@ -29,6 +29,7 @@ var (
 	bucketAlarms              = []byte("alarms")
 	bucketDecommissionedNodes = []byte("decommissioned_nodes")
 	bucketPreprocessRules     = []byte("preprocess_rules")
+	bucketChartScripts        = []byte("chart_script_rules")
 )
 
 type Store struct {
@@ -55,7 +56,7 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化各 bucket
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms, bucketDecommissionedNodes, bucketPreprocessRules} {
+		for _, b := range [][]byte{bucketUsers, bucketNodes, bucketArchives, bucketRules, bucketReports, bucketSettings, bucketAlarms, bucketDecommissionedNodes, bucketPreprocessRules, bucketChartScripts} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -77,6 +78,9 @@ func NewStore(cfg *config.Config) (*Store, error) {
 
 	// 初始化默认文本预处理扩展规则
 	_ = s.initDefaultPreprocessRules()
+
+	// 初始化默认时序图表解析脚本
+	_ = s.initDefaultChartScripts()
 
 	return s, nil
 }
@@ -776,6 +780,175 @@ func (s *Store) DeletePreprocessRule(id string) error {
 		b := tx.Bucket(bucketPreprocessRules)
 		return b.Delete([]byte(id))
 	})
+}
+
+// ================= 时序图表解析脚本管理 =================
+
+func (s *Store) SaveChartScript(rule *model.ChartScriptRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rule.ID == "" {
+		rule.ID = fmt.Sprintf("chart_script_%d", time.Now().UnixNano())
+	}
+	if rule.CreatedAt.IsZero() {
+		rule.CreatedAt = time.Now()
+	}
+	rule.UpdatedAt = time.Now()
+
+	data, err := json.Marshal(rule)
+	if err != nil {
+		return err
+	}
+
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketChartScripts)
+		return b.Put([]byte(rule.ID), data)
+	})
+}
+
+func (s *Store) GetChartScript(id string) (*model.ChartScriptRule, error) {
+	var r *model.ChartScriptRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketChartScripts)
+		data := b.Get([]byte(id))
+		if data == nil {
+			return errors.New("chart script rule not found")
+		}
+		return json.Unmarshal(data, &r)
+	})
+	return r, err
+}
+
+func (s *Store) ListChartScripts() ([]*model.ChartScriptRule, error) {
+	var list []*model.ChartScriptRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketChartScripts)
+		return b.ForEach(func(k, v []byte) error {
+			var r model.ChartScriptRule
+			if err := json.Unmarshal(v, &r); err == nil {
+				list = append(list, &r)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	// 按创建时间升序排序
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].CreatedAt.Before(list[j].CreatedAt)
+	})
+	return list, nil
+}
+
+func (s *Store) DeleteChartScript(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketChartScripts)
+		return b.Delete([]byte(id))
+	})
+}
+
+func (s *Store) initDefaultChartScripts() error {
+	rules, err := s.ListChartScripts()
+	if err == nil && len(rules) > 0 {
+		return nil
+	}
+
+	iostatScript := `#!/usr/bin/env python3
+import sys, re, json
+
+log_file = sys.argv[1] if len(sys.argv) > 1 else ""
+if not log_file:
+    print(json.dumps({"title": "iostat", "x_axis": {"data": []}, "series": []}))
+    sys.exit(0)
+
+timestamps = []
+dev_util = {}
+anomalies = []
+current_time = ""
+line_idx = 0
+
+re_time = re.compile(r"^(?:Time:\s+)?(\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+
+try:
+    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+        for raw_line in f:
+            line_idx += 1
+            line = raw_line.strip()
+            if not line:
+                continue
+            
+            tm = re_time.match(line)
+            if tm:
+                current_time = tm.group(1)
+                if current_time not in timestamps:
+                    timestamps.append(current_time)
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 12 and not parts[0].startswith("Device") and not parts[0].startswith("avg-cpu"):
+                dev = parts[0]
+                try:
+                    util = float(parts[-1])
+                except (ValueError, IndexError):
+                    continue
+                
+                if dev not in dev_util:
+                    dev_util[dev] = []
+                dev_util[dev].append(util)
+                
+                if util >= 85.0:
+                    anomalies.append({
+                        "time": current_time or str(line_idx),
+                        "index": len(timestamps) - 1 if timestamps else 0,
+                        "metric": f"{dev} 利用率 (%util)",
+                        "value": util,
+                        "severity": "CRITICAL" if util >= 95.0 else "WARNING",
+                        "reason": f"设备 {dev} 磁盘利用率突增达到危险高位 {util}%",
+                        "line_number": line_idx
+                    })
+except Exception:
+    pass
+
+series = []
+for dev in sorted(dev_util.keys())[:8]:
+    series.append({
+        "name": f"{dev} 利用率 (%util)",
+        "unit": "%",
+        "chart_type": "line",
+        "data": dev_util[dev]
+    })
+
+result = {
+    "title": "iostat 磁盘 I/O 利用率时序分析",
+    "description": "实时解析 iostat -xz 输出，监控各磁盘利用率波动及高负荷突变",
+    "x_axis": {
+        "label": "采样时间",
+        "type": "time",
+        "data": timestamps if timestamps else [str(i) for i in range(1, len(next(iter(dev_util.values()), [])) + 1)]
+    },
+    "series": series,
+    "anomalies": anomalies
+}
+print(json.dumps(result))
+`
+
+	defaultRule := &model.ChartScriptRule{
+		ID:            "chart_script_iostat_default",
+		Name:          "Linux iostat 磁盘利用率分析",
+		FilePattern:   `(?i).*iostat.*\.log$`,
+		Interpreter:   "/usr/bin/python3",
+		ScriptContent: iostatScript,
+		ScriptName:    "parse_iostat.py",
+		Description:   "解析系统 iostat -xz 1 周期打点日志，展示各块盘的利用率曲线与高水位突变",
+		Enabled:       true,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+
+	_ = s.SaveChartScript(defaultRule)
+	return nil
 }
 
 // ================= 诊断报告 (冷热分离) =================

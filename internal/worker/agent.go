@@ -68,6 +68,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/worker/storage/clean-archive", a.handleStorageCleanArchive)
 	mux.HandleFunc("/api/worker/storage/files", a.handleStorageFiles)
 	mux.HandleFunc("/api/worker/storage/tree-nodes", a.handleStorageTreeNodes)
+	mux.HandleFunc("/api/worker/chart/execute", a.handleChartExecute)
 	mux.HandleFunc("/api/worker/decommission", a.handleDecommission)
 
 	addr := fmt.Sprintf("%s:%d", a.cfg.ListenHost, a.cfg.Port)
@@ -1193,3 +1194,49 @@ func (a *Agent) collectSystemResource() model.SystemResource {
 	res.CPUPercent = float64(runtime.NumGoroutine())
 	return res
 }
+
+// ChartExecReq Worker 接收来自 Manager 的图表解析调度请求
+type ChartExecReq struct {
+	ExtractPath string                `json:"extract_path"`
+	FilePath    string                `json:"file_path"`
+	Rule        *model.ChartScriptRule `json:"rule"`
+	StartTime   string                `json:"start_time,omitempty"`
+	EndTime     string                `json:"end_time,omitempty"`
+	MaxPoints   int                   `json:"max_points,omitempty"`
+}
+
+// handleChartExecute 执行客户自定义图表解析脚本并进行降采样与突变识别
+func (a *Agent) handleChartExecute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "仅支持 POST 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ChartExecReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.ExtractPath == "" || req.FilePath == "" || req.Rule == nil {
+		http.Error(w, "缺少必要参数: extract_path, file_path 或 rule", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(req.ExtractPath, req.FilePath)
+	if !model.IsSafeSubpath(req.ExtractPath, fullPath) {
+		http.Error(w, "非法访问路径", http.StatusForbidden)
+		return
+	}
+
+	engine := NewChartEngine()
+	resp, err := engine.ExecuteScript(r.Context(), req.Rule, fullPath, req.StartTime, req.EndTime, req.MaxPoints)
+	if err != nil {
+		http.Error(w, "图表解析执行失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+

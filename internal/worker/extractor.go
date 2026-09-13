@@ -268,10 +268,20 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 				}
 
 				entries, _ := os.ReadDir(tmpDir)
+
+				// 检查子压缩包内部是否本身已经包含了一个与该子包名完全同名的文件夹 (忽略大小写精确比对 cleanName)
+				var sameNameDirEntry os.DirEntry
+				for _, entry := range entries {
+					if entry.IsDir() && (entry.Name() == cleanName || strings.EqualFold(entry.Name(), cleanName)) {
+						sameNameDirEntry = entry
+						break
+					}
+				}
+
 				var finalDest string
-				// 仅当压缩包内部唯一的单一顶级目录名称与该子包名完全一致或以其开头时才直接展平，避免多个子包内普遍存在的常规公共目录名 (如 logs, var, etc) 产生混杂覆盖
-				if len(entries) == 1 && entries[0].IsDir() && (entries[0].Name() == cleanName || strings.EqualFold(entries[0].Name(), cleanName) || strings.HasPrefix(strings.ToLower(entries[0].Name()), strings.ToLower(cleanName))) {
-					innerDirName := entries[0].Name()
+				if sameNameDirEntry != nil {
+					// 内部本身就已经包含了一个同名文件夹：绝不额外嵌套生成同名目录，直接提升该同名文件夹
+					innerDirName := sameNameDirEntry.Name()
 					finalDest = filepath.Join(parentDir, innerDirName)
 					innerSrc := filepath.Join(tmpDir, innerDirName)
 					if _, destErr := os.Stat(finalDest); os.IsNotExist(destErr) {
@@ -279,8 +289,13 @@ func unpackNestedArchives(targetDir string, lineMap map[string]int64) {
 					} else {
 						_ = moveDirContents(innerSrc, finalDest)
 					}
+					_ = os.RemoveAll(innerSrc)
+					// 若临时目录下还有同级的其他零星文件/目录，也移入该 finalDest 统一收纳
+					if len(entries) > 1 {
+						_ = moveDirContents(tmpDir, finalDest)
+					}
 				} else {
-					// 否则一律解压至以该压缩包基础名命名的专属目录 (例如 node-healthy/logs/...)，形成清晰的子包命名空间
+					// 否则（内部本身未包含同名文件夹）：必须统一生成同名专属目录，将解出内容收纳于 parentDir/cleanName
 					finalDest = filepath.Join(parentDir, cleanName)
 					if _, destErr := os.Stat(finalDest); os.IsNotExist(destErr) {
 						_ = os.Rename(tmpDir, finalDest)

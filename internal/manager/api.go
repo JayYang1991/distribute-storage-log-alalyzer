@@ -156,6 +156,10 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/preprocess/rules/", s.handlePreprocessRuleItem)
 	mux.HandleFunc("/api/preprocess/test", s.handlePreprocessTest)
 
+	// 自定义时序图表解析脚本管理与执行
+	mux.HandleFunc("/api/chart-scripts", s.handleChartScripts)
+	mux.HandleFunc("/api/chart-scripts/", s.handleChartScriptItem)
+
 	// 运维监控度量与微服务标准探针
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -1652,6 +1656,124 @@ func (s *Server) handleArchiveItem(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(nodes)
+		return
+	}
+
+	// 嗅探当前文件是否匹配自定义图表脚本规则
+	if len(parts) == 2 && parts[1] == "chart-match" {
+		filePath := r.URL.Query().Get("file")
+		if filePath == "" {
+			http.Error(w, "缺少文件参数 file", http.StatusBadRequest)
+			return
+		}
+		rules, err := s.store.ListChartScripts()
+		if err != nil {
+			rules = []*model.ChartScriptRule{}
+		}
+		fileName := filepath.Base(filePath)
+		var matched []*model.ChartScriptRule
+		for _, rule := range rules {
+			if !rule.Enabled {
+				continue
+			}
+			pat := strings.TrimSpace(rule.FilePattern)
+			if pat == "" {
+				continue
+			}
+			isMatched := false
+			if re, err := regexp.Compile(pat); err == nil {
+				if re.MatchString(filePath) || re.MatchString(fileName) {
+					isMatched = true
+				}
+			}
+			if !isMatched {
+				if m, _ := filepath.Match(pat, fileName); m {
+					isMatched = true
+				}
+			}
+			if isMatched {
+				matched = append(matched, rule)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(matched)
+		return
+	}
+
+	// 执行自定义图表脚本解析与数据获取
+	if len(parts) == 2 && parts[1] == "chart-execute" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "仅支持 POST 方法", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			FilePath     string `json:"file_path"`
+			ScriptRuleID string `json:"script_rule_id"`
+			StartTime    string `json:"start_time,omitempty"`
+			EndTime      string `json:"end_time,omitempty"`
+			MaxPoints    int    `json:"max_points,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if req.FilePath == "" || req.ScriptRuleID == "" {
+			http.Error(w, "缺少必要参数 file_path 或 script_rule_id", http.StatusBadRequest)
+			return
+		}
+
+		rule, err := s.store.GetChartScript(req.ScriptRuleID)
+		if err != nil || rule == nil {
+			http.Error(w, "未找到指定的图表解析脚本规则", http.StatusNotFound)
+			return
+		}
+		if !rule.Enabled {
+			http.Error(w, "该图表解析脚本规则已被禁用", http.StatusBadRequest)
+			return
+		}
+
+		// 若日志存放在远程业务节点，代理转发至 Worker 节点执行
+		if archive.StorageNodeIP != "" && archive.StorageNodePort > 0 && archive.StorageNodeID != "manager_primary" {
+			execPayload := worker.ChartExecReq{
+				ExtractPath: archive.ExtractPath,
+				FilePath:    req.FilePath,
+				Rule:        rule,
+				StartTime:   req.StartTime,
+				EndTime:     req.EndTime,
+				MaxPoints:   req.MaxPoints,
+			}
+			payloadBytes, _ := json.Marshal(execPayload)
+			url := fmt.Sprintf("http://%s:%d/api/worker/chart/execute", archive.StorageNodeIP, archive.StorageNodePort)
+			postResp, err := s.httpClient.Post(url, "application/json", bytes.NewReader(payloadBytes))
+			if err != nil {
+				http.Error(w, "业务节点连接失败: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer postResp.Body.Close()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(postResp.StatusCode)
+			_, _ = io.Copy(w, postResp.Body)
+			return
+		}
+
+		// 本地执行 (单节点或本地存储模式)
+		fullPath := filepath.Join(archive.ExtractPath, req.FilePath)
+		if !model.IsSafeSubpath(archive.ExtractPath, fullPath) {
+			http.Error(w, "非法文件路径", http.StatusForbidden)
+			return
+		}
+
+		engine := worker.NewChartEngine()
+		dataResp, err := engine.ExecuteScript(r.Context(), rule, fullPath, req.StartTime, req.EndTime, req.MaxPoints)
+		if err != nil {
+			http.Error(w, "图表解析执行失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(dataResp)
 		return
 	}
 
@@ -3164,4 +3286,191 @@ func (s *Server) handlePreprocessTest(w http.ResponseWriter, r *http.Request) {
 		"timestamp": ts,
 	})
 }
+
+// ================= 自定义时序图表脚本规则管理 API =================
+
+// handleChartScripts 列表与新建图表脚本规则 (支持 JSON 与表单文件上传)
+func (s *Server) handleChartScripts(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil || currentUser == nil {
+		http.Error(w, "未授权访问", http.StatusUnauthorized)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.store.ListChartScripts()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rules)
+
+	case http.MethodPost:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可添加时序图表解析脚本", http.StatusForbidden)
+			return
+		}
+
+		contentType := r.Header.Get("Content-Type")
+		var rule model.ChartScriptRule
+
+		if strings.HasPrefix(contentType, "multipart/form-data") {
+			// 表单上传本地脚本文件
+			if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB
+				http.Error(w, "解析表单数据失败: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			rule.Name = strings.TrimSpace(r.FormValue("name"))
+			rule.FilePattern = strings.TrimSpace(r.FormValue("file_pattern"))
+			rule.Interpreter = strings.TrimSpace(r.FormValue("interpreter"))
+			rule.Description = strings.TrimSpace(r.FormValue("description"))
+			rule.Enabled = r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on" || r.FormValue("enabled") == "1"
+
+			file, header, err := r.FormFile("script_file")
+			if err == nil && header != nil {
+				defer file.Close()
+				buf := new(bytes.Buffer)
+				if _, err := io.Copy(buf, file); err == nil {
+					rule.ScriptContent = buf.String()
+					rule.ScriptName = header.Filename
+				}
+			}
+			// 若未传独立文件，则取表单中的 script_content 文本
+			if rule.ScriptContent == "" {
+				rule.ScriptContent = strings.TrimSpace(r.FormValue("script_content"))
+			}
+		} else {
+			// 普通 JSON 提交
+			if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+				http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		if rule.Name == "" || rule.FilePattern == "" || rule.ScriptContent == "" {
+			http.Error(w, "规则名称、目标文件名匹配正则与脚本内容均不可为空", http.StatusBadRequest)
+			return
+		}
+		if rule.Interpreter == "" {
+			rule.Interpreter = "/usr/bin/python3"
+		}
+
+		// 正则表达式合法性校验
+		if _, err := regexp.Compile(rule.FilePattern); err != nil {
+			http.Error(w, "文件名匹配正则表达式不合法: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if rule.ID == "" {
+			rule.ID = fmt.Sprintf("chart_script_%d", time.Now().UnixNano())
+		}
+		rule.CreatedAt = time.Now()
+		rule.UpdatedAt = time.Now()
+
+		if err := s.store.SaveChartScript(&rule); err != nil {
+			http.Error(w, "保存图表脚本规则失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(rule)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleChartScriptItem 单个脚本规则查看、更新与删除
+func (s *Server) handleChartScriptItem(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil || currentUser == nil {
+		http.Error(w, "未授权访问", http.StatusUnauthorized)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/chart-scripts/")
+	if id == "" {
+		http.Error(w, "缺少规则 ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		rule, err := s.store.GetChartScript(id)
+		if err != nil {
+			http.Error(w, "规则不存在", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(rule)
+
+	case http.MethodPut:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可修改时序图表解析脚本", http.StatusForbidden)
+			return
+		}
+
+		existing, err := s.store.GetChartScript(id)
+		if err != nil {
+			http.Error(w, "规则不存在", http.StatusNotFound)
+			return
+		}
+
+		var updated model.ChartScriptRule
+		if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
+			http.Error(w, "请求格式错误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if updated.Name != "" {
+			existing.Name = updated.Name
+		}
+		if updated.FilePattern != "" {
+			if _, err := regexp.Compile(updated.FilePattern); err != nil {
+				http.Error(w, "文件名匹配正则表达式不合法: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			existing.FilePattern = updated.FilePattern
+		}
+		if updated.Interpreter != "" {
+			existing.Interpreter = updated.Interpreter
+		}
+		if updated.ScriptContent != "" {
+			existing.ScriptContent = updated.ScriptContent
+		}
+		if updated.ScriptName != "" {
+			existing.ScriptName = updated.ScriptName
+		}
+		existing.Description = updated.Description
+		existing.Enabled = updated.Enabled
+		existing.UpdatedAt = time.Now()
+
+		if err := s.store.SaveChartScript(existing); err != nil {
+			http.Error(w, "更新脚本规则失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(existing)
+
+	case http.MethodDelete:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可删除时序图表解析脚本", http.StatusForbidden)
+			return
+		}
+
+		if err := s.store.DeleteChartScript(id); err != nil {
+			http.Error(w, "删除脚本规则失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 

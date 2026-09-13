@@ -178,24 +178,104 @@ func TestExtractNestedArchive(t *testing.T) {
 	t.Logf("多层嵌套压缩包递归解压验证全部通过！总行数: %d", totalLines)
 }
 
-func BenchmarkExtractArchive(b *testing.B) {
-	tempDir, err := os.MkdirTemp("", "extractor_bench_*")
+func TestNestedArchiveSameNameDirPolicy(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "extractor_policy_test_*")
 	if err != nil {
-		b.Fatal(err)
+		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	archivePath := filepath.Join(tempDir, "bench_logs.tar.gz")
-	createSampleTarGz(b, archivePath, 5, 1000)
+	// 1. 创建子包 A：内部本身包含同名文件夹 "sub_with_dir/app.log"
+	subWithDirPath := filepath.Join(tempDir, "sub_with_dir.tar.gz")
+	{
+		f, _ := os.Create(subWithDirPath)
+		gw := gzip.NewWriter(f)
+		tw := tar.NewWriter(gw)
+		content := "log line in sub_with_dir"
+		_ = tw.WriteHeader(&tar.Header{
+			Name: "sub_with_dir/app.log",
+			Mode: 0644,
+			Size: int64(len(content)),
+		})
+		_, _ = tw.Write([]byte(content))
+		_ = tw.Close()
+		_ = gw.Close()
+		_ = f.Close()
+	}
 
-	b.ResetTimer()
-	b.ReportAllocs()
+	// 2. 创建子包 B：内部无同名文件夹，仅包含根层文件 "direct.log"
+	subWithoutDirPath := filepath.Join(tempDir, "sub_without_dir.tar.gz")
+	{
+		f, _ := os.Create(subWithoutDirPath)
+		gw := gzip.NewWriter(f)
+		tw := tar.NewWriter(gw)
+		content := "log line in sub_without_dir"
+		_ = tw.WriteHeader(&tar.Header{
+			Name: "direct.log",
+			Mode: 0644,
+			Size: int64(len(content)),
+		})
+		_, _ = tw.Write([]byte(content))
+		_ = tw.Close()
+		_ = gw.Close()
+		_ = f.Close()
+	}
 
-	for i := 0; i < b.N; i++ {
-		targetDir := filepath.Join(tempDir, fmt.Sprintf("out_%d", i))
-		_, _, err := ExtractArchive(archivePath, targetDir)
-		if err != nil {
-			b.Fatal(err)
-		}
+	// 3. 将两个子包打入外层包 outer.tar.gz
+	outerTarGz := filepath.Join(tempDir, "outer.tar.gz")
+	{
+		f, _ := os.Create(outerTarGz)
+		gw := gzip.NewWriter(f)
+		tw := tar.NewWriter(gw)
+
+		dataA, _ := os.ReadFile(subWithDirPath)
+		_ = tw.WriteHeader(&tar.Header{
+			Name: "sub_with_dir.tar.gz",
+			Mode: 0644,
+			Size: int64(len(dataA)),
+		})
+		_, _ = tw.Write(dataA)
+
+		dataB, _ := os.ReadFile(subWithoutDirPath)
+		_ = tw.WriteHeader(&tar.Header{
+			Name: "sub_without_dir.tar.gz",
+			Mode: 0644,
+			Size: int64(len(dataB)),
+		})
+		_, _ = tw.Write(dataB)
+
+		_ = tw.Close()
+		_ = gw.Close()
+		_ = f.Close()
+	}
+
+	// 4. 执行解压
+	targetDir := filepath.Join(tempDir, "extracted")
+	fileList, _, err := ExtractArchive(outerTarGz, targetDir)
+	if err != nil {
+		t.Fatalf("ExtractArchive 失败: %v", err)
+	}
+
+	fileMap := make(map[string]bool)
+	for _, item := range fileList {
+		fileMap[filepath.ToSlash(item.RelativePath)] = true
+		t.Logf("解压文件项: %s (isDir=%v)", filepath.ToSlash(item.RelativePath), item.IsDirectory)
+	}
+
+	// 验证规则 A: 内部自带同名目录 -> 不额外生成同名目录 (即仅一层 sub_with_dir/app.log，不可出现 sub_with_dir/sub_with_dir/app.log)
+	if !fileMap["sub_with_dir/app.log"] {
+		t.Errorf("期望解压出 sub_with_dir/app.log，但未找到")
+	}
+	if fileMap["sub_with_dir/sub_with_dir/app.log"] {
+		t.Errorf("错误：子包内部已有同名文件夹，不应额外嵌套生成同名目录 (出现重复套娃)")
+	}
+
+	// 验证规则 B: 内部未包含同名目录 -> 必须生成同名目录收纳 (即必须在 sub_without_dir/direct.log，不可直接散落在根 direct.log)
+	if !fileMap["sub_without_dir/direct.log"] {
+		t.Errorf("期望解压出 sub_without_dir/direct.log，但未找到")
+	}
+	if fileMap["direct.log"] {
+		t.Errorf("错误：子包内部散列文件未收纳进同名目录，直接散落到了顶级目录")
 	}
 }
+

@@ -428,3 +428,60 @@ func IsSafeSubpath(base, target string) bool {
 	}
 	return true
 }
+
+// ChartScriptRule 客户自定义时序图表解析脚本规则
+type ChartScriptRule struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`           // 规则名称，例如 "Linux iostat 磁盘性能与利用率"
+	FilePattern   string    `json:"file_pattern"`   // 目标文件名通配符/正则表达式，例如 "(?i).*iostat.*\.log$" 或 "**/iostat*.txt"
+	Interpreter   string    `json:"interpreter"`    // 解释器，如 "/usr/bin/python3" 或 "/bin/bash"
+	ScriptContent string    `json:"script_content"` // 脚本源码文本
+	ScriptName    string    `json:"script_name"`    // 上传原始文件名，如 "parse_iostat.py"
+	Description   string    `json:"description"`    // 规则描述与指标说明
+	Enabled       bool      `json:"enabled"`        // 是否启用
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// ChartXAxis 图表横坐标配置
+type ChartXAxis struct {
+	Label string   `json:"label"` // 横坐标标题，如 "采集时间"
+	Type  string   `json:"type"`  // "time" | "category"
+	Data  []string `json:"data"`  // 时间标签数组，如 ["14:00:01", "14:00:02"]
+}
+
+// ChartSeries 图表指标数据系列
+type ChartSeries struct {
+	Name      string    `json:"name"`                 // 指标名称，如 "sda 利用率 (%util)"
+	Unit      string    `json:"unit"`                 // 单位，如 "%", "KB/s", "ms", "IOPS"
+	ChartType string    `json:"chart_type,omitempty"` // "line" | "area" | "bar"
+	Data      []float64 `json:"data"`                 // 对应的数值数组
+}
+
+// ChartAnomaly 突变异常点
+type ChartAnomaly struct {
+	Time       string  `json:"time"`                  // 发生时间戳
+	Index      int     `json:"index"`                 // 对应横坐标的数据点索引
+	Metric     string  `json:"metric"`                // 突变指标系列名称
+	Value      float64 `json:"value"`                 // 突变时刻数值
+	Severity   string  `json:"severity"`              // CRITICAL | WARNING
+	Reason     string  `json:"reason"`                // 突变描述，如 "利用率骤增至 99.8% (+86.3%)"
+	LineNumber int     `json:"line_number,omitempty"` // 原始日志文件对应的绝对行号 (用于穿透高亮)
+}
+
+// ChartDataResponse 完整的时序图表响应数据载荷
+type ChartDataResponse struct {
+	Title        string         `json:"title"`                   // 图表主标题
+	Description  string         `json:"description,omitempty"`   // 图表辅助描述
+	XAxis        ChartXAxis     `json:"x_axis"`                  // 横坐标定义
+	Series       []ChartSeries  `json:"series"`                  // 指标系列数据
+	Anomalies    []ChartAnomaly `json:"anomalies,omitempty"`     // 识别出的突变异常事件列表
+	TotalPoints  int            `json:"total_points"`            // 原始全量点位总数
+	Downsampled  bool           `json:"downsampled"`             // 是否经过了框架自动极值降采样
+	Resolution   string         `json:"resolution,omitempty"`    // 当前分辨率描述 (如 "降采样全景 (1500点)" 或 "高精原始秒级点位")
+	StartTime    string         `json:"start_time,omitempty"`    // 当前视口起始时间
+	EndTime      string         `json:"end_time,omitempty"`      // 当前视口结束时间
+	MatchedFile  string         `json:"matched_file,omitempty"`  // 命中的日志文件相对路径
+	ScriptRuleID string         `json:"script_rule_id,omitempty"`// 执行的脚本规则ID
+}
+
