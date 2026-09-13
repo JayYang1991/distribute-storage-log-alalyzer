@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"dist-log-analyzer/internal/ai"
 	"dist-log-analyzer/internal/config"
 	"dist-log-analyzer/internal/indexer"
 	"dist-log-analyzer/internal/model"
@@ -37,6 +38,7 @@ type Server struct {
 	store                *store.Store
 	scheduler            *Scheduler
 	ha                   *HAManager
+	aiSvc                *ai.Service
 	sessions             sync.Map // token -> username
 	server               *http.Server
 	staticFS             http.FileSystem
@@ -51,11 +53,18 @@ func NewServer(cfg *config.Config, s *store.Store, staticFS http.FileSystem) *Se
 		MaxIdleConnsPerHost: 50,
 		IdleConnTimeout:     90 * time.Second,
 	}
+
+	aiService, err := ai.NewService(s, cfg.AI)
+	if err != nil {
+		log.Printf("⚠️ 初始化 AI 智能服务失败: %v", err)
+	}
+
 	srv := &Server{
 		cfg:       cfg,
 		store:     s,
 		scheduler: NewScheduler(s),
 		ha:        NewHAManager(cfg, s),
+		aiSvc:     aiService,
 		staticFS:  staticFS,
 		httpClient: &http.Client{
 			Transport: transport,
@@ -146,6 +155,12 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/rules/reset", s.handleResetDefaultRules)
 	mux.HandleFunc("/api/rules/", s.handleRuleItem)
 	mux.HandleFunc("/api/reports/", s.handleReports)
+
+	// AI 大模型智能根因诊断与专有知识库
+	mux.HandleFunc("/api/reports/ai-stream/", s.handleAIDiagnosisStream)
+	mux.HandleFunc("/api/ai/config", s.handleAIConfig)
+	mux.HandleFunc("/api/ai/knowledge", s.handleAIKnowledge)
+	mux.HandleFunc("/api/ai/noise", s.handleAINoise)
 
 	// 通用分布式日志分析增强：基准差分对比与模板聚类
 	mux.HandleFunc("/api/analysis/diff", s.handleAnalysisDiff)
@@ -3472,5 +3487,251 @@ func (s *Server) handleChartScriptItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
+
+// ================= AI 大模型分析与领域知识 API =================
+
+// handleAIDiagnosisStream SSE 流式生成大模型根因分析报告
+func (s *Server) handleAIDiagnosisStream(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	archiveID := r.URL.Query().Get("archive_id")
+	if archiveID == "" {
+		archiveID = strings.TrimPrefix(r.URL.Path, "/api/reports/ai-stream/")
+	}
+	archiveID = strings.TrimSpace(archiveID)
+
+	archive, err := s.store.GetArchive(archiveID)
+	if err != nil {
+		http.Error(w, "归档日志不存在", http.StatusNotFound)
+		return
+	}
+
+	if currentUser.Role != model.RoleAdmin && archive.Username != currentUser.Username {
+		http.Error(w, "无权分析此日志归档", http.StatusForbidden)
+		return
+	}
+
+	report, err := s.store.GetReport(archiveID)
+	if err != nil || report == nil {
+		http.Error(w, "该日志尚未完成基础规则诊断，请等待解包与规则初筛完成", http.StatusBadRequest)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "当前连接不支持流式输出 (Streaming unsupported)", http.StatusInternalServerError)
+		return
+	}
+
+	// 开启 SSE (显式指定 UTF-8 字符集)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	cfg := s.aiSvc.GetConfig()
+	startMsg, _ := json.Marshal(map[string]interface{}{
+		"type":       "start",
+		"archive_id": archiveID,
+		"model":      cfg.Model,
+		"provider":   cfg.Provider,
+	})
+	fmt.Fprintf(w, "data: %s\n\n", startMsg)
+	flusher.Flush()
+
+	result, err := s.aiSvc.StreamAnalyzeReport(r.Context(), report, func(chunk string) error {
+		chunkPayload, _ := json.Marshal(map[string]interface{}{
+			"type":  "chunk",
+			"chunk": chunk,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", chunkPayload)
+		flusher.Flush()
+		return nil
+	})
+
+	if err != nil && result == nil {
+		errMsg, _ := json.Marshal(map[string]interface{}{
+			"type":  "error",
+			"error": err.Error(),
+		})
+		fmt.Fprintf(w, "data: %s\n\n", errMsg)
+		flusher.Flush()
+		return
+	}
+
+	// 将 AI 分析结果持久化到诊断报告中
+	report.AIAnalysis = result
+	_ = s.store.SaveReport(report)
+
+	doneMsg, _ := json.Marshal(map[string]interface{}{
+		"type":   "done",
+		"result": result,
+	})
+	fmt.Fprintf(w, "data: %s\n\n", doneMsg)
+	flusher.Flush()
+}
+
+// handleAIConfig 管理大模型配置
+func (s *Server) handleAIConfig(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		cfg := s.aiSvc.GetConfig()
+		// 安全脱敏 API Key
+		if cfg.APIKey != "" && len(cfg.APIKey) > 8 {
+			cfg.APIKey = cfg.APIKey[:4] + "****" + cfg.APIKey[len(cfg.APIKey)-4:]
+		} else if cfg.APIKey != "" {
+			cfg.APIKey = "********"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfg)
+
+	case http.MethodPost:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可修改 AI 模型配置", http.StatusForbidden)
+			return
+		}
+		var newCfg model.AIConfig
+		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+			http.Error(w, "参数解析失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		oldCfg := s.aiSvc.GetConfig()
+		// 若传过来的是脱敏的 key，则保留原有的有效 key
+		if strings.Contains(newCfg.APIKey, "****") {
+			newCfg.APIKey = oldCfg.APIKey
+		}
+
+		if err := s.aiSvc.UpdateConfig(newCfg); err != nil {
+			http.Error(w, "更新配置失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "配置更新成功"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleAIKnowledge 统一管理领域知识库 (专有术语词典、业务流程、误报白名单)
+func (s *Server) handleAIKnowledge(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		glossary, _ := s.store.GetAIGlossary()
+		workflows, _ := s.store.GetAIWorkflows()
+		noiseRules, _ := s.store.GetAINoiseRules()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"glossary":    glossary,
+			"workflows":   workflows,
+			"noise_rules": noiseRules,
+		})
+
+	case http.MethodPost:
+		if currentUser.Role != model.RoleAdmin {
+			http.Error(w, "仅管理员可修改专有知识库与业务流程", http.StatusForbidden)
+			return
+		}
+		var payload struct {
+			Glossary   []model.AIGlossaryTerm      `json:"glossary"`
+			Workflows  []model.AIWorkflowDefinition `json:"workflows"`
+			NoiseRules []model.AINoiseRule         `json:"noise_rules"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "参数解析失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if payload.Glossary != nil {
+			_ = s.store.SaveAIGlossary(payload.Glossary)
+		}
+		if payload.Workflows != nil {
+			_ = s.store.SaveAIWorkflows(payload.Workflows)
+		}
+		if payload.NoiseRules != nil {
+			_ = s.store.SaveAINoiseRules(payload.NoiseRules)
+		}
+
+		_ = s.aiSvc.ReloadKnowledge()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "知识库已保存并生效"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleAINoise 一键标记误报并加入白名单
+func (s *Server) handleAINoise(w http.ResponseWriter, r *http.Request) {
+	currentUser, err := s.authenticate(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Pattern     string `json:"pattern"`
+		Reason      string `json:"reason"`
+		StorageType string `json:"storage_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Pattern) == "" {
+		http.Error(w, "Pattern 不能为空", http.StatusBadRequest)
+		return
+	}
+
+	if req.Reason == "" {
+		req.Reason = fmt.Sprintf("由工程师 %s 于 %s 手动标记为非致命误报", currentUser.Username, time.Now().Format("2006-01-02 15:04"))
+	}
+	if req.StorageType == "" {
+		req.StorageType = "ALL"
+	}
+
+	rule := model.AINoiseRule{
+		ID:          fmt.Sprintf("NOISE-CUSTOM-%d", time.Now().Unix()),
+		Pattern:     regexp.QuoteMeta(strings.TrimSpace(req.Pattern)),
+		Reason:      req.Reason,
+		StorageType: req.StorageType,
+		Enabled:     true,
+		CreatedAt:   time.Now(),
+	}
+
+	if err := s.store.AddAINoiseRule(rule); err != nil {
+		http.Error(w, "添加误报规则失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = s.aiSvc.ReloadKnowledge()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"message": "已成功标记并加入误报抑制库，后续分析将自动免疫此日志！",
+		"rule":    rule,
+	})
+}
+
 
 

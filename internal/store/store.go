@@ -1345,3 +1345,133 @@ func (s *Store) GetAlarmSummary() model.AlarmSummary {
 	return sum
 }
 
+// ================= AI 大模型分析与知识库存储 =================
+
+var (
+	keyAIConfig     = []byte("ai_config")
+	keyAIGlossary   = []byte("ai_glossary")
+	keyAIWorkflows  = []byte("ai_workflows")
+	keyAINoiseRules = []byte("ai_noise_rules")
+)
+
+// SaveAIConfig 保存 AI 配置
+func (s *Store) SaveAIConfig(cfg *model.AIConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyAIConfig, data)
+	})
+}
+
+// GetAIConfig 读取 AI 配置
+func (s *Store) GetAIConfig() (*model.AIConfig, error) {
+	var cfg *model.AIConfig
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyAIConfig)
+		if data == nil {
+			return errors.New("ai_config not found")
+		}
+		return json.Unmarshal(data, &cfg)
+	})
+	return cfg, err
+}
+
+// SaveAIGlossary 保存企业专有术语表
+func (s *Store) SaveAIGlossary(terms []model.AIGlossaryTerm) error {
+	data, err := json.Marshal(terms)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyAIGlossary, data)
+	})
+}
+
+// GetAIGlossary 读取企业专有术语表
+func (s *Store) GetAIGlossary() ([]model.AIGlossaryTerm, error) {
+	var terms []model.AIGlossaryTerm
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyAIGlossary)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &terms)
+	})
+	return terms, err
+}
+
+// SaveAIWorkflows 保存业务流程定义
+func (s *Store) SaveAIWorkflows(wfs []model.AIWorkflowDefinition) error {
+	data, err := json.Marshal(wfs)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyAIWorkflows, data)
+	})
+}
+
+// GetAIWorkflows 读取业务流程定义
+func (s *Store) GetAIWorkflows() ([]model.AIWorkflowDefinition, error) {
+	var wfs []model.AIWorkflowDefinition
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyAIWorkflows)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &wfs)
+	})
+	return wfs, err
+}
+
+// SaveAINoiseRules 保存误报过滤规则
+func (s *Store) SaveAINoiseRules(rules []model.AINoiseRule) error {
+	data, err := json.Marshal(rules)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		return b.Put(keyAINoiseRules, data)
+	})
+}
+
+// GetAINoiseRules 读取误报过滤规则
+func (s *Store) GetAINoiseRules() ([]model.AINoiseRule, error) {
+	var rules []model.AINoiseRule
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSettings)
+		data := b.Get(keyAINoiseRules)
+		if data == nil {
+			return nil
+		}
+		return json.Unmarshal(data, &rules)
+	})
+	return rules, err
+}
+
+// AddAINoiseRule 追加单条误报过滤规则
+func (s *Store) AddAINoiseRule(rule model.AINoiseRule) error {
+	rules, err := s.GetAINoiseRules()
+	if err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+		return err
+	}
+	// 避免重复
+	for _, r := range rules {
+		if r.Pattern == rule.Pattern {
+			return nil
+		}
+	}
+	rules = append(rules, rule)
+	return s.SaveAINoiseRules(rules)
+}
+
+

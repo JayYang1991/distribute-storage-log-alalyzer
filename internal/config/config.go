@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"dist-log-analyzer/internal/model"
 )
 
 // Config 系统配置
@@ -31,6 +33,9 @@ type Config struct {
 	GatewayIP          string `json:"gateway_ip"`            // 默认网关 IP (为空时自动从系统路由探测)
 	EnableGatewayCheck bool   `json:"enable_gateway_check"`  // 开启网关连通性自检 (默认 true)
 	EnableWorkerQuorum bool   `json:"enable_worker_quorum"`  // 开启 Worker 反向多数派仲裁 (默认 true)
+
+	// AI 大模型智能分析配置
+	AI model.AIConfig `json:"ai"`
 
 	InitialAdmin struct {
 		Username string `json:"username"`
@@ -110,6 +115,14 @@ func DefaultConfig() *Config {
 		SyncIntervalSec:      5,
 		EnableGatewayCheck:   true,
 		EnableWorkerQuorum:   true,
+		AI: model.AIConfig{
+			Enabled:             true,
+			Provider:            "mock", // 默认开箱即用内置自研推断引擎，亦支持切换为 ollama, vllm, openai
+			BaseURL:             "http://127.0.0.1:11434/v1",
+			Model:               "deepseek-r1:70b",
+			TimeoutSec:          120,
+			AutoAnalyzeCritical: false,
+		},
 	}
 	cfg.InitialAdmin.Username = "admin"
 	cfg.InitialAdmin.Password = "admin123"

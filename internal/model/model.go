@@ -182,6 +182,9 @@ type DiagnosisReport struct {
 	HealthScore     int              `json:"health_score"` // 0-100
 	SummaryText     string           `json:"summary_text"`
 	AnalyzedAt      time.Time        `json:"analyzed_at"`
+
+	// AI 深度分析增强结果 (根因、传播链路、降噪忽略说明等)
+	AIAnalysis      *AIAnalysisResult `json:"ai_analysis,omitempty"`
 }
 
 // ArchiveCallbackReq Worker 异步解包与诊断完成后向 Manager 回调上报的数据包
@@ -484,4 +487,70 @@ type ChartDataResponse struct {
 	MatchedFile  string         `json:"matched_file,omitempty"`  // 命中的日志文件相对路径
 	ScriptRuleID string         `json:"script_rule_id,omitempty"`// 执行的脚本规则ID
 }
+
+// AIAnalysisResult 大模型深度根因与传播链推导结果
+type AIAnalysisResult struct {
+	Status           string    `json:"status"`            // analyzing, completed, failed
+	ModelName        string    `json:"model_name"`        // 使用的模型名称
+	RootCause        string    `json:"root_cause"`        // 推断的根本原因 (RCA)
+	PropagationChain []string  `json:"propagation_chain"` // 故障传播链条 (如 ["从节点磁盘超时", "主节点等待失败", "客户端EIO"])
+	BrokenStage      string    `json:"broken_stage"`      // 中断的业务流程阶段 (如 "PEER_WAL_COMMIT")
+	IgnoredNoises    []string  `json:"ignored_noises"`    // 识别并过滤的误报/良性干扰日志
+	ActionPlan       []string  `json:"action_plan"`       // 建议的专家处置命令与行动方案
+	RawMarkdown      string    `json:"raw_markdown"`      // 生成的完整 Markdown 报告
+	PromptTokens     int       `json:"prompt_tokens"`     // 消耗的 Prompt Token 数
+	CompletionTokens int       `json:"completion_tokens"` // 消耗的输出 Token 数
+	AnalyzedAt       time.Time `json:"analyzed_at"`       // 分析完成时间
+}
+
+// AIGlossaryTerm 企业专有术语与缩写定义
+type AIGlossaryTerm struct {
+	Term           string   `json:"term"`            // 缩写或术语名称，如 "CHUNK_SEAL"
+	FullName       string   `json:"full_name"`       // 全称，如 "数据分块定稿封装"
+	Module         string   `json:"module"`          // 所属模块，如 "StorageEngine", "MDS", "Raft"
+	Definition     string   `json:"definition"`      // 核心业务机理定义
+	FailureImpact  string   `json:"failure_impact"`  // 异常时的连锁反应与影响
+	CommonPatterns []string `json:"common_patterns"` // 日志中出现的常见匹配关键词
+}
+
+// AIWorkflowStage 业务流程单阶段定义
+type AIWorkflowStage struct {
+	Step           int      `json:"step"`            // 步骤序号 (1-indexed)
+	Name           string   `json:"name"`            // 阶段名，如 "ALLOC_CHUNK"
+	Description    string   `json:"description"`     // 阶段描述
+	SourceModule   string   `json:"source_module"`   // 发起模块
+	TargetModule   string   `json:"target_module"`   // 目标模块
+	SuccessPattern string   `json:"success_pattern"` // 阶段成功特征正则
+	TimeoutMs      int      `json:"timeout_ms"`      // 预期超时毫秒数
+}
+
+// AIWorkflowDefinition 企业自定义业务流程状态机
+type AIWorkflowDefinition struct {
+	ID          string            `json:"id"`          // 流程唯一标识，如 "WRITE_DATA_FLOW"
+	Name        string            `json:"name"`        // 流程名称，如 "多副本数据写入流程"
+	Description string            `json:"description"` // 流程详细说明
+	Stages      []AIWorkflowStage `json:"stages"`      // 流程阶段定义序列
+}
+
+// AINoiseRule 误报与假告警抑制规则
+type AINoiseRule struct {
+	ID          string    `json:"id"`          // 规则ID
+	Pattern     string    `json:"pattern"`     // 匹配正则 (如 "ERR: lease file not found, creating new one")
+	Reason      string    `json:"reason"`      // 误报理由说明
+	StorageType string    `json:"storage_type"`// 适用存储类型 (ALL, ceph, hdfs 等)
+	Enabled     bool      `json:"enabled"`     // 是否启用
+	CreatedAt   time.Time `json:"created_at"`  // 创建时间
+}
+
+// AIConfig 大模型配置
+type AIConfig struct {
+	Enabled             bool   `json:"enabled"`               // 是否启用 AI 分析
+	Provider            string `json:"provider"`              // openai, ollama, vllm, mock
+	BaseURL             string `json:"base_url"`              // 接口地址，如 http://localhost:11434/v1 或 https://api.deepseek.com/v1
+	APIKey              string `json:"api_key"`               // API 密钥 (本地 Ollama/vLLM 可为空)
+	Model               string `json:"model"`                 // 模型名称，如 deepseek-r1:70b, qwen2.5:72b, gpt-4o
+	TimeoutSec          int    `json:"timeout_sec"`           // 请求超时时间 (秒)，默认 120
+	AutoAnalyzeCritical bool   `json:"auto_analyze_critical"`// 是否对 CRITICAL/FATAL 级别日志自动执行后台分析
+}
+
 

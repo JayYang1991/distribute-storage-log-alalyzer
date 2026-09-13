@@ -3377,7 +3377,10 @@ const app = {
                 <strong style="margin-left: 8px;">${this.escape(ev.rule_name)}</strong>
                 <span style="color: var(--text-dim); font-size: 11px; margin-left: 6px;">[组件: ${ev.storage_type}]</span>
               </div>
-              <span style="font-size: 11px; color: var(--text-dim);">${ev.timestamp || ''}</span>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <button class="btn btn-xs" style="background: rgba(239, 68, 68, 0.1); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.25); font-size: 10px; padding: 2px 6px; cursor: pointer;" onclick="app.markLogAsNoise('${this.escape(ev.matched_content)}', '${this.escape(ev.rule_name)}')" title="标记此类日志为非致命误报，后续AI分析将自动免疫过滤">🚫 标记误报</button>
+                <span style="font-size: 11px; color: var(--text-dim);">${ev.timestamp || ''}</span>
+              </div>
             </div>
             <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">
               位置: <code>${this.escape(ev.file_path)} : 第 ${ev.line_number} 行</code>
@@ -3398,6 +3401,22 @@ const app = {
       </div>`;
     }
 
+    const aiAnalysis = rep.ai_analysis;
+    let aiContentHtml = "";
+    if (aiAnalysis && aiAnalysis.raw_markdown) {
+      aiContentHtml = this.formatMarkdown(aiAnalysis.raw_markdown);
+    } else {
+      aiContentHtml = `
+        <div style="text-align: center; color: var(--text-muted); padding: 18px 10px;">
+          <div style="font-size: 26px; margin-bottom: 8px;">🧠</div>
+          <p style="font-size: 13px; color: #cbd5e1; max-width: 600px; margin: 0 auto 10px auto; line-height: 1.6;">
+            点击右上角【启动 AI 根因推演】，系统将执行<strong>专有术语映射、业务流程投影并自动消噪免疫</strong>，生成端到端故障因果传播链路与专家排障处置指令。
+          </p>
+          <button class="btn btn-sm btn-primary btn-ai-sparkle" onclick="app.startAIDiagnosisStream('${rep.archive_id}')">✨ 立即生成 AI 深度诊断报告</button>
+        </div>
+      `;
+    }
+
     body.innerHTML = `
       <div class="health-score-container">
         <div class="score-circle" style="border-color: ${scoreColor};">
@@ -3412,6 +3431,23 @@ const app = {
             <span class="badge badge-danger">严重错误 (CRITICAL): ${critCount}</span>
             <span class="badge badge-warning">警告异常 (WARNING): ${warnCount}</span>
           </div>
+        </div>
+      </div>
+
+      <!-- 🤖 AI 智能根因分析与传播链 (RCA) 专区 -->
+      <div class="ai-rca-card" id="diag-ai-card">
+        <div class="ai-rca-header">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 16px;">🤖</span>
+            <strong style="font-size: 13.5px; color: #f8fafc;">AI 专家深度根因与时序传播链推导 (RCA)</strong>
+            <span class="badge badge-info" style="font-size: 10px; background: rgba(56, 189, 248, 0.15); color: #38bdf8;">消噪免疫 + 专有术语 + 状态机投影</span>
+          </div>
+          <button class="btn btn-sm btn-primary btn-ai-sparkle" id="btn-trigger-ai" onclick="app.startAIDiagnosisStream('${rep.archive_id}')">
+            ${aiAnalysis ? '🔄 重新发起 AI 深度推演' : '✨ 启动 AI 根因推演'}
+          </button>
+        </div>
+        <div class="ai-rca-body" id="diag-ai-content">
+          ${aiContentHtml}
         </div>
       </div>
 
@@ -5991,6 +6027,374 @@ print(json.dumps(result))
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     if (i >= sizes.length) return (bytes / Math.pow(k, sizes.length - 1)).toFixed(2) + " " + sizes[sizes.length - 1];
     return (bytes / Math.pow(k, i)).toFixed(2) + " " + sizes[i];
+  },
+
+  // ================= 🤖 AI 根因推演与知识库交互 =================
+
+  formatMarkdown(md) {
+    if (!md) return "";
+    // 1. 先抽取保护代码块，避免代码块内部符号被 Markdown 规则破坏
+    const codeBlocks = [];
+    let text = md.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
+      const id = `__CODE_BLOCK_${codeBlocks.length}__`;
+      codeBlocks.push(`<pre style="background:#080c14; border:1px solid rgba(255,255,255,0.1); border-radius:6px; padding:12px; margin:10px 0; overflow-x:auto;"><code class="language-${lang}">${this.escape(code)}</code></pre>`);
+      return id;
+    });
+
+    let html = this.escape(text);
+
+    // 2. 行内代码与粗体
+    html = html.replace(/`([^`\n]+)`/g, '<code style="color:#38bdf8; background:rgba(56,189,248,0.1); padding:2px 5px; border-radius:3px;">$1</code>');
+    html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+
+    // 3. 标题
+    html = html.replace(/^#### (.*$)/gim, '<h5 style="color:#38bdf8; font-size:13px; margin: 12px 0 6px 0;">$1</h5>');
+    html = html.replace(/^### (.*$)/gim, '<h4 style="color:#38bdf8; font-size:14px; margin: 14px 0 8px 0; border-bottom: 1px solid rgba(56,189,248,0.2); padding-bottom: 4px;">$1</h4>');
+    html = html.replace(/^## (.*$)/gim, '<h3 style="color:#f8fafc; font-size:15px; margin: 16px 0 10px 0;">$1</h3>');
+
+    // 4. 引用块 (> 或 &gt;)
+    html = html.replace(/^(&gt;|>)\s*(.*$)/gim, '<blockquote style="border-left: 3px solid #38bdf8; padding: 6px 12px; margin: 8px 0; background: rgba(56,189,248,0.08); color: #cbd5e1; border-radius: 0 4px 4px 0;">$2</blockquote>');
+
+    // 5. 无序列表 (-)
+    html = html.replace(/^\s*-\s+(.*$)/gim, '<li style="margin-left: 20px; list-style-type: disc; margin-bottom: 4px;">$1</li>');
+
+    // 6. 段落与换行
+    html = html.replace(/\n\n/g, '<div style="height: 8px;"></div>');
+    html = html.replace(/\n/g, '<br>');
+
+    // 7. 还原被保护的代码块
+    codeBlocks.forEach((block, idx) => {
+      html = html.replace(`__CODE_BLOCK_${idx}__`, block);
+    });
+
+    return html;
+  },
+
+  async startAIDiagnosisStream(archiveID) {
+    const contentEl = document.getElementById("diag-ai-content");
+    const triggerBtn = document.getElementById("btn-trigger-ai");
+    if (!contentEl) return;
+
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.innerHTML = "⏳ AI 正在深度推演中...";
+    }
+
+    contentEl.innerHTML = `<div class="ai-streaming-cursor" style="color: #38bdf8; font-family: monospace;">正在启动企业级消噪免疫引擎并装配专有时序状态机...</div>`;
+
+    let buffer = "";
+    try {
+      const token = localStorage.getItem("token") || "";
+      const response = await fetch(`/api/reports/ai-stream/?archive_id=${encodeURIComponent(archiveID)}&token=${encodeURIComponent(token)}`);
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let partialLine = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+        const lines = (partialLine + text).split("\n");
+        partialLine = lines.pop();
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: ")) continue;
+          const dataStr = trimmed.substring(6).trim();
+          if (dataStr === "[DONE]") break;
+
+          try {
+            const ev = JSON.parse(dataStr);
+            if (ev.type === "chunk" && ev.chunk) {
+              buffer += ev.chunk;
+              contentEl.innerHTML = this.formatMarkdown(buffer) + `<span class="ai-streaming-cursor"></span>`;
+              contentEl.scrollTop = contentEl.scrollHeight;
+            } else if (ev.type === "error") {
+              buffer += `\n> ❌ **分析错误**: ${this.escape(ev.error)}\n`;
+              contentEl.innerHTML = this.formatMarkdown(buffer);
+            } else if (ev.type === "done") {
+              contentEl.innerHTML = this.formatMarkdown(buffer);
+            }
+          } catch (e) {
+            // 非 JSON 数据
+          }
+        }
+      }
+
+      contentEl.innerHTML = this.formatMarkdown(buffer);
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.innerHTML = "🔄 重新发起 AI 深度推演";
+      }
+    } catch (err) {
+      contentEl.innerHTML = `<div style="color: #ef4444; padding: 12px; background: rgba(239,68,68,0.1); border-radius: 4px;">❌ AI 流式分析异常: ${this.escape(err.message)}</div>`;
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.innerHTML = "✨ 重试 AI 根因推演";
+      }
+    }
+  },
+
+  async markLogAsNoise(content, ruleName) {
+    const preview = content.length > 80 ? content.substring(0, 80) + "..." : content;
+    if (!confirm(`确定要将以下日志特征标记为【非致命误报】并加入白名单吗？\n\n“${preview}”\n\n标记后，后续 AI 大模型分析将自动对此类日志进行消噪免疫，绝不会将其误判为故障根因！`)) {
+      return;
+    }
+
+    try {
+      const res = await this.api("/api/ai/noise", "POST", {
+        pattern: content,
+        reason: `由工程师针对规则【${ruleName || '未知'}】手动标记为误报`,
+        storage_type: "ALL"
+      });
+      if (!res.ok) {
+        alert("标记失败: " + (await res.text()));
+        return;
+      }
+      const ret = await res.json();
+      alert("✔ " + ret.message);
+    } catch (e) {
+      alert("网络异常: " + e.message);
+    }
+  },
+
+  async openAIConfigModal() {
+    try {
+      const res = await this.api("/api/ai/config");
+      if (!res.ok) throw new Error(await res.text());
+      const cfg = await res.json();
+
+      document.getElementById("ai-cfg-enabled").checked = cfg.enabled !== false;
+      document.getElementById("ai-cfg-provider").value = cfg.provider || "mock";
+      document.getElementById("ai-cfg-baseurl").value = cfg.base_url || "http://127.0.0.1:11434/v1";
+      document.getElementById("ai-cfg-model").value = cfg.model || "deepseek-r1:70b";
+      document.getElementById("ai-cfg-apikey").value = cfg.api_key || "";
+      document.getElementById("ai-cfg-timeout").value = cfg.timeout_sec || 120;
+      document.getElementById("ai-cfg-auto-critical").checked = !!cfg.auto_analyze_critical;
+
+      this.onAIProviderChange();
+      this.openModal("modal-ai-config");
+    } catch (e) {
+      alert("获取 AI 配置失败: " + e.message);
+    }
+  },
+
+  onAIProviderChange() {
+    const prov = document.getElementById("ai-cfg-provider").value;
+    const urlGroup = document.getElementById("ai-cfg-baseurl-group");
+    const keyGroup = document.getElementById("ai-cfg-apikey-group");
+    const urlInput = document.getElementById("ai-cfg-baseurl");
+    const modelInput = document.getElementById("ai-cfg-model");
+
+    if (prov === "mock") {
+      urlGroup.style.display = "none";
+      keyGroup.style.display = "none";
+      if (!modelInput.value) modelInput.value = "builtin-heuristic:v2";
+    } else {
+      urlGroup.style.display = "block";
+      keyGroup.style.display = "block";
+      if (prov === "ollama") {
+        if (!urlInput.value || urlInput.value.includes("deepseek.com")) urlInput.value = "http://127.0.0.1:11434/v1";
+        if (!modelInput.value || modelInput.value.includes("builtin")) modelInput.value = "deepseek-r1:70b";
+      } else if (prov === "vllm") {
+        if (!urlInput.value || urlInput.value.includes("11434")) urlInput.value = "http://127.0.0.1:8000/v1";
+      } else if (prov === "openai") {
+        if (!urlInput.value || urlInput.value.includes("127.0.0.1")) urlInput.value = "https://api.deepseek.com/v1";
+      }
+    }
+  },
+
+  async saveAIConfig() {
+    const enabled = document.getElementById("ai-cfg-enabled").checked;
+    const provider = document.getElementById("ai-cfg-provider").value;
+    const baseURL = document.getElementById("ai-cfg-baseurl").value.trim();
+    const model = document.getElementById("ai-cfg-model").value.trim();
+    const apiKey = document.getElementById("ai-cfg-apikey").value.trim();
+    const timeoutSec = parseInt(document.getElementById("ai-cfg-timeout").value, 10) || 120;
+    const autoCrit = document.getElementById("ai-cfg-auto-critical").checked;
+
+    try {
+      const res = await this.api("/api/ai/config", "POST", {
+        enabled,
+        provider,
+        base_url: baseURL,
+        model,
+        api_key: apiKey,
+        timeout_sec: timeoutSec,
+        auto_analyze_critical: autoCrit
+      });
+      if (!res.ok) throw new Error(await res.text());
+      alert("✔ AI 大模型服务配置保存成功！");
+      this.closeModal("modal-ai-config");
+    } catch (e) {
+      alert("保存失败: " + e.message);
+    }
+  },
+
+  _currentKnowledgeData: null,
+
+  async openAIKnowledgeModal() {
+    try {
+      const res = await this.api("/api/ai/knowledge");
+      if (!res.ok) throw new Error(await res.text());
+      this._currentKnowledgeData = await res.json();
+
+      this.switchKnowledgeTab("glossary");
+      this.openModal("modal-ai-knowledge");
+    } catch (e) {
+      alert("加载专有知识库失败: " + e.message);
+    }
+  },
+
+  switchKnowledgeTab(tab) {
+    const tabs = ["glossary", "workflows", "noise"];
+    tabs.forEach(t => {
+      const btn = document.getElementById(`btn-know-tab-${t}`);
+      const pane = document.getElementById(`know-pane-${t}`);
+      if (btn) btn.className = `btn btn-sm ${t === tab ? 'btn-primary' : 'btn-secondary'}`;
+      if (pane) pane.style.display = (t === tab ? 'block' : 'none');
+    });
+
+    if (!this._currentKnowledgeData) return;
+
+    if (tab === "glossary") this.renderAIGlossary(this._currentKnowledgeData.glossary || []);
+    else if (tab === "workflows") this.renderAIWorkflows(this._currentKnowledgeData.workflows || []);
+    else if (tab === "noise") this.renderAINoiseRules(this._currentKnowledgeData.noise_rules || []);
+  },
+
+  renderAIGlossary(terms) {
+    const tbody = document.querySelector("#table-ai-glossary tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    terms.forEach((t, idx) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><strong style="color: #38bdf8;">${this.escape(t.term)}</strong></td>
+        <td>${this.escape(t.full_name || '-')}</td>
+        <td><code>${this.escape(t.module || '-')}</code></td>
+        <td style="font-size: 12px; color: var(--text-muted);">${this.escape(t.definition)}</td>
+        <td>
+          <button class="btn btn-danger btn-xs" onclick="app.deleteGlossaryItem(${idx})">删除</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+  },
+
+  renderAIWorkflows(workflows) {
+    const container = document.getElementById("know-workflows-list");
+    if (!container) return;
+    container.innerHTML = "";
+    workflows.forEach(wf => {
+      const item = document.createElement("div");
+      item.style.background = "rgba(255, 255, 255, 0.03)";
+      item.style.border = "1px solid var(--border-color)";
+      item.style.borderRadius = "6px";
+      item.style.padding = "12px 16px";
+
+      let stagesHtml = wf.stages.map(st => `
+        <div style="display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px;">
+          <span class="ai-chain-step">步骤 ${st.step}</span>
+          <strong style="color: #f1f5f9;">${this.escape(st.name)}</strong>
+          <span style="color: var(--text-dim);">(${this.escape(st.source_module)} ➔ ${this.escape(st.target_module)})</span>
+          <span style="color: var(--text-muted); margin-left: auto;">${this.escape(st.description)}</span>
+        </div>
+      `).join("");
+
+      item.innerHTML = `
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <strong style="font-size: 14px; color: #34d399;">${this.escape(wf.name)} <code>(${this.escape(wf.id)})</code></strong>
+        </div>
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">${this.escape(wf.description)}</p>
+        <div style="background: rgba(0, 0, 0, 0.25); border-radius: 4px; padding: 8px 12px;">${stagesHtml}</div>
+      `;
+      container.appendChild(item);
+    });
+  },
+
+  renderAINoiseRules(rules) {
+    const tbody = document.querySelector("#table-ai-noise tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    rules.forEach((r, idx) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><code style="color: #f87171; font-size: 11px;">${this.escape(r.pattern)}</code></td>
+        <td style="font-size: 12px; color: var(--text-muted);">${this.escape(r.reason)}</td>
+        <td><span class="badge badge-muted">${this.escape(r.storage_type || 'ALL')}</span></td>
+        <td>
+          <button class="btn btn-danger btn-xs" onclick="app.deleteNoiseItem(${idx})">删除</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+  },
+
+  async openAddGlossaryModal() {
+    const term = prompt("请输入专有术语或缩写 (如 CHUNK_SEAL):");
+    if (!term || !term.trim()) return;
+    const fullName = prompt("请输入全称说明 (如 数据分块定稿封装):") || "";
+    const module = prompt("请输入所属模块 (如 StorageEngine/MDS):") || "Core";
+    const definition = prompt("请输入核心业务机理定义:") || "";
+
+    if (!this._currentKnowledgeData.glossary) this._currentKnowledgeData.glossary = [];
+    this._currentKnowledgeData.glossary.push({
+      term: term.trim(),
+      full_name: fullName.trim(),
+      module: module.trim(),
+      definition: definition.trim(),
+      common_patterns: [term.trim()]
+    });
+
+    await this.saveCurrentKnowledge();
+    this.renderAIGlossary(this._currentKnowledgeData.glossary);
+  },
+
+  async deleteGlossaryItem(index) {
+    if (!confirm("确定要删除该专有术语吗？")) return;
+    this._currentKnowledgeData.glossary.splice(index, 1);
+    await this.saveCurrentKnowledge();
+    this.renderAIGlossary(this._currentKnowledgeData.glossary);
+  },
+
+  async openAddNoiseModal() {
+    const pattern = prompt("请输入误报日志匹配正则表达式 (如 ERR: lease file not found):");
+    if (!pattern || !pattern.trim()) return;
+    const reason = prompt("请输入排除理由 (如 初始化正常分支非故障):") || "已知良性日志";
+
+    if (!this._currentKnowledgeData.noise_rules) this._currentKnowledgeData.noise_rules = [];
+    this._currentKnowledgeData.noise_rules.push({
+      id: "NOISE-MANUAL-" + Date.now(),
+      pattern: pattern.trim(),
+      reason: reason.trim(),
+      storage_type: "ALL",
+      enabled: true,
+      created_at: new Date().toISOString()
+    });
+
+    await this.saveCurrentKnowledge();
+    this.renderAINoiseRules(this._currentKnowledgeData.noise_rules);
+  },
+
+  async deleteNoiseItem(index) {
+    if (!confirm("确定要删除该误报抑制规则吗？")) return;
+    this._currentKnowledgeData.noise_rules.splice(index, 1);
+    await this.saveCurrentKnowledge();
+    this.renderAINoiseRules(this._currentKnowledgeData.noise_rules);
+  },
+
+  async saveCurrentKnowledge() {
+    try {
+      const res = await this.api("/api/ai/knowledge", "POST", this._currentKnowledgeData);
+      if (!res.ok) throw new Error(await res.text());
+    } catch (e) {
+      alert("保存知识库异常: " + e.message);
+    }
   },
 
   escape(str) {

@@ -533,6 +533,51 @@
               </div>
             </div>
           </div>
+
+          <!-- AI 大模型增强根因分析 (RCA) 与企业专有知识库卡片 -->
+          <div class="card" style="margin-top: 20px; border: 1px solid rgba(56, 189, 248, 0.35); background: linear-gradient(135deg, rgba(30, 41, 59, 0.5) 0%, rgba(15, 23, 42, 0.8) 100%);">
+            <div class="card-header" style="background: rgba(56, 189, 248, 0.08);">
+              <div>
+                <span class="card-title" style="color: #38bdf8;">🤖 AI 大模型增强根因分析 (RCA) 与企业专有知识库</span>
+                <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">结合企业专有术语词典映射、业务流程状态机断裂点投影与误打 WARN/ERR 假告警智能免疫体系</p>
+              </div>
+              <div style="display: flex; gap: 10px;">
+                <button class="btn btn-secondary btn-sm" onclick="app.openAIKnowledgeModal();">📚 管理专有术语/流程/误报库</button>
+                <button class="btn btn-primary btn-sm btn-ai-sparkle" onclick="app.openAIConfigModal();">⚙️ AI 模型服务配置</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
+                <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px; padding: 14px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <strong style="color: #38bdf8;">📖 专有术语词典 (Glossary)</strong>
+                    <span class="badge badge-info" id="badge-glossary-count">5 项</span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--text-dim); line-height: 1.5;">
+                    包含 CHUNK_SEAL、BUMP_VER、PEER_WAL_COMMIT 等专有机制，动态扫描并向大模型注入定义，杜绝词意幻觉。
+                  </div>
+                </div>
+                <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px; padding: 14px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <strong style="color: #34d399;">🔄 业务时序流程 (Workflows)</strong>
+                    <span class="badge badge-success" id="badge-workflows-count">2 个</span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--text-dim); line-height: 1.5;">
+                    已建模多副本写入流程 (WRITE_DATA_FLOW) 与心跳故障倒换流程 (FAILOVER_FLOW)，准确定位业务流程卡死断裂阶段。
+                  </div>
+                </div>
+                <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: 6px; padding: 14px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <strong style="color: #fbbf24;">🚫 误报与假告警免疫 (Noise Shield)</strong>
+                    <span class="badge badge-warning" id="badge-noise-count">4 条</span>
+                  </div>
+                  <div style="font-size: 12px; color: var(--text-dim); line-height: 1.5;">
+                    启用静态正则白名单与瞬态重试成功自愈过滤，防止开发误打的非致命 WARN/ERR 带偏大模型因果推导。
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 7. 实时告警中心 Tab -->
@@ -1760,6 +1805,143 @@
     </div>
   </div>
 
-  <script src="/js/app.js?v=20260913_jump_fix"></script>
+  <!-- 模态框: AI 大模型服务配置 -->
+  <div class="modal-overlay" id="modal-ai-config">
+    <div class="modal-content" style="max-width: 600px;">
+      <div class="modal-header">
+        <h3 class="modal-title">⚙️ AI 大模型服务与推理网关配置</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-ai-config')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="form-ai-config" onsubmit="event.preventDefault(); app.saveAIConfig();">
+          <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 16px; font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+            💡 <strong>模型接入指南</strong>：系统默认提供【内置自研启发式推理引擎 (开箱即用，无需GPU)】。若需要更高阶的大模型能力，推荐对接企业内网私有部署的 <strong>Ollama</strong> 或 <strong>vLLM (DeepSeek-R1 / Qwen2.5-72B)</strong>，保障所有存储日志与拓扑 100% 不出机房。
+          </div>
+
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" id="ai-cfg-enabled" checked> 启用 AI 专家深度根因与传播链分析 (RCA)
+            </label>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">服务提供商 / 运行架构 *</label>
+            <select class="form-control" id="ai-cfg-provider" onchange="app.onAIProviderChange()">
+              <option value="mock">自研内置启发式推理引擎 (推荐: 开箱即用、零GPU依赖、超低延迟)</option>
+              <option value="ollama">Ollama (本地私有化 - 内网最简部署 DeepSeek/Qwen)</option>
+              <option value="vllm">vLLM / TGI (企业级高吞吐私有推理集群)</option>
+              <option value="openai">OpenAI 协议兼容接口 (DeepSeek / 通义千问 / Kimi / 公共云API)</option>
+            </select>
+          </div>
+
+          <div class="form-group" id="ai-cfg-baseurl-group">
+            <label class="form-label">接口 Base URL *</label>
+            <input type="text" class="form-control" id="ai-cfg-baseurl" placeholder="例如: http://127.0.0.1:11434/v1 或 https://api.deepseek.com/v1" required>
+          </div>
+
+          <div class="form-group" id="ai-cfg-model-group">
+            <label class="form-label">推理模型名称 (Model ID) *</label>
+            <input type="text" class="form-control" id="ai-cfg-model" placeholder="例如: deepseek-r1:70b 或 qwen2.5:72b 或 deepseek-chat" required>
+          </div>
+
+          <div class="form-group" id="ai-cfg-apikey-group">
+            <label class="form-label">API Key / Token (私有 Ollama 可留空)</label>
+            <input type="password" class="form-control" id="ai-cfg-apikey" placeholder="sk-...">
+          </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+            <div class="form-group">
+              <label class="form-label">单次推演超时时间 (秒)</label>
+              <input type="number" class="form-control" id="ai-cfg-timeout" min="10" max="600" value="120">
+            </div>
+            <div class="form-group" style="display: flex; align-items: center; margin-top: 24px;">
+              <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer;">
+                <input type="checkbox" id="ai-cfg-auto-critical"> 对致命故障自动执行后台分析
+              </label>
+            </div>
+          </div>
+
+          <div class="modal-footer" style="padding: 14px 0 0 0;">
+            <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-ai-config')">取消</button>
+            <button type="submit" class="btn btn-primary">💾 保存 AI 模型配置</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框: 专有知识库与流程管理 (Glossary, Workflows, Noise Rules) -->
+  <div class="modal-overlay" id="modal-ai-knowledge">
+    <div class="modal-content" style="max-width: 920px; height: 85vh; display: flex; flex-direction: column;">
+      <div class="modal-header">
+        <h3 class="modal-title">📚 企业自研专有知识库与流程管理</h3>
+        <button class="modal-close" onclick="app.closeModal('modal-ai-knowledge')">&times;</button>
+      </div>
+      <div class="modal-body" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 16px;">
+        <!-- 子 Tab 导航 -->
+        <div style="display: flex; gap: 10px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">
+          <button class="btn btn-sm btn-primary" id="btn-know-tab-glossary" onclick="app.switchKnowledgeTab('glossary')">📖 专有术语词典</button>
+          <button class="btn btn-sm btn-secondary" id="btn-know-tab-workflows" onclick="app.switchKnowledgeTab('workflows')">🔄 核心业务流程状态机</button>
+          <button class="btn btn-sm btn-secondary" id="btn-know-tab-noise" onclick="app.switchKnowledgeTab('noise')">🚫 误报与假告警抑制库</button>
+        </div>
+
+        <!-- Tab 1: 专有术语词典 -->
+        <div id="know-pane-glossary" style="display: block;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-size: 13px; color: var(--text-secondary);">动态扫描日志异常并提取释义注入 Prompt，消除大模型专业壁垒与词意幻觉</span>
+            <button class="btn btn-primary btn-xs" onclick="app.openAddGlossaryModal()">➕ 新增专有术语</button>
+          </div>
+          <div class="table-responsive" style="max-height: 480px; overflow-y: auto;">
+            <table id="table-ai-glossary">
+              <thead>
+                <tr>
+                  <th style="width: 120px;">术语/缩写</th>
+                  <th style="width: 150px;">全称</th>
+                  <th style="width: 120px;">所属模块</th>
+                  <th>机理定义</th>
+                  <th style="width: 70px;">操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Tab 2: 业务流程定义 -->
+        <div id="know-pane-workflows" style="display: none;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-size: 13px; color: var(--text-secondary);">分布式业务流程状态机标准定义，用于快速比对时序并定位【异常断裂阶段】</span>
+          </div>
+          <div id="know-workflows-list" style="display: flex; flex-direction: column; gap: 14px;"></div>
+        </div>
+
+        <!-- Tab 3: 误报与假告警白名单 -->
+        <div id="know-pane-noise" style="display: none;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <span style="font-size: 13px; color: var(--text-secondary);">被系统识别为非故障的良性/误打 WARN/ERR，在组装 Prompt 前自动剔除</span>
+            <button class="btn btn-primary btn-xs" onclick="app.openAddNoiseModal()">➕ 新增抑制规则</button>
+          </div>
+          <div class="table-responsive" style="max-height: 480px; overflow-y: auto;">
+            <table id="table-ai-noise">
+              <thead>
+                <tr>
+                  <th style="width: 260px;">误打日志匹配特征 (正则)</th>
+                  <th>排除原因说明</th>
+                  <th style="width: 90px;">存储类型</th>
+                  <th style="width: 70px;">操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" style="padding: 10px 18px;">
+        <button type="button" class="btn btn-secondary btn-sm" onclick="app.closeModal('modal-ai-knowledge')">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/app.js?v=20260913_ai_enhanced"></script>
 </body>
 </html>

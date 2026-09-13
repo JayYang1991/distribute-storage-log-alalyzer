@@ -1234,3 +1234,83 @@ mark.v-match.v-match-active {
   gap: 4px;
 }
 
+/* ================= 🤖 AI 增强根因分析 (RCA) 界面组件 ================= */
+.ai-rca-card {
+  margin: 16px 0;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.95) 100%);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.ai-rca-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  background: rgba(56, 189, 248, 0.08);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.18);
+}
+
+.ai-rca-body {
+  padding: 16px;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.ai-rca-body pre {
+  background: #080c14;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  overflow-x: auto;
+}
+
+.ai-rca-body code {
+  color: #38bdf8;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.ai-streaming-cursor::after {
+  content: "▋";
+  animation: ai-blink 0.8s infinite;
+  color: #38bdf8;
+  margin-left: 2px;
+}
+
+@keyframes ai-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.ai-chain-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  color: #38bdf8;
+  font-size: 11px;
+}
+
+.btn-ai-sparkle {
+  background: linear-gradient(135deg, #0ea5e9 0%, #3b82f6 100%);
+  color: white;
+  border: none;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.btn-ai-sparkle:hover {
+  filter: brightness(1.15);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.5);
+}
+
+
