@@ -383,12 +383,13 @@
                     <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
                       <input type="checkbox" id="search-whole-word"> 全词匹配
                     </label>
-                    <label style="display: flex; align-items: center; gap: 6px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
                       上下文展开:
-                      <select id="search-context-lines" class="form-control" style="width: 70px; padding: 2px 6px;">
+                      <select id="search-context-lines" class="form-control" style="width: 105px; padding: 2px 8px; font-size: 12px; height: 28px; cursor: pointer;">
                         <option value="0">无</option>
-                        <option value="2" selected>前后2行</option>
-                        <option value="5">前后5行</option>
+                        <option value="2" selected>前后 2 行</option>
+                        <option value="5">前后 5 行</option>
+                        <option value="10">前后 10 行</option>
                       </select>
                     </label>
                   </div>
