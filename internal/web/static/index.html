@@ -1678,82 +1678,87 @@
     </div>
   </div>
 
-  <!-- 模态框 13: 时序点位图表展示器 (支持海量点位极值降采样、局部框选自动提升精度与突变点定位跳转) -->
+  <!-- 模态框 13: 时序点位图表展示器 (图表优先、波形立体渐变、突变高亮与全屏支持) -->
   <div class="modal-overlay" id="modal-chart-view">
-    <div class="modal-content" style="max-width: 950px; width: 95vw; max-height: 92vh; display: flex; flex-direction: column;">
+    <div class="modal-content" style="max-width: 1100px; width: 95vw; height: 85vh; max-height: 850px; display: flex; flex-direction: column;">
       <div class="modal-header" style="flex-shrink: 0;">
-        <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-          <h3 class="modal-title" id="chart-modal-title" style="display: inline-block;">📈 时序性能图表</h3>
-          <span id="chart-matched-file-badge" class="badge badge-info" style="margin-left: 10px; font-size: 11px;"></span>
+        <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 8px;">
+          <h3 class="modal-title" id="chart-modal-title" style="display: inline-block; margin: 0;">📈 时序性能图表</h3>
+          <span id="chart-matched-file-badge" class="badge badge-info" style="font-size: 11px;"></span>
+          <span id="chart-resolution-badge" class="badge badge-muted" style="font-size: 11px;">加载中...</span>
         </div>
-        <button class="modal-close" onclick="app.closeModal('modal-chart-view')">&times;</button>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button type="button" class="btn-modal-action" id="btn-chart-maximize" onclick="app.toggleChartMaximize()" title="最大化/还原图表窗口">
+            <span id="icon-chart-maximize">⛶</span>
+          </button>
+          <button class="modal-close" onclick="app.closeModal('modal-chart-view')">&times;</button>
+        </div>
       </div>
 
-      <div class="modal-body" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 14px 20px;">
-        <!-- 工具控制条: 维度选择与分辨率指示 -->
-        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 8px 12px;">
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <span style="font-size: 12px; color: var(--text-dim);">指标系列过滤:</span>
-            <select id="chart-series-filter" class="form-control form-control-sm" style="max-width: 220px;" onchange="app.onChartSeriesFilterChange()">
-              <option value="__all__">全部指标系列展示</option>
-            </select>
+      <div class="modal-body" style="flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px 18px; overflow: hidden;">
+        <!-- 工具控制条: 系列切换、图例与全景按钮 -->
+        <div style="flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 6px 12px;">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span style="font-size: 12px; color: var(--text-dim);">设备/系列:</span>
+              <select id="chart-series-filter" class="form-control form-control-sm" style="max-width: 220px;" onchange="app.onChartSeriesFilterChange()">
+                <option value="__all__">全部指标系列展示</option>
+              </select>
+            </div>
+            <!-- 指标图例 -->
+            <div id="chart-legend-container" style="display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px;"></div>
           </div>
-          <div style="display: flex; align-items: center; gap: 10px; font-size: 12px;">
-            <span id="chart-resolution-badge" class="badge badge-muted" style="font-size: 11px;">加载中...</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
             <button id="btn-chart-reset-zoom" class="btn btn-secondary btn-xs" style="display: none;" onclick="app.resetChartZoom()">
               ↩ 恢复全景 (双击空白处)
             </button>
+            <span style="font-size: 11px; color: var(--text-dim);">💡 鼠标框选局部可展开秒级精细点位</span>
           </div>
         </div>
 
-        <!-- 🚨 突变事件导航胶囊栏 -->
-        <div id="chart-anomalies-container" style="display: none; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: var(--radius-sm); padding: 8px 12px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-            <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #f87171;">
-              <span>🚨 识别到突变异常事件 (<span id="chart-anomalies-count">0</span>):</span>
-              <span style="font-size: 11px; font-weight: normal; color: var(--text-dim);">点击任一标签一键平滑聚焦案发时刻</span>
-            </div>
-            <div style="display: flex; gap: 6px;">
-              <button class="btn btn-secondary btn-xs" onclick="app.navPrevAnomaly()" title="跳转定位到上一个突变点">◀ 上一处</button>
-              <button class="btn btn-secondary btn-xs" onclick="app.navNextAnomaly()" title="跳转定位到下一个突变点">下一处 ▶</button>
-            </div>
-          </div>
-          <div id="chart-anomalies-chips" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
-        </div>
-
-        <!-- 原生 Canvas 画布区域 -->
-        <div style="position: relative; width: 100%; height: 360px; background: #090d16; border: 1px solid var(--border-color); border-radius: var(--radius-sm); overflow: hidden;">
+        <!-- 🌟 原生 Canvas 核心时序图表展示区 (绝对主角) -->
+        <div id="chart-canvas-wrapper" style="flex: 1; min-height: 280px; position: relative; width: 100%; background: #080c14; border: 1px solid var(--border-color); border-radius: var(--radius-sm); overflow: hidden;">
           <canvas id="chart-canvas" style="display: block; width: 100%; height: 100%; cursor: crosshair;"></canvas>
           
-          <!-- 鼠标悬浮 / 突变点交互气泡卡片 -->
-          <div id="chart-tooltip-bubble" style="display: none; position: absolute; z-index: 20; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--primary); border-radius: 6px; padding: 8px 12px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); pointer-events: auto; max-width: 280px;">
-            <div id="chart-tooltip-time" style="font-weight: 600; color: #e2e8f0; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;"></div>
+          <!-- 悬浮数据浮层面板 (随鼠标横向移动) -->
+          <div id="chart-tooltip-bubble" style="display: none; position: absolute; z-index: 20; background: rgba(15, 23, 42, 0.95); border: 1px solid #38bdf8; border-radius: 6px; padding: 8px 12px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.6); pointer-events: auto; max-width: 320px; backdrop-filter: blur(8px);">
+            <div id="chart-tooltip-time" style="font-weight: 600; color: #f1f5f9; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 2px;"></div>
             <div id="chart-tooltip-metrics" style="line-height: 1.5; color: #38bdf8;"></div>
-            <div id="chart-tooltip-anomaly" style="margin-top: 6px; font-size: 11px; color: #f87171; display: none;"></div>
+            <div id="chart-tooltip-anomaly" style="margin-top: 6px; font-size: 11px; color: #f87171; display: none; background: rgba(239,68,68,0.12); padding: 4px 6px; border-radius: 4px;"></div>
             <div id="chart-tooltip-jump-btn" style="margin-top: 6px; display: none;">
               <button type="button" class="btn btn-primary btn-xs" style="width: 100%; font-size: 11px;" onclick="app.jumpFromChartToLogLine()">
                 📄 跳转到原始日志行
               </button>
             </div>
           </div>
-
-          <!-- 框选缩放引导遮罩提示 -->
-          <div id="chart-brush-hint" style="position: absolute; bottom: 8px; right: 12px; font-size: 11px; color: var(--text-dim); pointer-events: none;">
-            💡 提示: 鼠标拖拽可框选局部区间自动提升展示精度，双击空白处恢复全景
-          </div>
         </div>
 
-        <!-- 底部指标图例栏 -->
-        <div id="chart-legend-container" style="display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; padding: 4px 0;"></div>
+        <!-- 🚨 紧凑型突变异常导航控制器 (单行不占图表空间) -->
+        <div id="chart-anomalies-container" style="flex-shrink: 0; display: none; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: var(--radius-sm); padding: 6px 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 12px;">
+              <span style="font-weight: 600; color: #f87171;">🚨 突变告警 (<span id="chart-anomalies-count">0</span> 处):</span>
+              <span id="chart-current-anomaly-desc" style="color: var(--text-primary); font-family: monospace; font-size: 12px; font-weight: 500;"></span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <button class="btn btn-secondary btn-xs" onclick="app.navPrevAnomaly()" title="定位到上一个突变点">◀ 上一处</button>
+              <button class="btn btn-secondary btn-xs" onclick="app.navNextAnomaly()" title="定位到下一个突变点">下一处 ▶</button>
+              <button class="btn btn-primary btn-xs" id="btn-anomaly-jump-direct" onclick="app.jumpCurrentAnomalyToLog()" title="穿透定位到原始日志行">📄 跳转行</button>
+              <button class="btn btn-secondary btn-xs" id="btn-toggle-anomalies-drawer" onclick="app.toggleAnomaliesDrawer()" title="展开/收起全部突变列表">展开清单 ▾</button>
+            </div>
+          </div>
+          <!-- 默认收起的突变详情清单抽屉 -->
+          <div id="chart-anomalies-chips" style="display: none; max-height: 90px; overflow-y: auto; gap: 6px; flex-wrap: wrap; margin-top: 8px; padding-top: 6px; border-top: 1px dashed rgba(239,68,68,0.2);"></div>
+        </div>
       </div>
 
-      <div class="modal-footer" style="flex-shrink: 0; padding: 12px 20px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+      <div class="modal-footer" style="flex-shrink: 0; padding: 10px 18px; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
         <span id="chart-footer-desc" style="font-size: 12px; color: var(--text-dim);"></span>
-        <button type="button" class="btn btn-secondary" onclick="app.closeModal('modal-chart-view')">关闭</button>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="app.closeModal('modal-chart-view')">关闭</button>
       </div>
     </div>
   </div>
 
-  <script src="/js/app.js?v=20260913_chart_engine"></script>
+  <script src="/js/app.js?v=20260913_jump_fix"></script>
 </body>
 </html>

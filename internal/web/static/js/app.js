@@ -2620,14 +2620,16 @@ const app = {
         }
       });
 
-      // 如果指定了目标行，平滑滚动定位
+      // 如果指定了目标行，平滑滚动定位并在弹窗过渡完成后再次校准
       if (targetLine > 0) {
-        setTimeout(() => {
+        const scrollToTarget = () => {
           const targetEl = document.getElementById(`v-line-${targetLine}`);
           if (targetEl) {
             targetEl.scrollIntoView({ block: "center", behavior: "smooth" });
           }
-        }, 60);
+        };
+        setTimeout(scrollToTarget, 60);
+        setTimeout(scrollToTarget, 250);
       }
 
       // 如果有指定的高亮关键词，自动填充至文件内搜索栏并触发匹配
@@ -4732,6 +4734,81 @@ print(json.dumps(result))
     await this.fetchAndRenderChart();
   },
 
+  toggleChartMaximize() {
+    const modalContent = document.querySelector("#modal-chart-view .modal-content");
+    const icon = document.getElementById("icon-chart-maximize");
+    if (!modalContent) return;
+
+    if (modalContent.classList.contains("modal-chart-maximized")) {
+      modalContent.classList.remove("modal-chart-maximized");
+      modalContent.style.maxWidth = "1100px";
+      modalContent.style.width = "95vw";
+      modalContent.style.height = "85vh";
+      modalContent.style.maxHeight = "850px";
+      if (icon) icon.innerText = "⛶";
+    } else {
+      modalContent.classList.add("modal-chart-maximized");
+      modalContent.style.maxWidth = "98vw";
+      modalContent.style.width = "98vw";
+      modalContent.style.height = "96vh";
+      modalContent.style.maxHeight = "96vh";
+      if (icon) icon.innerText = "❐";
+    }
+    setTimeout(() => this.drawChart(), 50);
+  },
+
+  toggleAnomaliesDrawer() {
+    const chips = document.getElementById("chart-anomalies-chips");
+    const btn = document.getElementById("btn-toggle-anomalies-drawer");
+    if (!chips || !btn) return;
+    if (chips.style.display === "none" || !chips.style.display) {
+      chips.style.display = "flex";
+      btn.innerText = "收起清单 ▴";
+    } else {
+      chips.style.display = "none";
+      btn.innerText = "展开清单 ▾";
+    }
+    setTimeout(() => this.drawChart(), 50);
+  },
+
+  getActiveAnomalies() {
+    const data = this.activeChartData;
+    if (!data || !data.anomalies) return [];
+    const sel = this.activeChartState.selectedSeries;
+    if (!sel || sel === "__all__") {
+      return data.anomalies;
+    }
+    // 仅筛选与当前选中指标/设备一致的突变
+    return data.anomalies.filter(a => {
+      if (!a.metric) return false;
+      return a.metric === sel || sel.startsWith(a.metric) || a.metric.startsWith(sel);
+    });
+  },
+
+  jumpCurrentAnomalyToLog() {
+    const anomalies = this.getActiveAnomalies();
+    if (!anomalies || anomalies.length === 0) return;
+    const a = anomalies[this.activeChartState.currentAnomalyIdx];
+    if (!a) return;
+    
+    const archiveID = this.activeChartState.archiveID;
+    const filePath = this.activeChartState.filePath;
+    const line = a.line_number || 0;
+    // 若脚本未传递物理行号，平滑降级为使用突变时刻时间戳作为关键词自动搜索定位
+    const kw = line > 0 ? "" : (a.time ? a.time.split(" ").pop() : "");
+
+    this.closeModal("modal-chart-view");
+
+    const browserModal = document.getElementById("modal-file-browser");
+    if (browserModal && browserModal.classList.contains("active") && this.currentViewingArchiveID === archiveID) {
+      this.ensureParentDirsExpanded(filePath);
+      this.renderFileTree(archiveID, this.browserFiles, this.currentTreeFilter);
+      this.loadFileContent(archiveID, filePath, 0, line, kw);
+    } else {
+      this.openViewerAndJump(archiveID, filePath, line, kw);
+    }
+  },
+
   async fetchAndRenderChart() {
     const state = this.activeChartState;
     if (!state.archiveID || !state.filePath || !state.ruleID) return;
@@ -4752,8 +4829,8 @@ print(json.dumps(result))
       this.activeChartData = data;
 
       // 填充标题与描述
-      document.getElementById("chart-modal-title").innerText = `📈 ${data.title || "时序性能监控"}`;
-      document.getElementById("chart-footer-desc").innerText = data.description || (data.downsampled ? "已启用自适应极值降采样（保留波峰毛刺）" : "原始高精点位展示");
+      document.getElementById("chart-modal-title").innerText = `📈 ${data.title || "时序性能图表"}`;
+      document.getElementById("chart-footer-desc").innerText = data.description || (data.downsampled ? "已启用自适应极值降采样（保留突变波峰与波谷）" : "原始高精点位展示");
       
       const resBadge = document.getElementById("chart-resolution-badge");
       resBadge.className = data.downsampled ? "badge badge-warning" : "badge badge-success";
@@ -4764,15 +4841,15 @@ print(json.dumps(result))
       // 渲染指标系列下拉筛选
       this.renderChartSeriesSelector(data.series);
 
-      // 渲染突变事件导航胶囊
-      this.renderChartAnomalies(data.anomalies);
+      // 渲染紧凑突变事件控制台（根据当前选定指标过滤）
+      this.renderChartAnomalies();
 
       // 绘制图例
       this.renderChartLegends(data.series);
 
       // 触发原生 Canvas 绘制
       this.initChartCanvas();
-      this.drawChart();
+      setTimeout(() => this.drawChart(), 50);
     } catch (e) {
       alert("执行图表脚本失败: " + e.message);
       document.getElementById("chart-resolution-badge").innerText = "执行出错";
@@ -4784,7 +4861,7 @@ print(json.dumps(result))
     const sel = document.getElementById("chart-series-filter");
     if (!sel) return;
     const currentVal = this.activeChartState.selectedSeries || "__all__";
-    sel.innerHTML = `<option value="__all__">全部指标系列展示 (${series ? series.length : 0})</option>`;
+    sel.innerHTML = `<option value="__all__">全部指标系列 (${series ? series.length : 0})</option>`;
     if (series) {
       series.forEach(s => {
         const opt = document.createElement("option");
@@ -4799,6 +4876,11 @@ print(json.dumps(result))
   onChartSeriesFilterChange() {
     const sel = document.getElementById("chart-series-filter");
     this.activeChartState.selectedSeries = sel.value;
+    this.activeChartState.currentAnomalyIdx = 0;
+    this.activeChartState.hoverIndex = -1;
+    document.getElementById("chart-tooltip-bubble").style.display = "none";
+    // 联动过滤突变告警栏，仅展示该指标的突变
+    this.renderChartAnomalies();
     this.drawChart();
   },
 
@@ -4816,12 +4898,13 @@ print(json.dumps(result))
       item.style.alignItems = "center";
       item.style.gap = "6px";
       item.style.cursor = "pointer";
+      item.title = `点击聚焦查看 ${s.name}`;
       item.onclick = () => {
         document.getElementById("chart-series-filter").value = s.name;
         this.onChartSeriesFilterChange();
       };
       item.innerHTML = `
-        <span style="display:inline-block; width:10px; height:10px; background:${color}; border-radius:2px;"></span>
+        <span style="display:inline-block; width:10px; height:10px; background:${color}; border-radius:2px; box-shadow: 0 0 6px ${color}88;"></span>
         <span style="color:var(--text-color); font-weight:500;">${this.escape(s.name)}</span>
         <span style="color:var(--text-dim); font-size:11px;">(${s.unit || ""})</span>
       `;
@@ -4829,25 +4912,42 @@ print(json.dumps(result))
     });
   },
 
-  renderChartAnomalies(anomalies) {
+  renderChartAnomalies() {
     const container = document.getElementById("chart-anomalies-container");
     const countSpan = document.getElementById("chart-anomalies-count");
     const chipsBox = document.getElementById("chart-anomalies-chips");
+    const desc = document.getElementById("chart-current-anomaly-desc");
     if (!container || !chipsBox) return;
 
-    if (!anomalies || anomalies.length === 0) {
-      container.style.display = "none";
-      chipsBox.innerHTML = "";
+    const list = this.getActiveAnomalies();
+
+    if (!list || list.length === 0) {
+      const sel = this.activeChartState.selectedSeries;
+      if (sel && sel !== "__all__") {
+        container.style.display = "block";
+        countSpan.innerText = "0";
+        if (desc) {
+          desc.innerHTML = `<span style="color:var(--text-dim);">当前指标 <strong>${this.escape(sel)}</strong> 暂无突变告警</span>`;
+        }
+        chipsBox.innerHTML = "";
+      } else {
+        container.style.display = "none";
+        chipsBox.innerHTML = "";
+      }
       return;
     }
 
     container.style.display = "block";
-    countSpan.innerText = anomalies.length;
+    countSpan.innerText = list.length;
     chipsBox.innerHTML = "";
+    this.activeChartState.currentAnomalyIdx = 0;
 
-    anomalies.forEach((a, idx) => {
+    this.updateCurrentAnomalyDisplay();
+
+    list.forEach((a, idx) => {
       const chip = document.createElement("div");
       chip.className = `badge ${a.severity === "CRITICAL" ? "badge-danger" : "badge-warning"}`;
+      chip.id = `chart-anomaly-chip-${idx}`;
       chip.style.cursor = "pointer";
       chip.style.padding = "4px 8px";
       chip.style.display = "inline-flex";
@@ -4858,14 +4958,44 @@ print(json.dumps(result))
 
       chip.innerHTML = `
         <span>${a.severity === "CRITICAL" ? "🔴" : "🟠"}</span>
-        <span>${this.escape(a.time)}: <strong>${this.escape(a.metric)}</strong> (${a.value})</span>
+        <span>${this.escape(a.time)}: <strong>${this.escape(a.metric)}</strong> (${typeof a.value === "number" ? a.value.toFixed(1) : a.value})</span>
       `;
       chipsBox.appendChild(chip);
     });
   },
 
+  updateCurrentAnomalyDisplay() {
+    const anomalies = this.getActiveAnomalies();
+    const desc = document.getElementById("chart-current-anomaly-desc");
+    if (!desc) return;
+
+    if (!anomalies || anomalies.length === 0) {
+      desc.innerHTML = `<span style="color:var(--text-dim);">当前指标暂无突变告警</span>`;
+      return;
+    }
+
+    const idx = Math.min(this.activeChartState.currentAnomalyIdx || 0, anomalies.length - 1);
+    this.activeChartState.currentAnomalyIdx = idx;
+    const a = anomalies[idx];
+    if (!a) return;
+
+    const valStr = typeof a.value === "number" ? a.value.toFixed(1) : a.value;
+    desc.innerHTML = `<span style="color:#38bdf8;">[#${idx + 1}/${anomalies.length}]</span> ${this.escape(a.time)} &bull; <strong style="color:${a.severity==='CRITICAL'?'#ef4444':'#f59e0b'};">${this.escape(a.metric)}: ${valStr}</strong> &bull; <span style="color:var(--text-dim);">${this.escape(a.reason || '突变')}</span>`;
+
+    // 高亮芯片列表中的 active 项
+    document.querySelectorAll("#chart-anomalies-chips .badge").forEach((el, i) => {
+      if (i === idx) {
+        el.style.boxShadow = "0 0 0 2px #38bdf8";
+        el.style.filter = "brightness(1.2)";
+      } else {
+        el.style.boxShadow = "none";
+        el.style.filter = "none";
+      }
+    });
+  },
+
   navPrevAnomaly() {
-    const anomalies = this.activeChartData?.anomalies;
+    const anomalies = this.getActiveAnomalies();
     if (!anomalies || anomalies.length === 0) return;
     let idx = this.activeChartState.currentAnomalyIdx - 1;
     if (idx < 0) idx = anomalies.length - 1;
@@ -4873,7 +5003,7 @@ print(json.dumps(result))
   },
 
   navNextAnomaly() {
-    const anomalies = this.activeChartData?.anomalies;
+    const anomalies = this.getActiveAnomalies();
     if (!anomalies || anomalies.length === 0) return;
     let idx = this.activeChartState.currentAnomalyIdx + 1;
     if (idx >= anomalies.length) idx = 0;
@@ -4881,11 +5011,13 @@ print(json.dumps(result))
   },
 
   focusAnomaly(anomalyIdx) {
-    const anomalies = this.activeChartData?.anomalies;
+    const anomalies = this.getActiveAnomalies();
     if (!anomalies || !anomalies[anomalyIdx]) return;
     const a = anomalies[anomalyIdx];
     this.activeChartState.currentAnomalyIdx = anomalyIdx;
     this.activeChartState.hoverIndex = a.index;
+
+    this.updateCurrentAnomalyDisplay();
 
     // 弹出气泡定位
     this.showAnomalyTooltip(a);
@@ -4900,18 +5032,20 @@ print(json.dumps(result))
     bubble.style.top = "40px";
 
     document.getElementById("chart-tooltip-time").innerText = `突变时刻: ${a.time}`;
+    const valStr = typeof a.value === "number" ? a.value.toFixed(1) : a.value;
     document.getElementById("chart-tooltip-metrics").innerHTML = `
-      <div style="font-weight:600; color:#f87171;">${this.escape(a.metric)}: ${a.value}</div>
+      <div style="font-weight:600; color:#f87171;">${this.escape(a.metric)}: ${valStr}</div>
     `;
 
     const anomDiv = document.getElementById("chart-tooltip-anomaly");
     anomDiv.style.display = "block";
-    anomDiv.innerText = a.reason || "检测到剧烈波动";
+    anomDiv.innerText = a.reason || "检测到剧烈突变波动";
 
     const jumpBtn = document.getElementById("chart-tooltip-jump-btn");
-    if (a.line_number && a.line_number > 0) {
+    if (a) {
       jumpBtn.style.display = "block";
-      jumpBtn.dataset.line = a.line_number;
+      jumpBtn.dataset.line = a.line_number || "";
+      jumpBtn.dataset.time = a.time || "";
     } else {
       jumpBtn.style.display = "none";
     }
@@ -4919,12 +5053,24 @@ print(json.dumps(result))
 
   jumpFromChartToLogLine() {
     const jumpBtn = document.getElementById("chart-tooltip-jump-btn");
-    const line = parseInt(jumpBtn?.dataset?.line);
-    if (!line || !this.activeChartState.filePath || !this.activeChartState.archiveID) return;
+    const line = parseInt(jumpBtn?.dataset?.line) || 0;
+    const time = jumpBtn?.dataset?.time || "";
+    if (!this.activeChartState.filePath || !this.activeChartState.archiveID) return;
+
+    const archiveID = this.activeChartState.archiveID;
+    const filePath = this.activeChartState.filePath;
+    const kw = line > 0 ? "" : (time ? time.split(" ").pop() : "");
 
     this.closeModal("modal-chart-view");
-    // 切换到该归档包的文件查看
-    this.viewFile(this.activeChartState.archiveID, this.activeChartState.filePath, line);
+
+    const browserModal = document.getElementById("modal-file-browser");
+    if (browserModal && browserModal.classList.contains("active") && this.currentViewingArchiveID === archiveID) {
+      this.ensureParentDirsExpanded(filePath);
+      this.renderFileTree(archiveID, this.browserFiles, this.currentTreeFilter);
+      this.loadFileContent(archiveID, filePath, 0, line, kw);
+    } else {
+      this.openViewerAndJump(archiveID, filePath, line, kw);
+    }
   },
 
   resetChartZoom() {
@@ -4941,7 +5087,8 @@ print(json.dumps(result))
 
   initChartCanvas() {
     const canvas = document.getElementById("chart-canvas");
-    if (!canvas || canvas.dataset.initialized) return;
+    if (!canvas) return;
+    if (canvas.dataset.initialized) return;
     canvas.dataset.initialized = "true";
 
     let isBrushing = false;
@@ -4995,6 +5142,13 @@ print(json.dumps(result))
         this.drawChart();
       }
     });
+
+    window.addEventListener("resize", () => {
+      const modal = document.getElementById("modal-chart-view");
+      if (modal && modal.classList.contains("active")) {
+        this.drawChart();
+      }
+    });
   },
 
   handleCanvasHover(mouseX) {
@@ -5043,27 +5197,24 @@ print(json.dumps(result))
     });
     document.getElementById("chart-tooltip-metrics").innerHTML = metricsHtml || "无数据";
 
-    // 检查是否有突变事件落在该点
-    const anomaly = (data.anomalies || []).find(a => a.index === idx);
+    // 检查是否有突变事件落在该点 (仅关注当前选定指标的突变)
+    const anomaly = this.getActiveAnomalies().find(a => a.index === idx);
     const anomDiv = document.getElementById("chart-tooltip-anomaly");
     const jumpBtn = document.getElementById("chart-tooltip-jump-btn");
 
     if (anomaly) {
       anomDiv.style.display = "block";
       anomDiv.innerText = `🚨 ${anomaly.reason}`;
-      if (anomaly.line_number) {
-        jumpBtn.style.display = "block";
-        jumpBtn.dataset.line = anomaly.line_number;
-      } else {
-        jumpBtn.style.display = "none";
-      }
+      jumpBtn.style.display = "block";
+      jumpBtn.dataset.line = anomaly.line_number || "";
+      jumpBtn.dataset.time = anomaly.time || "";
     } else {
       anomDiv.style.display = "none";
       jumpBtn.style.display = "none";
     }
 
     bubble.style.display = "block";
-    const bubbleW = 220;
+    const bubbleW = 240;
     let left = mouseX + 15;
     if (left + bubbleW > window.innerWidth * 0.9) {
       left = mouseX - bubbleW - 15;
@@ -5104,33 +5255,45 @@ print(json.dumps(result))
 
   drawChart() {
     const canvas = document.getElementById("chart-canvas");
-    if (!canvas) return;
+    const container = document.getElementById("chart-canvas-wrapper");
+    if (!canvas || !container) return;
     const ctx = canvas.getContext("2d");
+
+    // 精准提取容器可用视口尺寸
+    const rect = container.getBoundingClientRect();
+    const w = Math.floor(rect.width);
+    const h = Math.floor(rect.height);
+
+    if (w <= 0 || h <= 0) {
+      setTimeout(() => this.drawChart(), 50);
+      return;
+    }
 
     // Retina 高清屏自适应适配
     const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    const w = rect.width;
-    const h = rect.height;
-
     canvas.width = w * dpr;
     canvas.height = h * dpr;
-    ctx.scale(dpr, dpr);
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
 
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
     const data = this.activeChartData;
     if (!data || !data.x_axis || !data.x_axis.data || data.x_axis.data.length === 0) {
       ctx.fillStyle = "#64748b";
-      ctx.font = "13px sans-serif";
+      ctx.font = "14px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("暂无有效时序数据", w / 2, h / 2);
       return;
     }
 
-    const padding = { top: 30, right: 30, bottom: 40, left: 60 };
+    const padding = { top: 25, right: 35, bottom: 35, left: 60 };
     const plotW = w - padding.left - padding.right;
     const plotH = h - padding.top - padding.bottom;
+
+    if (plotW <= 10 || plotH <= 10) return;
 
     // 计算 Y 轴极值
     let minY = 0;
@@ -5142,23 +5305,38 @@ print(json.dumps(result))
       if (selSeriesName !== "__all__" && s.name !== selSeriesName) return;
       const arr = s.Data || s.data || [];
       arr.forEach(v => {
-        if (v > maxY) {
-          maxY = v;
-          hasCustomMax = true;
-        }
-        if (v < minY) {
-          minY = v;
+        if (typeof v === "number") {
+          if (v > maxY) {
+            maxY = v;
+            hasCustomMax = true;
+          }
+          if (v < minY) {
+            minY = v;
+          }
         }
       });
     });
 
     if (hasCustomMax) {
-      maxY = Math.ceil(maxY * 1.15); // 顶部留白
+      maxY = Math.ceil(maxY * 1.12);
     }
     if (maxY <= minY) maxY = minY + 10;
 
-    // 绘制坐标轴与背景网格
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+    // 1. 绘制危险水位背景区 (当包含百分比且上限为 100 左右时)
+    const isPercentageScale = (maxY >= 95 && maxY <= 120);
+    if (isPercentageScale) {
+      const y95 = padding.top + plotH - ((95 - minY) / (maxY - minY)) * plotH;
+      if (y95 >= padding.top && y95 <= padding.top + plotH) {
+        const critGrad = ctx.createLinearGradient(0, padding.top, 0, y95);
+        critGrad.addColorStop(0, "rgba(239, 68, 68, 0.18)");
+        critGrad.addColorStop(1, "rgba(239, 68, 68, 0.03)");
+        ctx.fillStyle = critGrad;
+        ctx.fillRect(padding.left, padding.top, plotW, y95 - padding.top);
+      }
+    }
+
+    // 2. 绘制水平背景网格线
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
     ctx.lineWidth = 1;
     ctx.fillStyle = "#94a3b8";
     ctx.font = "11px monospace";
@@ -5177,8 +5355,48 @@ print(json.dumps(result))
       ctx.fillText(yVal.toFixed(0), padding.left - 8, yPos + 4);
     }
 
-    // X 轴时间刻度标签
+    // 3. 绘制 85% 与 95% 警戒阈值线
+    if (isPercentageScale) {
+      // 85% Warning 线
+      const y85 = padding.top + plotH - ((85 - minY) / (maxY - minY)) * plotH;
+      if (y85 >= padding.top && y85 <= padding.top + plotH) {
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "rgba(245, 158, 11, 0.6)";
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y85);
+        ctx.lineTo(w - padding.right, y85);
+        ctx.stroke();
+        ctx.fillStyle = "#f59e0b";
+        ctx.textAlign = "right";
+        ctx.font = "10px sans-serif";
+        ctx.fillText("85% 警戒", w - padding.right - 4, y85 - 4);
+        ctx.restore();
+      }
+
+      // 95% Critical 线
+      const y95 = padding.top + plotH - ((95 - minY) / (maxY - minY)) * plotH;
+      if (y95 >= padding.top && y95 <= padding.top + plotH) {
+        ctx.save();
+        ctx.setLineDash([5, 3]);
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.85)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y95);
+        ctx.lineTo(w - padding.right, y95);
+        ctx.stroke();
+        ctx.fillStyle = "#ef4444";
+        ctx.textAlign = "right";
+        ctx.font = "10px sans-serif";
+        ctx.fillText("95% 危险", w - padding.right - 4, y95 - 4);
+        ctx.restore();
+      }
+    }
+
+    // 4. 绘制 X 轴时间刻度
     ctx.textAlign = "center";
+    ctx.fillStyle = "#94a3b8";
     const xPoints = data.x_axis.data;
     const xStepCount = Math.min(6, xPoints.length);
     for (let i = 0; i < xStepCount; i++) {
@@ -5194,8 +5412,15 @@ print(json.dumps(result))
       ctx.fillText(tText, xPos, padding.top + plotH + 18);
     }
 
-    // 绘制各 Series 折线
-    const colors = ["#38bdf8", "#34d399", "#f59e0b", "#a78bfa", "#f472b6", "#fb923c", "#4ade80", "#22d3ee"];
+    // 5. 绘制各指标系列：面积波形渐变填充 (Area Gradient) + 加粗发光折线
+    const colors = [
+      { stroke: "#38bdf8", fillStart: "rgba(56, 189, 248, 0.35)", fillEnd: "rgba(56, 189, 248, 0.02)" },
+      { stroke: "#34d399", fillStart: "rgba(52, 211, 153, 0.35)", fillEnd: "rgba(52, 211, 153, 0.02)" },
+      { stroke: "#f59e0b", fillStart: "rgba(245, 158, 11, 0.35)", fillEnd: "rgba(245, 158, 11, 0.02)" },
+      { stroke: "#a78bfa", fillStart: "rgba(167, 139, 250, 0.35)", fillEnd: "rgba(167, 139, 250, 0.02)" },
+      { stroke: "#f472b6", fillStart: "rgba(244, 114, 182, 0.35)", fillEnd: "rgba(244, 114, 182, 0.02)" },
+      { stroke: "#fb923c", fillStart: "rgba(251, 146, 60, 0.35)", fillEnd: "rgba(251, 146, 60, 0.02)" }
+    ];
     const n = xPoints.length;
 
     data.series.forEach((s, sIdx) => {
@@ -5203,9 +5428,32 @@ print(json.dumps(result))
       const arr = s.Data || s.data || [];
       if (arr.length === 0) return;
 
-      const color = colors[sIdx % colors.length];
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.8;
+      const c = colors[sIdx % colors.length];
+
+      // A. 面积渐变填充
+      const areaGrad = ctx.createLinearGradient(0, padding.top, 0, padding.top + plotH);
+      areaGrad.addColorStop(0, c.fillStart);
+      areaGrad.addColorStop(1, c.fillEnd);
+
+      ctx.beginPath();
+      ctx.moveTo(padding.left, padding.top + plotH);
+      for (let i = 0; i < n; i++) {
+        const val = arr[i] !== undefined ? arr[i] : 0;
+        const xPos = padding.left + (i / (n - 1 || 1)) * plotW;
+        const yPos = padding.top + plotH - ((val - minY) / (maxY - minY)) * plotH;
+        ctx.lineTo(xPos, yPos);
+      }
+      ctx.lineTo(padding.left + plotW, padding.top + plotH);
+      ctx.closePath();
+      ctx.fillStyle = areaGrad;
+      ctx.fill();
+
+      // B. 加粗发光折线
+      ctx.save();
+      ctx.strokeStyle = c.stroke;
+      ctx.lineWidth = 2.2;
+      ctx.shadowColor = c.stroke;
+      ctx.shadowBlur = 6;
       ctx.beginPath();
 
       for (let i = 0; i < n; i++) {
@@ -5220,35 +5468,52 @@ print(json.dumps(result))
         }
       }
       ctx.stroke();
+      ctx.restore();
     });
 
-    // 绘制突变标记竖线与呼吸光晕
-    if (data.anomalies && data.anomalies.length > 0) {
-      data.anomalies.forEach(a => {
+    // 6. 绘制突变事件波峰高亮圆圈与垂直警示线 (仅绘制当前选定指标的突变)
+    const activeAnomalies = this.getActiveAnomalies();
+    if (activeAnomalies && activeAnomalies.length > 0) {
+      const curAnomaly = activeAnomalies[this.activeChartState.currentAnomalyIdx];
+      activeAnomalies.forEach((a, aIdx) => {
         if (a.index >= 0 && a.index < n) {
           const xPos = padding.left + (a.index / (n - 1 || 1)) * plotW;
+          const isFocused = (curAnomaly && curAnomaly.index === a.index);
 
-          // 红色警示虚线
+          // 突变贯穿虚线
           ctx.save();
-          ctx.setLineDash([4, 4]);
-          ctx.strokeStyle = a.severity === "CRITICAL" ? "rgba(239, 68, 68, 0.8)" : "rgba(245, 158, 11, 0.8)";
-          ctx.lineWidth = 1.5;
+          ctx.setLineDash([3, 3]);
+          ctx.strokeStyle = a.severity === "CRITICAL" ? "rgba(239, 68, 68, 0.75)" : "rgba(245, 158, 11, 0.75)";
+          ctx.lineWidth = isFocused ? 2 : 1;
           ctx.beginPath();
           ctx.moveTo(xPos, padding.top);
           ctx.lineTo(xPos, padding.top + plotH);
           ctx.stroke();
           ctx.restore();
 
-          // 突变点圆圈
-          ctx.fillStyle = a.severity === "CRITICAL" ? "#ef4444" : "#f59e0b";
+          // 在折线点位处绘制醒目突变圆点
+          const aVal = typeof a.value === "number" ? a.value : 0;
+          const yPos = padding.top + plotH - ((aVal - minY) / (maxY - minY)) * plotH;
+
+          // 发光光晕
           ctx.beginPath();
-          ctx.arc(xPos, padding.top + 10, 4, 0, Math.PI * 2);
+          ctx.arc(xPos, yPos, isFocused ? 12 : 6, 0, Math.PI * 2);
+          ctx.fillStyle = a.severity === "CRITICAL" ? "rgba(239, 68, 68, 0.3)" : "rgba(245, 158, 11, 0.3)";
           ctx.fill();
+
+          // 实心内圆
+          ctx.beginPath();
+          ctx.arc(xPos, yPos, isFocused ? 5 : 3.5, 0, Math.PI * 2);
+          ctx.fillStyle = a.severity === "CRITICAL" ? "#ef4444" : "#f59e0b";
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 1.5;
+          ctx.fill();
+          ctx.stroke();
         }
       });
     }
 
-    // 绘制悬浮十字线
+    // 7. 绘制悬浮十字探针线
     const hoverIdx = this.activeChartState.hoverIndex;
     if (hoverIdx >= 0 && hoverIdx < n) {
       const hoverX = padding.left + (hoverIdx / (n - 1 || 1)) * plotW;
@@ -5263,11 +5528,11 @@ print(json.dumps(result))
       ctx.restore();
     }
 
-    // 绘制拉框阴影遮罩 (Brush Selection)
+    // 8. 绘制拉框局部缩放阴影 (Brush)
     if (this.activeChartState.brushStart !== null && this.activeChartState.brushEnd !== null) {
       const bStart = Math.min(this.activeChartState.brushStart, this.activeChartState.brushEnd);
       const bEnd = Math.max(this.activeChartState.brushStart, this.activeChartState.brushEnd);
-      ctx.fillStyle = "rgba(56, 189, 248, 0.2)";
+      ctx.fillStyle = "rgba(56, 189, 248, 0.25)";
       ctx.strokeStyle = "#38bdf8";
       ctx.lineWidth = 1;
       ctx.fillRect(bStart, padding.top, bEnd - bStart, plotH);
