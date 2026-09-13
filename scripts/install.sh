@@ -419,20 +419,23 @@ else
             # 检查该磁盘是否已被挂载
             if ! grep -qs "$inst_mount" /proc/mounts; then
                 if [ "$FORMAT_DISK" = true ]; then
-                    echo "     ⚡ 正在执行磁盘格式化 ($current_fs: $disk_dev)..."
-                    umount "$disk_dev" 2>/dev/null || true
+                    echo "     ⚡ 正在执行大容量磁盘专业格式化与旧签名清理 ($current_fs: $disk_dev)..."
+                    umount -f "$disk_dev"* 2>/dev/null || true
+                    wipefs -a -f "$disk_dev" 2>/dev/null || true
                     if [ "$current_fs" == "xfs" ]; then
-                        mkfs.xfs -f "$disk_dev" >/dev/null 2>&1 || true
+                        mkfs.xfs -f -b size=4096 "$disk_dev" >/dev/null 2>&1 || mkfs.xfs -f "$disk_dev" >/dev/null 2>&1 || true
                     else
-                        mkfs.ext4 -F "$disk_dev" >/dev/null 2>&1 || true
+                        mkfs.ext4 -F -O 64bit "$disk_dev" >/dev/null 2>&1 || mkfs.ext4 -F "$disk_dev" >/dev/null 2>&1 || true
                     fi
                 fi
                 echo "     正在挂载磁盘 $disk_dev 到 $inst_mount..."
-                mount "$disk_dev" "$inst_mount" 2>/dev/null || mount -t "$current_fs" "$disk_dev" "$inst_mount" 2>/dev/null || true
+                local mount_opts="defaults,noatime"
+                [ "$current_fs" == "xfs" ] && mount_opts="defaults,noatime,allocsize=64M"
+                mount -o "$mount_opts" "$disk_dev" "$inst_mount" 2>/dev/null || mount "$disk_dev" "$inst_mount" 2>/dev/null || mount -t "$current_fs" "$disk_dev" "$inst_mount" 2>/dev/null || true
 
                 # 写入 /etc/fstab (若未存在)
                 if ! grep -qs "$inst_mount" /etc/fstab; then
-                    echo "$disk_dev $inst_mount $current_fs defaults 0 0" >> /etc/fstab
+                    echo "$disk_dev $inst_mount $current_fs $mount_opts 0 0" >> /etc/fstab
                 fi
             else
                 echo "     ✔ 磁盘已处于挂载状态 ($inst_mount)"

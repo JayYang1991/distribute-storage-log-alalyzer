@@ -558,18 +558,18 @@ const app = {
     let opts = "";
     if (workers.length > 0) {
       const lowest = workers[0];
-      const lowestUsed = lowest.resource?.disk_used_mb ? `${(lowest.resource.disk_used_mb / 1024).toFixed(2)} GB` : '0 MB';
+      const lowestUsed = lowest.resource?.disk_used_mb ? this.formatDiskSizeMB(lowest.resource.disk_used_mb) : '0 MB';
       opts += `<option value="auto">🎯 智能容量调度 (推荐: 优先存放至已用容量最低节点: ${this.escape(lowest.name)}，已用 ${lowestUsed})</option>`;
 
       workers.forEach((n, idx) => {
         const usedMB = (n.resource && n.resource.disk_used_mb) ? n.resource.disk_used_mb : (n.storage_used_bytes ? Math.round(n.storage_used_bytes / (1024 * 1024)) : 0);
-        const usedStr = usedMB >= 1024 ? `${(usedMB / 1024).toFixed(2)} GB` : `${usedMB} MB`;
-        const freeGB = n.resource?.disk_free_mb ? `${(n.resource.disk_free_mb / 1024).toFixed(1)} GB` : '未知';
+        const usedStr = this.formatDiskSizeMB(usedMB);
+        const freeStr = n.resource?.disk_free_mb ? this.formatDiskSizeMB(n.resource.disk_free_mb) : '未知';
         const pctStr = n.resource?.disk_used_percent ? ` (${n.resource.disk_used_percent.toFixed(1)}%)` : '';
         const recBadge = (idx === 0) ? ' ⭐ [推荐: 已用容量最低]' : '';
         const diskInfo = n.disk_device ? ` [磁盘: ${n.disk_device}]` : '';
 
-        opts += `<option value="${n.id}">${this.escape(n.name)} - ${n.ip}:${n.port}${diskInfo} (已用: ${usedStr}${pctStr}, 剩余可用: ${freeGB})${recBadge}</option>`;
+        opts += `<option value="${n.id}">${this.escape(n.name)} - ${n.ip}:${n.port}${diskInfo} (已用: ${usedStr}${pctStr}, 剩余可用: ${freeStr})${recBadge}</option>`;
       });
     } else {
       opts = '<option value="" disabled selected>⚠️ 当前无可用业务存储节点 (日志只能存入业务存储，禁止存入管理系统盘)</option>';
@@ -605,8 +605,8 @@ const app = {
       
       // 丰富容量展示：已用容量与剩余空间
       const usedMB = (n.resource && n.resource.disk_used_mb) ? n.resource.disk_used_mb : (n.storage_used_bytes ? Math.round(n.storage_used_bytes / (1024 * 1024)) : 0);
-      const usedStr = usedMB >= 1024 ? `${(usedMB / 1024).toFixed(2)} GB` : `${usedMB} MB`;
-      const freeStr = n.resource?.disk_free_mb ? `${(n.resource.disk_free_mb / 1024).toFixed(1)} GB` : "-";
+      const usedStr = this.formatDiskSizeMB(usedMB);
+      const freeStr = n.resource?.disk_free_mb ? this.formatDiskSizeMB(n.resource.disk_free_mb) : "-";
       const pctStr = n.resource?.disk_used_percent ? `${n.resource.disk_used_percent.toFixed(1)}%` : "";
       
       const diskHtml = (n.resource && n.resource.disk_total_mb > 0)
@@ -5548,7 +5548,7 @@ print(json.dumps(result))
 
     let totalBytes = 0;
     this.archives.forEach(a => totalBytes += a.size || 0);
-    document.getElementById("stat-storage").innerText = `${(totalBytes / (1024 * 1024)).toFixed(1)} MB`;
+    document.getElementById("stat-storage").innerText = this.formatBytes(totalBytes);
 
     let eventsTotal = 0;
     this.archives.forEach(a => {
@@ -5971,6 +5971,26 @@ print(json.dumps(result))
       if (btn) btn.title = "最大化占满浏览器 (支持双击标题栏最大化)";
       localStorage.setItem("fileBrowserMaximized", "false");
     }
+  },
+
+  formatDiskSizeMB(mb) {
+    if (mb === undefined || mb === null || isNaN(mb) || mb < 0) return "0 MB";
+    if (mb >= 1024 * 1024) {
+      return `${(mb / (1024 * 1024)).toFixed(2)} TB`;
+    }
+    if (mb >= 1024) {
+      return `${(mb / 1024).toFixed(2)} GB`;
+    }
+    return `${Math.round(mb)} MB`;
+  },
+
+  formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    if (i >= sizes.length) return (bytes / Math.pow(k, sizes.length - 1)).toFixed(2) + " " + sizes[sizes.length - 1];
+    return (bytes / Math.pow(k, i)).toFixed(2) + " " + sizes[i];
   },
 
   escape(str) {

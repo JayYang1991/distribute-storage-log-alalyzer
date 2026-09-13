@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,12 +95,78 @@ func createSSHClient(opts SSHDeployOptions) (*ssh.Client, error) {
 
 type rawBlockDevice struct {
 	Name       string           `json:"name"`
-	Size       int64            `json:"size"`
+	Size       int64            `json:"-"`
+	RawSize    interface{}      `json:"size"`
 	Type       string           `json:"type"`
 	MountPoint string           `json:"mountpoint"`
 	FSType     string           `json:"fstype"`
 	Model      string           `json:"model"`
 	Children   []rawBlockDevice `json:"children"`
+}
+
+func (r *rawBlockDevice) UnmarshalJSON(data []byte) error {
+	type Alias rawBlockDevice
+	aux := &struct {
+		*Alias
+	}{
+		Alias: (*Alias)(r),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	switch v := r.RawSize.(type) {
+	case float64:
+		r.Size = int64(v)
+	case int64:
+		r.Size = v
+	case string:
+		r.Size = parseHumanSize(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			r.Size = n
+		} else {
+			r.Size = parseHumanSize(v.String())
+		}
+	}
+	return nil
+}
+
+func parseHumanSize(s string) int64 {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0
+	}
+	if val, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return val
+	}
+	var numStr strings.Builder
+	var unitStr string
+	for i, r := range s {
+		if (r >= '0' && r <= '9') || r == '.' {
+			numStr.WriteRune(r)
+		} else {
+			unitStr = strings.TrimSpace(s[i:])
+			break
+		}
+	}
+	num, err := strconv.ParseFloat(numStr.String(), 64)
+	if err != nil {
+		return 0
+	}
+	var mul float64 = 1
+	switch {
+	case strings.HasPrefix(unitStr, "P"):
+		mul = 1024 * 1024 * 1024 * 1024 * 1024
+	case strings.HasPrefix(unitStr, "T"):
+		mul = 1024 * 1024 * 1024 * 1024
+	case strings.HasPrefix(unitStr, "G"):
+		mul = 1024 * 1024 * 1024
+	case strings.HasPrefix(unitStr, "M"):
+		mul = 1024 * 1024
+	case strings.HasPrefix(unitStr, "K"):
+		mul = 1024
+	}
+	return int64(num * mul)
 }
 
 // checkBlockDeviceSafety 递归检测块设备及其子分区是否已有文件系统或为系统分区
@@ -293,10 +360,11 @@ func DetectRemoteDisks(opts SSHDeployOptions) ([]model.DiskInfo, error) {
 				continue
 			}
 			d := model.DiskInfo{
-				Name: f[0],
-				Path: fmt.Sprintf("/dev/%s", f[0]),
-				Size: f[1],
-				Type: f[2],
+				Name:      f[0],
+				Path:      fmt.Sprintf("/dev/%s", f[0]),
+				Size:      f[1],
+				SizeBytes: parseHumanSize(f[1]),
+				Type:      f[2],
 			}
 			if len(f) >= 4 && f[3] != "" {
 				d.MountPoint = f[3]
@@ -522,26 +590,36 @@ func DeployWorkerViaSSH(opts SSHDeployOptions, logWriter io.Writer) error {
 			idx+1, len(disks), diskDev, instPort, instMount)
 
 		if opts.FormatDisk {
-			_ = runRemoteCmd(client, fmt.Sprintf("%sumount %s 2>/dev/null || true", sudoPrefix, diskDev), logWriter)
+			// 1. 彻底强制卸载该磁盘及其所有可能挂载的子分区
+			_ = runRemoteCmd(client, fmt.Sprintf("%sumount -f %s* 2>/dev/null || true", sudoPrefix, diskDev), logWriter)
+			// 2. 清除该磁盘上的旧 MBR/GPT 分区表签名和旧文件系统特征，防止 4T 以上大盘被旧 MBR 限制在 2TB 寻址空间
+			_ = runRemoteCmd(client, fmt.Sprintf("%swipefs -a -f %s 2>/dev/null || true", sudoPrefix, diskDev), logWriter)
+
 			var formatCmd string
 			if strings.ToLower(opts.FSType) == "xfs" {
-				formatCmd = fmt.Sprintf("%smkfs.xfs -f %s", sudoPrefix, diskDev)
+				// xfs 原生 64 位大盘支持，使用 4KB 扇区对齐优化，支持 4T~100T+ 超大存储
+				formatCmd = fmt.Sprintf("%smkfs.xfs -f -b size=4096 %s", sudoPrefix, diskDev)
 			} else {
-				formatCmd = fmt.Sprintf("%smkfs.ext4 -F %s", sudoPrefix, diskDev)
+				// ext4 针对 4T+ 大盘必须启用 64bit 特性（突破 32 位块寻址 2TB/16TB 限制）
+				formatCmd = fmt.Sprintf("%smkfs.ext4 -F -O 64bit %s", sudoPrefix, diskDev)
 			}
 			if err := runRemoteCmd(client, formatCmd, logWriter); err != nil {
 				return fmt.Errorf("格式化硬盘 %s 失败: %w", diskDev, err)
 			}
 		}
 
-		mountCmd := fmt.Sprintf("%smkdir -p %s && (%smount | grep -q 'on %s ' || %smount %s %s) && %schown -R %s %s 2>/dev/null || true",
-			sudoPrefix, instMount, sudoPrefix, instMount, sudoPrefix, diskDev, instMount, sudoPrefix, opts.Username, instMount)
+		mountOpts := "defaults,noatime"
+		if strings.ToLower(opts.FSType) == "xfs" {
+			mountOpts = "defaults,noatime,allocsize=64M"
+		}
+		mountCmd := fmt.Sprintf("%smkdir -p %s && (%smount | grep -q 'on %s ' || %smount -o %s %s %s || %smount %s %s) && %schown -R %s %s 2>/dev/null || true",
+			sudoPrefix, instMount, sudoPrefix, instMount, sudoPrefix, mountOpts, diskDev, instMount, sudoPrefix, diskDev, instMount, sudoPrefix, opts.Username, instMount)
 		if err := runRemoteCmd(client, mountCmd, logWriter); err != nil {
 			return fmt.Errorf("挂载硬盘 %s 失败: %w", diskDev, err)
 		}
 
-		fstabCmd := fmt.Sprintf("%sbash -c \"grep -v '%s' /etc/fstab > /tmp/fstab.tmp && mv -f /tmp/fstab.tmp /etc/fstab && echo '%s %s %s defaults 0 0' >> /etc/fstab\" 2>/dev/null || true",
-			sudoPrefix, diskDev, diskDev, instMount, opts.FSType)
+		fstabCmd := fmt.Sprintf("%sbash -c \"grep -v '%s' /etc/fstab > /tmp/fstab.tmp && mv -f /tmp/fstab.tmp /etc/fstab && echo '%s %s %s %s 0 0' >> /etc/fstab\" 2>/dev/null || true",
+			sudoPrefix, diskDev, diskDev, instMount, opts.FSType, mountOpts)
 		_ = runRemoteCmd(client, fstabCmd, logWriter)
 
 		// 创建该盘的数据目录并赋予当前用户权限

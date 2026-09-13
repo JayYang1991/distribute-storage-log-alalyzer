@@ -394,6 +394,71 @@ func TestDeployWorkerMultiDiskSuccessLive(t *testing.T) {
 	_ = runRemoteCmd(client, "sudo -n rm -rf /opt/dist-log-worker-test", nil)
 }
 
+func TestLargeDiskHandling(t *testing.T) {
+	// 1. 测试 parseHumanSize 对 4T、8T、16T 及 P 级容量的解析
+	tests := []struct {
+		input    string
+		expected int64
+	}{
+		{"4T", 4 * 1024 * 1024 * 1024 * 1024},
+		{"3.6T", 3958241859993},
+		{"8TB", 8 * 1024 * 1024 * 1024 * 1024},
+		{"16T", 16 * 1024 * 1024 * 1024 * 1024},
+		{"1P", 1024 * 1024 * 1024 * 1024 * 1024},
+		{"500G", 500 * 1024 * 1024 * 1024},
+		{"4398046511104", 4398046511104},
+		{"", 0},
+	}
+
+	for _, tc := range tests {
+		got := parseHumanSize(tc.input)
+		if got != tc.expected {
+			t.Errorf("parseHumanSize(%q) = %d, expected %d", tc.input, got, tc.expected)
+		}
+	}
+
+	// 2. 测试 rawBlockDevice UnmarshalJSON 对 lsblk 各种类型输出的兼容性 (数字、字符串字节、带单位字符串)
+	jsonInt := `{"name":"sdb","size":4398046511104,"type":"disk"}`
+	var devInt rawBlockDevice
+	if err := json.Unmarshal([]byte(jsonInt), &devInt); err != nil {
+		t.Fatalf("Unmarshal integer size failed: %v", err)
+	}
+	if devInt.Size != 4398046511104 {
+		t.Errorf("devInt.Size = %d, expected 4398046511104", devInt.Size)
+	}
+
+	jsonStrUnit := `{"name":"sdc","size":"4T","type":"disk"}`
+	var devStrUnit rawBlockDevice
+	if err := json.Unmarshal([]byte(jsonStrUnit), &devStrUnit); err != nil {
+		t.Fatalf("Unmarshal unit string size failed: %v", err)
+	}
+	if devStrUnit.Size != 4*1024*1024*1024*1024 {
+		t.Errorf("devStrUnit.Size = %d, expected %d", devStrUnit.Size, 4*1024*1024*1024*1024)
+	}
+
+	jsonStrNum := `{"name":"sdd","size":"4398046511104","type":"disk"}`
+	var devStrNum rawBlockDevice
+	if err := json.Unmarshal([]byte(jsonStrNum), &devStrNum); err != nil {
+		t.Fatalf("Unmarshal string number size failed: %v", err)
+	}
+	if devStrNum.Size != 4398046511104 {
+		t.Errorf("devStrNum.Size = %d, expected 4398046511104", devStrNum.Size)
+	}
+
+	// 3. 测试 formatBytes 对 4T+ 大盘的友好展示
+	fourTB := int64(4 * 1024 * 1024 * 1024 * 1024)
+	gotStr := formatBytes(fourTB)
+	if gotStr != "4.0 TB" {
+		t.Errorf("formatBytes(4TB) = %s, expected 4.0 TB", gotStr)
+	}
+
+	sixteenTB := int64(16 * 1024 * 1024 * 1024 * 1024)
+	if formatBytes(sixteenTB) != "16.0 TB" {
+		t.Errorf("formatBytes(16TB) = %s, expected 16.0 TB", formatBytes(sixteenTB))
+	}
+}
+
+
 
 
 
