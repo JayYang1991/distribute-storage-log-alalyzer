@@ -2,6 +2,7 @@ package worker
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"os"
@@ -277,5 +278,139 @@ func TestNestedArchiveSameNameDirPolicy(t *testing.T) {
 	if fileMap["direct.log"] {
 		t.Errorf("错误：子包内部散列文件未收纳进同名目录，直接散落到了顶级目录")
 	}
+}
+
+func TestConsolidateSingleGzAndRotatedLogs(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "extractor_consolidate_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// 构造内嵌 dmesg.1.gz 的 gzip 数据
+	var dmesg1GzBuf bytes.Buffer
+	{
+		gw := gzip.NewWriter(&dmesg1GzBuf)
+		_, _ = gw.Write([]byte("[   1.000000] dmesg.1 oldest line\n"))
+		_ = gw.Close()
+	}
+
+	// 构造内嵌 syslog.1.gz 的 gzip 数据
+	var syslog1GzBuf bytes.Buffer
+	{
+		gw := gzip.NewWriter(&syslog1GzBuf)
+		_, _ = gw.Write([]byte("2026-09-13 10:00:00 [INFO] syslog.1 line 1\n2026-09-13 10:00:01 [INFO] syslog.1 line 2\n"))
+		_ = gw.Close()
+	}
+
+	// 构造 outer.tar.gz
+	outerPath := filepath.Join(tempDir, "outer_rotated.tar.gz")
+	{
+		f, _ := os.Create(outerPath)
+		gw := gzip.NewWriter(f)
+		tw := tar.NewWriter(gw)
+
+		// 写入未归档普通文件 testlog/dmesg (开机较晚)
+		dmesgActive := "[ 100.000000] dmesg active newest line\n"
+		_ = tw.WriteHeader(&tar.Header{Name: "testlog/dmesg", Mode: 0644, Size: int64(len(dmesgActive))})
+		_, _ = tw.Write([]byte(dmesgActive))
+
+		// 写入未归档普通文件 testlog/dmesg.0 (开机中间)
+		dmesg0 := "[  50.000000] dmesg.0 middle line\n"
+		_ = tw.WriteHeader(&tar.Header{Name: "testlog/dmesg.0", Mode: 0644, Size: int64(len(dmesg0))})
+		_, _ = tw.Write([]byte(dmesg0))
+
+		// 写入单文件压缩包 testlog/dmesg.1.gz (开机最早)
+		dmesg1Bytes := dmesg1GzBuf.Bytes()
+		_ = tw.WriteHeader(&tar.Header{Name: "testlog/dmesg.1.gz", Mode: 0644, Size: int64(len(dmesg1Bytes))})
+		_, _ = tw.Write(dmesg1Bytes)
+
+		// 写入未归档普通文件 testlog/syslog (时间较晚)
+		syslogActive := "2026-09-13 12:00:00 [INFO] syslog active line\n"
+		_ = tw.WriteHeader(&tar.Header{Name: "testlog/syslog", Mode: 0644, Size: int64(len(syslogActive))})
+		_, _ = tw.Write([]byte(syslogActive))
+
+		// 写入单文件压缩包 testlog/syslog.1.gz (时间较早)
+		syslog1Bytes := syslog1GzBuf.Bytes()
+		_ = tw.WriteHeader(&tar.Header{Name: "testlog/syslog.1.gz", Mode: 0644, Size: int64(len(syslog1Bytes))})
+		_, _ = tw.Write(syslog1Bytes)
+
+		_ = tw.Close()
+		_ = gw.Close()
+		_ = f.Close()
+	}
+
+	targetDir := filepath.Join(tempDir, "extracted")
+	fileList, totalLines, err := ExtractArchive(outerPath, targetDir)
+	if err != nil {
+		t.Fatalf("ExtractArchive 失败: %v", err)
+	}
+
+	fileMap := make(map[string]*model.LogFileItem)
+	for _, item := range fileList {
+		rel := filepath.ToSlash(item.RelativePath)
+		fileMap[rel] = item
+		t.Logf("解压归拢后文件: %s (isDir=%v, lines=%d)", rel, item.IsDirectory, item.LineCount)
+	}
+
+	// 1. 验证目标同名前缀目录与单一合并文件创建
+	if _, ok := fileMap["testlog/dmesg/dmesg"]; !ok {
+		t.Errorf("缺少合并后的单一文件 testlog/dmesg/dmesg")
+	}
+	if _, ok := fileMap["testlog/syslog/syslog"]; !ok {
+		t.Errorf("缺少合并后的单一文件 testlog/syslog/syslog")
+	}
+
+	// 2. 验证原始碎片已彻底被归拢或清理，根目录绝无散落文件
+	forbiddenFiles := []string{
+		"testlog/dmesg.0", "testlog/dmesg.1", "testlog/dmesg.1.gz",
+		"testlog/syslog.1", "testlog/syslog.1.gz",
+		"testlog/dmesg/dmesg.0", "testlog/dmesg/dmesg.1",
+	}
+	for _, ff := range forbiddenFiles {
+		if _, ok := fileMap[ff]; ok {
+			t.Errorf("碎片文件未被清理或残留: %s", ff)
+		}
+	}
+
+	// 3. 验证合并后内容的严格时间顺序 (读取首行确定时间先后)
+	dmesgMergedPath := filepath.Join(targetDir, "testlog", "dmesg", "dmesg")
+	dmesgContent, err := os.ReadFile(dmesgMergedPath)
+	if err != nil {
+		t.Fatalf("读取合并后 dmesg 失败: %v", err)
+	}
+	dmesgLines := strings.Split(strings.TrimSpace(string(dmesgContent)), "\n")
+	if len(dmesgLines) != 3 {
+		t.Fatalf("预期 dmesg 合并后 3 行，实际 %d 行: %v", len(dmesgLines), dmesgLines)
+	}
+	// 校验顺序：dmesg.1 ([ 1.0]) -> dmesg.0 ([ 50.0]) -> dmesg ([ 100.0])
+	if !strings.Contains(dmesgLines[0], "dmesg.1") {
+		t.Errorf("第一行必须是最早的 dmesg.1，实际为: %s", dmesgLines[0])
+	}
+	if !strings.Contains(dmesgLines[1], "dmesg.0") {
+		t.Errorf("第二行必须是中间的 dmesg.0，实际为: %s", dmesgLines[1])
+	}
+	if !strings.Contains(dmesgLines[2], "dmesg active") {
+		t.Errorf("第三行必须是最新活跃的 dmesg active，实际为: %s", dmesgLines[2])
+	}
+
+	// 校验 syslog 顺序：syslog.1 (10:00:00) -> syslog (12:00:00)
+	syslogMergedPath := filepath.Join(targetDir, "testlog", "syslog", "syslog")
+	syslogContent, err := os.ReadFile(syslogMergedPath)
+	if err != nil {
+		t.Fatalf("读取合并后 syslog 失败: %v", err)
+	}
+	syslogLines := strings.Split(strings.TrimSpace(string(syslogContent)), "\n")
+	if len(syslogLines) != 3 {
+		t.Fatalf("预期 syslog 合并后 3 行，实际 %d 行: %v", len(syslogLines), syslogLines)
+	}
+	if !strings.Contains(syslogLines[0], "10:00:00") {
+		t.Errorf("第一行必须是较早的 10:00:00，实际为: %s", syslogLines[0])
+	}
+	if !strings.Contains(syslogLines[2], "12:00:00") {
+		t.Errorf("最后一行必须是较晚的 12:00:00，实际为: %s", syslogLines[2])
+	}
+
+	t.Logf("单文件 .gz 专属同名目录建立、同前缀文件归拢与按时间合并验证全部通过！总行数: %d", totalLines)
 }
 
